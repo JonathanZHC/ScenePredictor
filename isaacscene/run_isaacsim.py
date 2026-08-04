@@ -10,6 +10,9 @@ import traceback
 
 
 WARMUP_FRAMES = 20
+CAMERA_READY_MAX_ATTEMPTS = 60
+CAMERA_READY_LOG_INTERVAL = 10
+
 ROS_DOMAIN_ID = 117
 
 
@@ -46,7 +49,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help=(
-            "Full per-camera PointCloud2 publication rate."
+            "Full per-camera PointCloud2 publication rate. "
+            "Set to 0 to disable PointCloud2 generation "
+            "and publication."
         ),
     )
     parser.add_argument(
@@ -116,8 +121,10 @@ if ARGS.width <= 0 or ARGS.height <= 0:
     raise ValueError("Width and height must be positive.")
 if ARGS.rgbd_hz <= 0.0:
     raise ValueError("rgbd-hz must be positive.")
-if ARGS.pointcloud_hz <= 0.0:
-    raise ValueError("pointcloud-hz must be positive.")
+if ARGS.pointcloud_hz < 0.0:
+    raise ValueError(
+        "pointcloud-hz must be non-negative."
+    )
 if ARGS.pointcloud_hz > ARGS.rgbd_hz:
     raise ValueError(
         "pointcloud-hz cannot exceed rgbd-hz."
@@ -216,6 +223,81 @@ def _print_profile(
             flush=True,
         )
 
+def _wait_until_cameras_ready(
+    cameras,
+    rig,
+    corruption,
+) -> None:
+    """Wait until every RGB/depth annotator returns valid data."""
+
+    last_error: RuntimeError | None = None
+
+    empty_data_messages = (
+        "annotator returned empty data",
+        "RGB shape is (0,)",
+        "depth shape is (0,)",
+    )
+
+    for attempt in range(
+        1,
+        CAMERA_READY_MAX_ATTEMPTS + 1,
+    ):
+        try:
+            frames = capture_all_cameras(
+                cameras,
+                rig,
+                corruption,
+                frame_index=0,
+            )
+        except RuntimeError as error:
+            message = str(error)
+
+            # 不要掩盖其他真实错误
+            if not any(
+                token in message
+                for token in empty_data_messages
+            ):
+                raise
+
+            last_error = error
+
+            if (
+                attempt == 1
+                or attempt % CAMERA_READY_LOG_INTERVAL == 0
+            ):
+                print(
+                    "Camera annotators are not ready "
+                    f"(attempt {attempt}/"
+                    f"{CAMERA_READY_MAX_ATTEMPTS}): "
+                    f"{error}",
+                    flush=True,
+                )
+
+            # 再渲染一帧，然后重试
+            simulation_app.update()
+            continue
+
+        shapes = ", ".join(
+            (
+                f"{name}: "
+                f"rgb={frame.rgb.shape}, "
+                f"depth={frame.depth_m.shape}"
+            )
+            for name, frame in frames.items()
+        )
+
+        print(
+            f"Camera annotators ready after "
+            f"{attempt} attempt(s): {shapes}",
+            flush=True,
+        )
+        return
+
+    raise RuntimeError(
+        "Camera annotators remained empty after "
+        f"{CAMERA_READY_MAX_ATTEMPTS} attempts. "
+        f"Last error: {last_error}"
+    ) from last_error
 
 def main() -> None:
     ros_publisher = None
@@ -278,7 +360,20 @@ def main() -> None:
         for _ in range(WARMUP_FRAMES):
             simulation_app.update()
 
+        _wait_until_cameras_ready(
+            cameras,
+            rig,
+            corruption,
+        )
+
         stream = "corrupted" if ARGS.corrupt else "clean"
+
+        pointcloud_mode = (
+            "disabled"
+            if ARGS.pointcloud_hz == 0.0
+            else "separate_full_optical_frame"
+        )
+
         print(
             "Running forever: "
             f"resolution={ARGS.width}x{ARGS.height}, "
@@ -293,7 +388,7 @@ def main() -> None:
             f"depth_corruption="
             f"{ARGS.corrupt and ARGS.depth_corruption}, "
             "depth_encoding=32FC1, "
-            "pointcloud=separate_full_optical_frame, "
+            f"pointcloud={pointcloud_mode}, "
             "downsampling=false, fusion=false",
             flush=True,
         )

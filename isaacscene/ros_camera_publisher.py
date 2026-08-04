@@ -63,7 +63,7 @@ class _CameraPublishers:
     depth: Any
     camera_info: Any
     pose: Any
-    points: Any
+    points: Any | None
 
 
 def _point(x: float, y: float, z: float) -> Point:
@@ -101,8 +101,10 @@ class RosCameraPublisher:
     ) -> None:
         if rgbd_hz <= 0.0:
             raise ValueError("rgbd_hz must be positive.")
-        if pointcloud_hz <= 0.0:
-            raise ValueError("pointcloud_hz must be positive.")
+        if pointcloud_hz < 0.0:
+            raise ValueError(
+                "pointcloud_hz must be non-negative."
+            )
         if pointcloud_hz > rgbd_hz:
             raise ValueError(
                 "pointcloud_hz cannot exceed rgbd_hz because point clouds "
@@ -118,14 +120,25 @@ class RosCameraPublisher:
         self.world_frame_id = world_frame_id
         self.rgbd_hz = float(rgbd_hz)
         self.pointcloud_hz = float(pointcloud_hz)
+        self.pointcloud_enabled = self.pointcloud_hz > 0.0
 
-        self._pointcloud_period_s = 1.0 / self.pointcloud_hz
-        self._next_pointcloud_time = time.perf_counter()
-
-        self._pointcloud_builder = GpuCameraPointCloudBuilder(
-            max_depth_m=max_depth_m,
-            device=POINTCLOUD_DEVICE,
-        )
+        if self.pointcloud_enabled:
+            self._pointcloud_period_s = (
+                1.0 / self.pointcloud_hz
+            )
+            self._next_pointcloud_time = (
+                time.perf_counter()
+            )
+            self._pointcloud_builder = (
+                GpuCameraPointCloudBuilder(
+                    max_depth_m=max_depth_m,
+                    device=POINTCLOUD_DEVICE,
+                )
+            )
+        else:
+            self._pointcloud_period_s = None
+            self._next_pointcloud_time = None
+            self._pointcloud_builder = None
 
         self.last_point_counts: dict[str, int] = {
             camera.spec.name: 0 for camera in cameras
@@ -183,10 +196,14 @@ class RosCameraPublisher:
                     f"{namespace}/pose",
                     metadata_qos,
                 ),
-                points=self.node.create_publisher(
-                    PointCloud2,
-                    f"{namespace}/points",
-                    pointcloud_qos,
+                points=(
+                    self.node.create_publisher(
+                        PointCloud2,
+                        f"{namespace}/points",
+                        pointcloud_qos,
+                    )
+                    if self.pointcloud_enabled
+                    else None
                 ),
             )
 
@@ -210,11 +227,21 @@ class RosCameraPublisher:
         self._publish_static_transforms()
         self._publish_camera_pyramids()
 
+        if self.pointcloud_enabled:
+            pointcloud_message = (
+                "Publishing separate, full, non-downsampled "
+                "optical-frame PointCloud2 streams at "
+                f"{self.pointcloud_hz:.3f} Hz."
+            )
+        else:
+            pointcloud_message = (
+                "PointCloud2 generation and publication are disabled."
+            )
+
         self.node.get_logger().info(
             f"Publishing RGB8 and {DEPTH_ENCODING} at "
-            f"{self.rgbd_hz:.3f} Hz. Publishing separate, full, "
-            f"non-downsampled optical-frame PointCloud2 streams at "
-            f"{self.pointcloud_hz:.3f} Hz."
+            f"{self.rgbd_hz:.3f} Hz. "
+            f"{pointcloud_message}"
         )
 
     @staticmethod
@@ -467,7 +494,12 @@ class RosCameraPublisher:
         stamp = self.node.get_clock().now().to_msg()
         now = time.perf_counter()
 
-        publish_pointcloud = now >= self._next_pointcloud_time
+        publish_pointcloud = (
+            self.pointcloud_enabled
+            and self._next_pointcloud_time is not None
+            and now >= self._next_pointcloud_time
+        )
+
         if publish_pointcloud:
             self._next_pointcloud_time = max(
                 self._next_pointcloud_time
@@ -518,8 +550,22 @@ class RosCameraPublisher:
             )
 
             if publish_pointcloud:
+                if self._pointcloud_builder is None:
+                    raise RuntimeError(
+                        "Point-cloud publishing is enabled but "
+                        "the point-cloud builder is missing."
+                    )
+
+                if publishers.points is None:
+                    raise RuntimeError(
+                        f"{name} point-cloud publisher is missing."
+                    )
+
                 cloud = self._pointcloud_builder.build(frame)
-                self.last_point_counts[name] = int(cloud.shape[0])
+                self.last_point_counts[name] = int(
+                    cloud.shape[0]
+                )
+
                 publishers.points.publish(
                     self._pointcloud_message(
                         cloud,

@@ -399,6 +399,10 @@ def _unwrap_annotator_data(data: Any, label: str):
         data = data["data"]
 
     if isinstance(data, wp.array):
+        if data.size == 0:
+            raise RuntimeError(
+                f"{label} annotator returned empty data."
+            )
         return data
 
     array = np.asarray(data)
