@@ -1,71 +1,57 @@
 # Clone the repo:
 
+```bash
 git clone git@github.com:JonathanZHC/ScenePredictor.git
 git submodule update --init --recursive
+```
 
 # Build the docker:
 
-docker build -f .docker/Dockerfile -t scenepred .
-
-# Run the docker:
-
-docker run --rm -it \
-  --name scenepred1\
-  --gpus all \
-  --device=/dev/dri:/dev/dri \
-  --network=host \
-  --ipc=host \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  -e ACCEPT_EULA=Y \
-  -e PRIVACY_CONSENT=Y \
-  -e OMNICLIENT_HUB_MODE=disabled \
-  -e DISPLAY="$DISPLAY" \
-  -e HOME=/tmp \
-  -e XDG_CACHE_HOME=/tmp/.cache \
-  -e XDG_RUNTIME_DIR=/tmp/runtime-isaac-sim \
-  -e MPLCONFIGDIR=/tmp/.cache/matplotlib \
-  -e NVIDIA_VISIBLE_DEVICES=all \
-  -e NVIDIA_DRIVER_CAPABILITIES=all \
-  -e __GLX_VENDOR_LIBRARY_NAME=nvidia \
-  -e __NV_PRIME_RENDER_OFFLOAD=1 \
-  -e ROS_DOMAIN_ID=117 \
-  -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  -v "$PWD/isaacscene:/workspace/isaacscene:rw" \
-  -v "$PWD/camera_output:/workspace/camera_output:rw" \
-  scenepred \
-  /bin/bash
+```bash
+docker build --progress=plain -f .docker/Dockerfile -t scenepredictor .
+```
 
 # Run isaacsim to generate the scene:
 
+```bash
+docker exec -it scenepredictor bash -lc '
+source /opt/ros/jazzy/setup.bash
+
 /isaac-sim/python.sh \
   /workspace/isaacscene/run_isaacsim.py \
-    --scene dynamic \
-    --width 640 \
-    --height 480 \
-    --camera-hz 30 \
-    --pointcloud-hz 30 \
-    --corrupt \
-    --no-rgb-corruption
+  --scene dynamic \
+  --width 640 \
+  --height 480 \
+  --rgbd-hz 30 \
+  --pointcloud-hz 5 \
+  --motion-speed-scale 1.0
+'
+```
 
 # Run Rviz for pcd visualization:
 
+```bash
+docker exec -it scenepredictor bash -lc '
+source /opt/ros/jazzy/setup.bash
 rviz2 -d /workspace/isaacscene/isaacscene.rviz
-
-# Check RGB-D publication frequency
-
-python3 \
-  /workspace/isaacscene/python_image_rate_subscriber.py \
-  --topic /camera_0/depth/image_raw \
-  --reliability reliable \
-  --expected-hz 30
+'
+```
 
 # If cannot write to isaacscene.rviz:
 
-mv isaacscene.rviz isaacscene.rviz.owner1003.backup
-cp isaacscene.rviz.owner1003.backup isaacscene.rviz
-chmod u+rw isaacscene.rviz
+```bash
+sudo setfacl -m u:1234:rw isaacscene/isaacscene.rviz
+```
+
+# Check ROS topics:
+
+```bash
+docker exec -it scenepredictor bash -lc '
+source /opt/ros/jazzy/setup.bash
+ros2 topic list | sort
+'
+```
+
 
 
 
