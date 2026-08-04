@@ -30,21 +30,6 @@ weights/
 kit/cache/
 kit/logs/
 kit/data/
+
 # Container and Isaac Sim runtime caches
 .container-cache/
-camera_output/
-
-# Python caches
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# Runtime outputs
-outputs/
-profiles/
-logs/
-*.log
-
-# Local backup files
-*.owner*.backup
-*.rviz.bak

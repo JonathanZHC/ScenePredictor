@@ -8,7 +8,7 @@ git submodule update --init --recursive
 # Build the docker:
 
 ```bash
-docker build --progress=plain -f .docker/Dockerfile -t scenepredictor .
+docker build --progress=plain -f .docker/dockerfile -t scenepredictor .
 ```
 
 # Run isaacsim to generate the scene:

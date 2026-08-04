@@ -5,6 +5,12 @@ IMAGE="${IMAGE:-scenepredictor}"
 CONTAINER="${CONTAINER:-scenepredictor}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE_ROOT="${REPO_ROOT}/.container-cache"
+DRI_RENDER_NODE="$(
+    find /dev/dri -maxdepth 1 -name 'renderD*' |
+    sort |
+    head -n 1
+)"
+DRI_RENDER_GID="$(stat -c '%g' "${DRI_RENDER_NODE}")"
 
 if [[ ! -f "${REPO_ROOT}/.gitmodules" ]]; then
     echo "Run this script from the ScenePredictor repository root." >&2
@@ -40,7 +46,7 @@ docker run -d \
     --name "${CONTAINER}" \
     --gpus all \
     --device /dev/dri:/dev/dri \
-    --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+    --group-add "${DRI_RENDER_GID}" \
     --network host \
     --ipc host \
     --ulimit memlock=-1 \
