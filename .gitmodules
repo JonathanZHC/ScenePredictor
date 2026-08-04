@@ -1,0 +1,4 @@
+[submodule "DifFlow3D"]
+	path = DifFlow3D
+	url = https://github.com/JonathanZHC/DifFlow3D.git
+	branch = main
