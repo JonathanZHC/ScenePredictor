@@ -24,6 +24,8 @@ source /opt/ros/jazzy/setup.bash
   --height 480 \
   --rgbd-hz 30 \
   --pointcloud-hz 5 \
+  --corrupt \
+  --no-rgb-corruption \
   --motion-speed-scale 1.0
 '
 ```
@@ -49,6 +51,32 @@ sudo setfacl -m u:1234:rw isaacscene/isaacscene.rviz
 docker exec -it scenepredictor bash -lc '
 source /opt/ros/jazzy/setup.bash
 ros2 topic list | sort
+'
+```
+
+# Run ScenePredictor:
+
+```bash
+docker exec -it scenepredictor bash -lc '
+source /opt/ros/jazzy/setup.bash
+
+/isaac-sim/python.sh \
+  /workspace/scripts/run_scene_pred_pipeline.py \
+  --config /workspace/configs/default.yaml
+'
+```
+
+# Run Rviz for visualization:
+
+```bash
+docker exec -it scenepredictor bash -lc '
+export XDG_RUNTIME_DIR=/tmp/runtime-1234
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+
+source /opt/ros/jazzy/setup.bash
+
+rviz2 -d /workspace/scene_pred_pipeline.rviz
 '
 ```
 
