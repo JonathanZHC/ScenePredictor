@@ -1,17 +1,6 @@
 # Isaac Sim 6.0.1 + ROS 2 Jazzy + RTX 5090/Blackwell ScenePredictor image.
-#
-# Architecture:
-#   - Isaac Sim publishes RGB, depth, CameraInfo, pose/TF and optional PointCloud2.
-#   - ScenePredictor runs as a separate ROS 2 process and subscribes only to
-#     RGB/depth/calibration/TF topics.
-#   - PointCloud2 publication is retained only for RViz visualization.
-#   - DifFlow3D is copied from the initialized local Git submodule in this repo.
-#
-# Build context MUST be the ScenePredictor repository root:
-#   docker build -f .docker/Dockerfile -t scenepredictor:isaac6 .
-#
-# Before building:
-#   git submodule update --init --recursive
+# Build context must be the ScenePredictor repository root.
+# Before building: git submodule update --init --recursive
 
 ARG ISAAC_SIM_IMAGE=nvcr.io/nvidia/isaac-sim:6.0.1
 ARG CUDA_BUILDER_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
@@ -20,12 +9,11 @@ ARG TORCH_VERSION=2.11.0
 ARG TORCHVISION_VERSION=0.26.0
 ARG WARP_VERSION=1.15.0
 ARG ULTRALYTICS_VERSION=8.4.115
-ARG OPEN_CLIP_VERSION=3.3.0
-
+ARG TENSORRT_VERSION=10.14.1.48.post1
 ARG TORCH_CUDA_ARCH_LIST=12.0
 
 # =============================================================================
-# Stage 1: build the local DifFlow3D submodule's PointNet++ CUDA extension
+# Stage 1: build the local DifFlow3D PointNet++ CUDA extension.
 # =============================================================================
 FROM ${CUDA_BUILDER_IMAGE} AS difflow-builder
 
@@ -41,7 +29,8 @@ ENV LANG=C.UTF-8 \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     FORCE_CUDA=1 \
-    MAX_JOBS=4
+    MAX_JOBS=4 \
+    LD_LIBRARY_PATH=/opt/difflow-build-venv/lib/python3.12/site-packages/torch/lib:/usr/local/cuda/lib64
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -55,8 +44,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Use an isolated builder venv. Ubuntu 24.04's system Python is externally
-# managed and should not be modified directly.
 ENV VIRTUAL_ENV=/opt/difflow-build-venv \
     PATH=/opt/difflow-build-venv/bin:${PATH}
 
@@ -64,118 +51,48 @@ RUN /usr/bin/python3 -m venv "${VIRTUAL_ENV}" \
     && python3 -m pip install --upgrade pip setuptools wheel \
     && python3 -m pip install \
       torch==${TORCH_VERSION} \
-      --index-url https://download.pytorch.org/whl/cu128 \
-    && python3 - <<'PY'
-import sys
-import torch
+      --index-url https://download.pytorch.org/whl/cu128
 
-print("builder Python:", sys.version)
-print("builder executable:", sys.executable)
-print("builder torch:", torch.__version__)
-print("builder torch CUDA:", torch.version.cuda)
-PY
-
-# IMPORTANT:
-# This copies the exact DifFlow3D commit pinned by the ScenePredictor submodule.
-# It intentionally does not clone IRMVLab/DifFlow3D during the Docker build.
 COPY DifFlow3D/ /opt/DifFlow3D/
 
 RUN test -d /opt/DifFlow3D/pointnet2/src \
     && test -f /opt/DifFlow3D/pretrain_weights/model_difflow_355_0.0114.pth \
-    && weight_size="$(stat -c '%s' \
-         /opt/DifFlow3D/pretrain_weights/model_difflow_355_0.0114.pth)" \
-    && test "${weight_size}" -gt 1000000 \
-    && echo "DifFlow3D checkpoint size: ${weight_size} bytes"
+    && test "$(stat -c '%s' /opt/DifFlow3D/pretrain_weights/model_difflow_355_0.0114.pth)" -gt 1000000
 
-# Apply API-only compatibility edits required by modern PyTorch/CUDA.
-# The CUDA kernel mathematics and DifFlow3D model computations are unchanged.
+# Modern PyTorch/CUDA API compatibility edits. The CUDA mathematics is unchanged.
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
 
-repo = Path("/opt/DifFlow3D")
-src_dir = repo / "pointnet2" / "src"
-
-if not src_dir.is_dir():
-    raise FileNotFoundError(src_dir)
-
-for path in sorted(src_dir.glob("*")):
-    if path.suffix not in {".cpp", ".cu", ".h", ".hpp"}:
+repo = Path('/opt/DifFlow3D')
+src_dir = repo / 'pointnet2' / 'src'
+for path in sorted(src_dir.glob('*')):
+    if path.suffix not in {'.cpp', '.cu', '.h', '.hpp'}:
         continue
-
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding='utf-8')
     original = text
-
-    # THC was removed from modern PyTorch.
-    text = re.sub(
-        r'^\s*#include\s*[<"]THC/THC\.h[>"]\s*$\n?',
-        "",
-        text,
-        flags=re.MULTILINE,
-    )
-    text = re.sub(
-        r'^\s*extern\s+THCState\s*\*\s*state\s*;\s*$\n?',
-        "",
-        text,
-        flags=re.MULTILINE,
-    )
-
-    # Tensor::data<T>() and DeprecatedTypeProperties are obsolete.
-    text = re.sub(
-        r'\.data\s*<\s*([^>]+?)\s*>\s*\(\s*\)',
-        r'.data_ptr<\1>()',
-        text,
-    )
-    text = text.replace(".type().is_cuda()", ".is_cuda()")
-
-    # Use the modern c10 CUDA stream API.
-    if "getCurrentCUDAStream" in text:
-        text = text.replace(
-            "at::cuda::getCurrentCUDAStream()",
-            "c10::cuda::getCurrentCUDAStream().stream()",
-        )
-        text = text.replace(
-            "c10::cuda::getCurrentCUDAStream()",
-            "c10::cuda::getCurrentCUDAStream().stream()",
-        )
-        text = text.replace(
-            "c10::cuda::getCurrentCUDAStream().stream().stream()",
-            "c10::cuda::getCurrentCUDAStream().stream()",
-        )
-
-        include = "#include <c10/cuda/CUDAStream.h>"
+    text = re.sub(r'^\s*#include\s*[<"]THC/THC\.h[>"]\s*$\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*extern\s+THCState\s*\*\s*state\s*;\s*$\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\.data\s*<\s*([^>]+?)\s*>\s*\(\s*\)', r'.data_ptr<\1>()', text)
+    text = text.replace('.type().is_cuda()', '.is_cuda()')
+    if 'getCurrentCUDAStream' in text:
+        text = text.replace('at::cuda::getCurrentCUDAStream()', 'c10::cuda::getCurrentCUDAStream().stream()')
+        text = text.replace('c10::cuda::getCurrentCUDAStream()', 'c10::cuda::getCurrentCUDAStream().stream()')
+        text = text.replace('c10::cuda::getCurrentCUDAStream().stream().stream()', 'c10::cuda::getCurrentCUDAStream().stream()')
+        include = '#include <c10/cuda/CUDAStream.h>'
         if include not in text:
             lines = text.splitlines()
             insert_at = 0
             for index, line in enumerate(lines):
-                if line.lstrip().startswith("#include"):
+                if line.lstrip().startswith('#include'):
                     insert_at = index + 1
                 elif insert_at:
                     break
             lines.insert(insert_at, include)
-            text = "\n".join(lines)
-            if original.endswith("\n"):
-                text += "\n"
-
+            text = '\n'.join(lines) + ('\n' if original.endswith('\n') else '')
     if text != original:
-        path.write_text(text, encoding="utf-8")
-        print("patched", path.relative_to(repo))
-
-joined = "\n".join(
-    candidate.read_text(encoding="utf-8")
-    for candidate in src_dir.glob("*")
-    if candidate.suffix in {".cpp", ".cu", ".h", ".hpp"}
-)
-
-for forbidden in (
-    "#include <THC/THC.h>",
-    "extern THCState *state;",
-    "at::cuda::getCurrentCUDAStream()",
-    ".data<float>()",
-    ".data<int>()",
-):
-    if forbidden in joined:
-        raise RuntimeError(f"Unpatched legacy API remains: {forbidden}")
+        path.write_text(text, encoding='utf-8')
+        print('patched', path.relative_to(repo))
 PY
 
 RUN python3 -m pip install numpy==1.26.4 \
@@ -183,42 +100,27 @@ RUN python3 -m pip install numpy==1.26.4 \
     && rm -rf build pointnet2_cuda*.so \
     && python3 setup.py build_ext --inplace \
     && cd /opt/DifFlow3D \
-    && PYTHONPATH=/opt/DifFlow3D:/opt/DifFlow3D/pointnet2 \
-       python3 - <<'PY'
-import sys
-import torch
+    && PYTHONPATH=/opt/DifFlow3D:/opt/DifFlow3D/pointnet2 python3 - <<'PY'
 import pointnet2_cuda
 from pointnet2 import pointnet2_utils
-
-print("builder Python:", sys.executable)
-print("builder torch:", torch.__version__)
-print("builder torch CUDA:", torch.version.cuda)
-print("pointnet2_cuda:", pointnet2_cuda.__file__)
-print("pointnet2_utils:", pointnet2_utils.__file__)
-print("PointNet++ builder import OK")
+print('pointnet2_cuda:', pointnet2_cuda.__file__)
+print('pointnet2_utils:', pointnet2_utils.__file__)
 PY
 
-# Bundle libcudart required by pointnet2_cuda. NVIDIA driver libraries remain
-# supplied at runtime by NVIDIA Container Toolkit through --gpus all.
 RUN python3 - <<'PY'
 from pathlib import Path
 import shutil
 
-root = Path("/usr/local/cuda")
-candidates = sorted(root.rglob("libcudart.so.12"))
+candidates = sorted(Path('/usr/local/cuda').rglob('libcudart.so.12'))
 if not candidates:
-    raise FileNotFoundError("libcudart.so.12 was not found in the CUDA builder")
-
-source = candidates[0].resolve()
-destination_dir = Path("/opt/difflow-cuda-runtime/lib")
-destination_dir.mkdir(parents=True, exist_ok=True)
-destination = destination_dir / "libcudart.so.12"
-shutil.copy2(source, destination)
-print("bundled CUDA runtime:", source, "->", destination)
+    raise FileNotFoundError('libcudart.so.12 not found')
+out = Path('/opt/difflow-cuda-runtime/lib')
+out.mkdir(parents=True, exist_ok=True)
+shutil.copy2(candidates[0].resolve(), out / 'libcudart.so.12')
 PY
 
 # =============================================================================
-# Stage 2: official Isaac Sim runtime
+# Stage 2: official Isaac Sim runtime.
 # =============================================================================
 FROM ${ISAAC_SIM_IMAGE}
 
@@ -229,11 +131,9 @@ ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG WARP_VERSION
 ARG ULTRALYTICS_VERSION
-ARG OPEN_CLIP_VERSION
+ARG TENSORRT_VERSION
 ARG TORCH_CUDA_ARCH_LIST
 
-# Do not globally replace Isaac Sim's PYTHONPATH. Extra packages and repository
-# paths are registered later through a .pth file in Isaac Sim's Python.
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     PYTHONUNBUFFERED=1 \
@@ -263,33 +163,11 @@ ENV LANG=en_US.UTF-8 \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# ROS 2 dependencies required by:
-#   - Isaac Sim's ROS publishers;
-#   - a separate ScenePredictor ROS subscriber process;
-#   - dynamic multi-camera synchronization;
-#   - RViz visualization.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates \
-      curl \
-      gnupg2 \
-      locales \
-      lsb-release \
-      software-properties-common \
-      python3 \
-      python3-dev \
-      libgl1 \
-      libglib2.0-0 \
-      libsm6 \
-      libxext6 \
-      libxrender1 \
-      libx11-6 \
-      libxrandr2 \
-      libxinerama1 \
-      libxcursor1 \
-      libxi6 \
-      xauth \
-      mesa-utils \
-      libgomp1 \
+      ca-certificates curl git gnupg2 locales lsb-release software-properties-common \
+      python3 python3-dev \
+      libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libx11-6 \
+      libxrandr2 libxinerama1 libxcursor1 libxi6 xauth mesa-utils libgomp1 \
     && locale-gen en_US.UTF-8 \
     && curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
       -o /usr/share/keyrings/ros-archive-keyring.gpg \
@@ -315,9 +193,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-rosdep \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the exact PyTorch/CUDA pair used by the builder into an isolated
-# target directory. This directory is also used by Isaac scene code that needs
-# PyTorch and NVIDIA Warp for GPU point-cloud visualization/corruption.
+# Keep the ML stack isolated from Isaac Sim's own packages.
 RUN mkdir -p /opt/difflow-python-packages \
     && /isaac-sim/python.sh -m pip install \
       --no-cache-dir \
@@ -326,22 +202,15 @@ RUN mkdir -p /opt/difflow-python-packages \
       torchvision==${TORCHVISION_VERSION} \
       --index-url https://download.pytorch.org/whl/cu128
 
-# Runtime dependencies for both Isaac scene support and ScenePredictor:
-#   - warp-lang: Isaac GPU camera corruption and optional PointCloud2 path;
-#   - Ultralytics: YOLO instance segmentation;
-#   - open_clip_torch: batched CLIP visual embeddings;
-#   - scipy/sklearn: current DifFlow3D utilities.
-#
-# PYTHONPATH exposes the already-installed target directory to pip's resolver
-# so it does not install a second Torch stack.
+# Install packages that do not depend on Torch first. Ultralytics is installed
+# separately with --no-deps so pip cannot replace the pinned cu128 Torch with
+# a newer PyPI Torch/CUDA 13 stack.
 RUN PYTHONPATH=/opt/difflow-python-packages \
     /isaac-sim/python.sh -m pip install \
       --no-cache-dir \
       --target /opt/difflow-python-packages \
       numpy==1.26.4 \
       warp-lang==${WARP_VERSION} \
-      ultralytics-opencv-headless==${ULTRALYTICS_VERSION} \
-      open_clip_torch==${OPEN_CLIP_VERSION} \
       scipy==1.15.3 \
       scikit-learn==1.6.1 \
       joblib==1.4.2 \
@@ -351,80 +220,108 @@ RUN PYTHONPATH=/opt/difflow-python-packages \
       pycparser==2.22 \
       pypng==0.20220715.0 \
       PyYAML==6.0.2 \
-      Pillow==11.2.1
+      Pillow==11.2.1 \
+      onnx==1.18.0 \
+      onnxslim==0.1.59 \
+      matplotlib==3.10.8 \
+      opencv-python-headless==4.11.0.86 \
+      requests==2.32.5 \
+      psutil==7.2.2 \
+      polars==1.38.1 \
+      nvidia-ml-py==13.590.48 \
+      filelock==3.20.3 \
+      packaging==25.0 \
+      sympy==1.14.0 \
+      ftfy \
+      regex
+
+RUN PYTHONPATH=/opt/difflow-python-packages \
+    /isaac-sim/python.sh -m pip install \
+      --no-cache-dir \
+      --no-deps \
+      --target /opt/difflow-python-packages \
+      ultralytics-thop==2.0.18 \
+      ultralytics-opencv-headless==${ULTRALYTICS_VERSION}
+
+# YOLOE uses this CLIP package only to encode the text vocabulary before
+# exporting the fixed-vocabulary TensorRT engine. --no-deps prevents pip from
+# replacing the pinned Torch 2.11.0+cu128 stack.
+RUN PYTHONPATH=/opt/difflow-python-packages \
+    /isaac-sim/python.sh -m pip install \
+      --no-cache-dir \
+      --no-deps \
+      --target /opt/difflow-python-packages \
+      "git+https://github.com/ultralytics/CLIP.git"
+
+# Explicit cu12 package prevents pip from selecting a CUDA 13 TensorRT wheel.
+RUN PYTHONPATH=/opt/difflow-python-packages \
+    /isaac-sim/python.sh -m pip install \
+      --no-cache-dir \
+      --target /opt/difflow-python-packages \
+      "tensorrt-cu12==${TENSORRT_VERSION}"
 
 COPY --from=difflow-builder /opt/DifFlow3D /opt/DifFlow3D
-
-# Supply the CUDA runtime required by pointnet2_cuda.
 RUN mkdir -p /usr/local/lib/difflow-cuda
-
 COPY --from=difflow-builder \
     /opt/difflow-cuda-runtime/lib/libcudart.so.12 \
     /usr/local/lib/difflow-cuda/libcudart.so.12
 
-RUN printf '%s\n' \
+# Register Torch and TensorRT wheel libraries with the dynamic linker.
+RUN trt_lib_dir="$(find /opt/difflow-python-packages -type f \
+      \( -name 'libnvinfer.so' -o -name 'libnvinfer.so.*' \) \
+      -printf '%h\n' | sort -u | head -n 1)" \
+    && test -n "${trt_lib_dir}" \
+    && printf '%s\n' \
       '/usr/local/lib/difflow-cuda' \
       '/opt/difflow-python-packages/torch/lib' \
-      > /etc/ld.so.conf.d/difflow-runtime.conf \
+      "${trt_lib_dir}" \
+      > /etc/ld.so.conf.d/scenepredictor-runtime.conf \
     && ldconfig \
     && ldconfig -p | grep -F 'libcudart.so.12' \
+    && ldconfig -p | grep -F 'libnvinfer.so' \
     && test -f /opt/difflow-python-packages/torch/lib/libtorch_python.so
 
-# Add paths after Isaac Sim's normal paths. This preserves Isaac Sim's own
-# environment while exposing the isolated ML packages, local DifFlow3D
-# submodule, and the bind-mounted ScenePredictor repository.
+# Append custom paths after Isaac Sim's standard paths.
 RUN /isaac-sim/python.sh - <<'PY'
 from pathlib import Path
 import site
 
 site_dirs = site.getsitepackages()
 if not site_dirs:
-    raise RuntimeError("Isaac Sim site-packages directory was not found")
-
-site_dir = Path(site_dirs[0])
-pth = site_dir / "scenepredictor_paths.pth"
+    raise RuntimeError('Isaac Sim site-packages directory not found')
+pth = Path(site_dirs[0]) / 'scenepredictor_paths.pth'
 pth.write_text(
     "import sys; "
-    "sys.path.append('/opt/difflow-python-packages'); "
-    "sys.path.append('/opt/DifFlow3D'); "
-    "sys.path.append('/opt/DifFlow3D/pointnet2'); "
-    "sys.path.append('/workspace')\n",
-    encoding="utf-8",
+    "sys.path.insert(0, '/workspace'); "
+    "sys.path.insert(0, '/opt/DifFlow3D/pointnet2'); "
+    "sys.path.insert(0, '/opt/DifFlow3D'); "
+    "sys.path.insert(0, '/opt/difflow-python-packages')\n",
+    encoding='utf-8',
 )
-
-print("created:", pth)
-print(pth.read_text(encoding="utf-8"))
+print('created:', pth)
 PY
 
 WORKDIR /workspace
 
-# One entrypoint supports Isaac Sim, RViz, ROS inspection and the future
-# ScenePredictor subscriber process. ScenePredictor itself should be run as a
-# separate process from Isaac Sim, communicating through ROS 2.
 RUN cat > /usr/local/bin/scenepredictor-entrypoint <<'EOF_ENTRYPOINT'
 #!/usr/bin/env bash
 set -euo pipefail
-
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
     set +u
     source /opt/ros/jazzy/setup.bash
     set -u
 fi
-
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-117}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export OMNICLIENT_HUB_MODE="${OMNICLIENT_HUB_MODE:-disabled}"
 export HF_HOME="${HF_HOME:-/isaac-sim/.cache/huggingface}"
 export TORCH_HOME="${TORCH_HOME:-/isaac-sim/.cache/torch}"
 export YOLO_CONFIG_DIR="${YOLO_CONFIG_DIR:-/isaac-sim/.config/Ultralytics}"
-
 exec "$@"
 EOF_ENTRYPOINT
 
 RUN chmod +x /usr/local/bin/scenepredictor-entrypoint \
     && cat >> /isaac-sim/.bashrc <<'EOF_BASHRC'
-
-# ScenePredictor container environment.
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
     source /opt/ros/jazzy/setup.bash
 fi
@@ -435,73 +332,54 @@ export TORCH_HOME="${TORCH_HOME:-/isaac-sim/.cache/torch}"
 export YOLO_CONFIG_DIR="${YOLO_CONFIG_DIR:-/isaac-sim/.config/Ultralytics}"
 EOF_BASHRC
 
-# Inspect the custom extension's dynamic dependencies. Missing NVIDIA driver
-# libraries during docker build are acceptable because the toolkit injects
-# them only at `docker run --gpus all` time.
-RUN extension_path="$(find /opt/DifFlow3D/pointnet2 -maxdepth 1 \
-      -name 'pointnet2_cuda*.so' -print -quit)" \
-    && test -n "${extension_path}" \
-    && echo "PointNet++ extension: ${extension_path}" \
-    && ldd "${extension_path}" || true
-
-# Build-time import validation. No GPU is expected during docker build, so
-# CUDA availability is printed but not asserted.
+# Import validation. GPU availability is not required during docker build.
 RUN source /opt/ros/jazzy/setup.bash \
     && YOLO_CONFIG_DIR=/tmp/ultralytics-build-config \
        HF_HOME=/tmp/huggingface-build-cache \
        /isaac-sim/python.sh - <<'PY'
 import sys
-
+import clip
 import cv2
 import numpy
-import open_clip
+import onnx
+import onnxslim
 import rclpy
-import message_filters
-from cv_bridge import CvBridge
 import scipy
 import sklearn
+import tensorrt as trt
 import torch
 import torchvision
-import warp as wp
-import yaml
-import PIL
 import ultralytics
-from ultralytics import YOLO
-
+import warp as wp
+from cv_bridge import CvBridge
+from ultralytics import YOLO, YOLOE
 import pointnet2_cuda
 from pointnet2 import pointnet2_utils
 
 wp.init()
-
-print("Isaac Python:", sys.version)
-print("Isaac executable:", sys.executable)
-print("numpy:", numpy.__version__)
-print("torch:", torch.__version__)
-print("torchvision:", torchvision.__version__)
-print("torch CUDA:", torch.version.cuda)
-print("CUDA available during docker build:", torch.cuda.is_available())
-print("Warp:", wp.__version__)
-print("Warp devices during build:", wp.get_devices())
-print("OpenCV:", cv2.__version__)
-print("Ultralytics:", ultralytics.__version__)
-print("YOLO class:", YOLO)
-print("OpenCLIP module:", open_clip.__file__)
-print("OpenCLIP pretrained configs:", len(open_clip.list_pretrained()))
-print("ROS rclpy:", rclpy.__file__)
-print("message_filters:", message_filters.__file__)
-print("CvBridge:", CvBridge)
-print("scipy:", scipy.__version__)
-print("sklearn:", sklearn.__version__)
-print("pointnet2_cuda:", pointnet2_cuda.__file__)
-print("pointnet2_utils:", pointnet2_utils.__file__)
-print("ScenePredictor runtime imports OK")
+print('Python:', sys.version)
+print('Ultralytics CLIP:', clip.__file__)
+print('CLIP models:', clip.available_models())
+print('numpy:', numpy.__version__)
+print('torch:', torch.__version__, 'CUDA:', torch.version.cuda)
+print('torchvision:', torchvision.__version__)
+print('TensorRT:', trt.__version__)
+print('ONNX:', onnx.__version__)
+print('ONNX Slim:', onnxslim.__file__)
+print('Ultralytics:', ultralytics.__version__)
+print('YOLO:', YOLO, 'YOLOE:', YOLOE)
+print('OpenCV:', cv2.__version__)
+print('Warp:', wp.__version__)
+print('ROS:', rclpy.__file__, 'CvBridge:', CvBridge)
+print('scipy:', scipy.__version__, 'sklearn:', sklearn.__version__)
+print('pointnet2_cuda:', pointnet2_cuda.__file__)
+print('pointnet2_utils:', pointnet2_utils.__file__)
 PY
 
-# Prepare writable runtime paths. Host bind-mount directories should also be
-# writable by UID/GID 1234.
 RUN install -d -o 1234 -g 1234 -m 0775 \
       /workspace \
       /workspace/camera_output \
+      /workspace/weights \
       /isaac-sim/kit/cache \
       /isaac-sim/.cache \
       /isaac-sim/.cache/ov \
@@ -526,10 +404,11 @@ RUN install -d -o 1234 -g 1234 -m 0775 \
     && test -r /opt/difflow-python-packages/torch/__init__.py \
     && test -r /opt/difflow-python-packages/warp/__init__.py \
     && test -r /opt/difflow-python-packages/ultralytics/__init__.py \
-    && test -r /opt/difflow-python-packages/open_clip/__init__.py \
+    && test -r /opt/difflow-python-packages/clip/__init__.py \
+    && test -r /opt/difflow-python-packages/tensorrt/__init__.py \
+    && test -r /opt/difflow-python-packages/onnx/__init__.py \
     && test -x /opt/ros/jazzy/bin/rviz2
 
 USER 1234:1234
-
 ENTRYPOINT ["/usr/local/bin/scenepredictor-entrypoint"]
 CMD ["/bin/bash"]

@@ -7,45 +7,18 @@ from .data_types import FlowInput, FlowResult
 
 
 class VelocityRecovery:
-    """Step 5C: recover source-anchor velocity to every current moving point."""
+    """Recover source-anchor velocity to current moving candidates.
 
-    def __init__(self, config: PipelineConfig) -> None:
-        self.config = config
+    Same-track restriction is applied as a GPU mask inside each cdist chunk.
+    This avoids one Python loop and one GPU->CPU scalar transfer per track.
+    Current-only tracks have no valid source anchors and receive zero velocity.
+    """
 
-    def _recover_track(
+    def __init__(
         self,
-        target_points: torch.Tensor,
-        warped_anchors: torch.Tensor,
-        anchor_velocity: torch.Tensor,
-    ) -> torch.Tensor:
-        if warped_anchors.shape[0] == 0:
-            return torch.zeros_like(target_points)
-        k = min(self.config.recovery.knn, warped_anchors.shape[0])
-        outputs: list[torch.Tensor] = []
-        temperature = self.config.recovery.temperature_m
-
-        for begin in range(
-            0,
-            target_points.shape[0],
-            self.config.recovery.chunk_size,
-        ):
-            chunk = target_points[
-                begin : begin + self.config.recovery.chunk_size
-            ]
-            distances = torch.cdist(chunk, warped_anchors)
-            values, indices = torch.topk(
-                distances,
-                k=k,
-                dim=1,
-                largest=False,
-                sorted=False,
-            )
-            weights = torch.softmax(-values / temperature, dim=1)
-            neighbors = anchor_velocity[indices]
-            outputs.append(
-                torch.sum(weights[..., None] * neighbors, dim=1)
-            )
-        return torch.cat(outputs, dim=0)
+        config: PipelineConfig,
+    ) -> None:
+        self.config = config
 
     def recover(
         self,
@@ -53,27 +26,84 @@ class VelocityRecovery:
         flow_result: FlowResult,
     ) -> torch.Tensor:
         current = flow_input.current_candidates
+        anchors = flow_result.warped_anchors
+        anchor_velocity = flow_result.anchor_velocity
         output = torch.zeros_like(current)
 
-        if not self.config.recovery.restrict_same_track:
-            return self._recover_track(
-                current,
-                flow_result.warped_anchors,
-                flow_result.anchor_velocity,
+        if current.shape[0] == 0 or anchors.shape[0] == 0:
+            return output
+
+        k = min(
+            self.config.recovery.knn,
+            anchors.shape[0],
+        )
+        temperature = max(
+            self.config.recovery.temperature_m,
+            1.0e-8,
+        )
+        restrict = (
+            self.config.recovery.restrict_same_track
+        )
+        anchor_ids = (
+            flow_input.previous_anchor_track_ids
+        )
+
+        for begin in range(
+            0,
+            current.shape[0],
+            self.config.recovery.chunk_size,
+        ):
+            end = min(
+                begin
+                + self.config.recovery.chunk_size,
+                current.shape[0],
+            )
+            chunk = current[begin:end]
+            distances = torch.cdist(
+                chunk,
+                anchors,
             )
 
-        for track_id in torch.unique(
-            flow_input.current_candidate_track_ids
-        ).tolist():
-            target_mask = (
-                flow_input.current_candidate_track_ids == track_id
+            if restrict:
+                target_ids = (
+                    flow_input.current_candidate_track_ids[
+                        begin:end
+                    ]
+                )
+                same_track = (
+                    target_ids[:, None]
+                    == anchor_ids[None, :]
+                )
+                distances.masked_fill_(
+                    ~same_track,
+                    torch.inf,
+                )
+
+            values, indices = torch.topk(
+                distances,
+                k=k,
+                dim=1,
+                largest=False,
+                sorted=False,
             )
-            source_mask = (
-                flow_input.previous_anchor_track_ids == track_id
+            valid = torch.isfinite(values)
+            logits = torch.where(
+                valid,
+                -values / temperature,
+                torch.full_like(values, -1.0e9),
             )
-            output[target_mask] = self._recover_track(
-                current[target_mask],
-                flow_result.warped_anchors[source_mask],
-                flow_result.anchor_velocity[source_mask],
+            weights = torch.softmax(
+                logits,
+                dim=1,
+            ) * valid
+            weights = weights / weights.sum(
+                dim=1,
+                keepdim=True,
+            ).clamp_min_(1.0e-12)
+            neighbors = anchor_velocity[indices]
+            output[begin:end] = torch.sum(
+                weights[..., None] * neighbors,
+                dim=1,
             )
+
         return output

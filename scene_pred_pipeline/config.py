@@ -21,14 +21,22 @@ class RosConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    yolo_weights: str = "yolo11n-seg.pt"
-    yolo_image_size: int = 640
-    yolo_confidence: float = 0.25
-    yolo_iou: float = 0.70
-    clip_model: str = "ViT-B-32"
-    clip_pretrained: str = "openai"
-    clip_crop_padding: float = 0.10
-    clip_batch_size: int = 64
+    # TensorRT is the default deployment backend. The .engine must be exported
+    # with scripts/export_yoloe_tensorrt.py using the same label_file.
+    backend: str = "tensorrt"
+    weights: str = "/workspace/weights/yoloe-26s-seg.engine"
+    source_weights: str = "/workspace/weights/yoloe-26s-seg.pt"
+    label_file: str = "/workspace/configs/object_labels.txt"
+
+    image_size: int = 640
+    engine_batch_size: int = 2
+    confidence: float = 0.20
+    iou: float = 0.70
+    half: bool = True
+    retina_masks: bool = True
+
+    # Executed in PerViewPerception.__init__, before cycle-time collection.
+    warmup_frames: int = 5
 
 
 @dataclass(frozen=True)
@@ -45,35 +53,43 @@ class DepthConfig:
 
 @dataclass(frozen=True)
 class MultiViewConfig:
+    # Class labels are a hard gate. Geometry decides instance identity.
     centroid_gate_m: float = 0.30
-    reprojection_points: int = 64
+    aabb_gap_gate_m: float = 0.10
+
+    reprojection_points: int = 96
     minimum_visible_points: int = 16
     occlusion_tolerance_m: float = 0.03
-    depth_tolerance_m: float = 0.05
-    reprojection_threshold: float = 0.50
-    clip_threshold: float = 0.65
-    high_class_confidence: float = 0.75
-    reprojection_weight: float = 0.65
-    clip_weight: float = 0.25
-    centroid_weight: float = 0.10
+    depth_tolerance_m: float = 0.04
+    reprojection_threshold: float = 0.30
+
+    reprojection_weight: float = 0.85
+    spatial_weight: float = 0.15
 
 
 @dataclass(frozen=True)
 class VoxelConfig:
-    size_m: float = 0.01
+    size_m: float = 0.02
     origin_world: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True)
 class TrackingConfig:
-    centroid_gate_m: float = 0.15
-    clip_threshold: float = 0.60
-    position_weight: float = 0.65
-    appearance_weight: float = 0.35
-    high_class_confidence: float = 0.75
-    history_lags: tuple[int, ...] = (1, 2, 4, 8)
+    # Identity association uses current geometry only. No predicted position,
+    # velocity extrapolation or appearance embedding is used.
+    centroid_gate_m: float = 0.20
+    aabb_gap_gate_m: float = 0.08
+    voxel_neighbor_radius: int = 1
+    voxel_coverage_threshold: float = 0.08
+
+    voxel_weight: float = 0.70
+    spatial_weight: float = 0.30
+
+    # Motion classification remains multi-lag and conservative.
+    history_lags: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
     centroid_speed_threshold_mps: float = 0.03
     voxel_iou_threshold: float = 0.60
+    minimum_history_matches: int = 1
 
 
 @dataclass(frozen=True)
@@ -84,6 +100,7 @@ class FlowConfig:
     checkpoint: str = (
         "/opt/DifFlow3D/pretrain_weights/model_difflow_355_0.0114.pth"
     )
+
     target_points: int = 2048
     pre_fps_factor: float = 2.0
     iterations: int = 4
@@ -111,6 +128,7 @@ class OutputConfig:
     publish_velocity_markers: bool = True
     publish_moving_masks: bool = True
     publish_annotated_rgb: bool = True
+
     velocity_marker_stride: int = 32
     velocity_marker_scale: float = 0.20
     profile_interval_frames: int = 30
@@ -119,8 +137,17 @@ class OutputConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     device: str = "cuda:0"
-    enable_cuda_timing: bool = True
     allow_tf32: bool = True
+
+    # When false, no CUDA events, synchronization, wall-clock bookkeeping or
+    # summary accumulation is performed.
+    enable_profiling: bool = True
+    enable_cuda_timing: bool = True
+    profile_history_size: int = 300
+
+    # When false, no RViz publishers are created and no annotated RGB or moving
+    # mask is generated. This removes the large GPU->CPU visualization copies.
+    enable_visualization: bool = True
 
 
 @dataclass(frozen=True)

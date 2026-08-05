@@ -30,27 +30,44 @@ source /opt/ros/jazzy/setup.bash
 '
 ```
 
-# Run Rviz for pcd visualization:
+# Download YOLO weight:
 
 ```bash
 docker exec -it scenepredictor bash -lc '
-source /opt/ros/jazzy/setup.bash
-rviz2 -d /workspace/isaacscene/isaacscene.rviz
+mkdir -p /workspace/weights
+cd /workspace/weights
+
+/isaac-sim/python.sh - <<'"'"'PY'"'"'
+from ultralytics import YOLOE
+
+model = YOLOE(
+    "yoloe-26s-seg.pt",
+    task="segment",
+)
+
+print("YOLOE model loaded successfully")
+print("Model:", model)
+PY
+
+ls -lh /workspace/weights/yoloe-26s-seg.pt
 '
 ```
 
-# If cannot write to isaacscene.rviz:
-
-```bash
-sudo setfacl -m u:1234:rw isaacscene/isaacscene.rviz
-```
-
-# Check ROS topics:
+# Export TensorRT engine file:
 
 ```bash
 docker exec -it scenepredictor bash -lc '
 source /opt/ros/jazzy/setup.bash
-ros2 topic list | sort
+
+/isaac-sim/python.sh \
+  /workspace/scripts/export_yoloe_tensorrt.py \
+  --weights /workspace/weights/yoloe-26s-seg.pt \
+  --labels /workspace/configs/object_labels.txt \
+  --output /workspace/weights/yoloe-26s-seg.engine \
+  --imgsz 640 \
+  --batch 2 \
+  --device 0 \
+  --workspace 4
 '
 ```
 
@@ -77,6 +94,22 @@ chmod 700 "${XDG_RUNTIME_DIR}"
 source /opt/ros/jazzy/setup.bash
 
 rviz2 -d /workspace/scene_pred_pipeline.rviz
+'
+```
+
+
+```bash
+touch scene_pred_pipeline.rviz
+sudo setfacl -m u:1234:rw scene_pred_pipeline.rviz
+sudo setfacl -m u:1234:rwx .
+
+
+# Check ROS topics:
+
+```bash
+docker exec -it scenepredictor bash -lc '
+source /opt/ros/jazzy/setup.bash
+ros2 topic list | sort
 '
 ```
 

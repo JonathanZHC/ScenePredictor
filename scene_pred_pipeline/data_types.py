@@ -17,6 +17,7 @@ class PointType(IntEnum):
     STATIC_OBJECT = 1
     MOVING_OBJECT = 2
 
+
 @dataclass(frozen=True)
 class ImageDetection:
     bbox_xyxy: tuple[int, int, int, int]
@@ -25,6 +26,7 @@ class ImageDetection:
     confidence: float
     track_id: int
     motion_state: MotionState
+
 
 @dataclass
 class CameraFrameCpu:
@@ -41,7 +43,6 @@ class CameraFrameCpu:
 class CameraFrameGpu:
     camera_name: str
     stamp_ns: int
-    rgb: torch.Tensor
     depth: torch.Tensor
     K: torch.Tensor
     T_world_camera: torch.Tensor
@@ -67,10 +68,11 @@ class ViewInstance:
 
     mask_original: torch.Tensor
     mask_eroded: torch.Tensor
-    clip_embedding: torch.Tensor
 
     pcd_world: torch.Tensor
     centroid_world: torch.Tensor
+    aabb_min_world: torch.Tensor
+    aabb_max_world: torch.Tensor
     reprojection_points_world: torch.Tensor
 
 
@@ -79,18 +81,20 @@ class PerViewResult:
     camera: CameraFrameGpu
     instances: list[ViewInstance]
     background_pcd_world: torch.Tensor
-    annotated_rgb: np.ndarray
 
 
 @dataclass
 class FusedObject:
     frame_object_id: int
     class_id: int
+    class_name: str
     class_confidence: float
-    representative_embedding: torch.Tensor
-    view_embeddings: list[torch.Tensor]
+
     pcd_world: torch.Tensor
     centroid_world: torch.Tensor
+    aabb_min_world: torch.Tensor
+    aabb_max_world: torch.Tensor
+
     source_camera_names: tuple[str, ...]
     members: list[ViewInstance]
 
@@ -107,12 +111,18 @@ class FusedFrame:
 class VoxelizedObject:
     frame_object_id: int
     class_id: int
+    class_name: str
     class_confidence: float
-    representative_embedding: torch.Tensor
+
     points: torch.Tensor
     voxel_keys: torch.Tensor
+    voxel_coords: torch.Tensor
+
     centroid_world: torch.Tensor
+    aabb_min_world: torch.Tensor
+    aabb_max_world: torch.Tensor
     members: list[ViewInstance]
+
     track_id: int = -1
     motion_state: MotionState = MotionState.STATIC
 
@@ -144,6 +154,20 @@ class Track:
 
 
 @dataclass
+class FlowCache:
+    """Per-frame moving-point sampling cache.
+
+    The current frame is preselected and FPS-sampled exactly once. On the next
+    cycle these tensors are reused directly as the previous-frame input.
+    """
+
+    candidates: torch.Tensor
+    candidate_track_ids: torch.Tensor
+    anchors: torch.Tensor
+    anchor_track_ids: torch.Tensor
+
+
+@dataclass
 class TrackedFrame:
     frame_index: int
     stamp_ns: int
@@ -151,6 +175,7 @@ class TrackedFrame:
     background_points: torch.Tensor
     background_keys: torch.Tensor
     moving_masks: dict[str, torch.Tensor]
+    flow_cache: FlowCache | None = None
 
 
 @dataclass
@@ -159,10 +184,12 @@ class FlowInput:
     current_candidates: torch.Tensor
     previous_candidate_track_ids: torch.Tensor
     current_candidate_track_ids: torch.Tensor
+
     previous_anchors: torch.Tensor
     current_anchors: torch.Tensor
     previous_anchor_track_ids: torch.Tensor
     current_anchor_track_ids: torch.Tensor
+
     dt_s: float
 
 
@@ -176,12 +203,16 @@ class FlowResult:
 @dataclass
 class SceneVelocityOutput:
     stamp_ns: int
+
     background_points: torch.Tensor
     static_points: torch.Tensor
+
     moving_points: torch.Tensor
     moving_velocity: torch.Tensor
     moving_track_ids: torch.Tensor
+
     moving_masks: dict[str, torch.Tensor]
     camera_rgb: dict[str, np.ndarray]
     annotated_rgb: dict[str, np.ndarray]
+
     timings_ms: dict[str, float]

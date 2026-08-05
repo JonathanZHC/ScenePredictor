@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-import statistics
 
+import numpy as np
 import torch
 
 from .config import PipelineConfig
@@ -14,19 +14,50 @@ from .data_types import (
     VoxelizedFrame,
     VoxelizedObject,
 )
-from .voxel import voxel_iou
+from .voxel import (
+    voxel_iou,
+    voxel_neighbor_coverage,
+)
+
+
+def _aabb_gap_numpy(
+    min_a: np.ndarray,
+    max_a: np.ndarray,
+    min_b: np.ndarray,
+    max_b: np.ndarray,
+) -> float:
+    separation = np.maximum(
+        np.maximum(
+            min_a - max_b,
+            min_b - max_a,
+        ),
+        0.0,
+    )
+    return float(np.linalg.norm(separation))
 
 
 class SimpleObjectTracker:
-    """Step 4: previous-frame matching and median multi-lag motion decision."""
+    """Current-geometry tracking and multi-lag motion classification.
 
-    def __init__(self, config: PipelineConfig) -> None:
+    Identity association never extrapolates position or differentiates a noisy
+    visible-point centroid into a predicted velocity.
+    """
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+    ) -> None:
         self.config = config
         self.next_track_id = 0
-        self.previous_objects: list[VoxelizedObject] = []
+        self.previous_objects: list[
+            VoxelizedObject
+        ] = []
         self.tracks: dict[int, Track] = {}
 
-    def _new_track(self, item: VoxelizedObject) -> int:
+    def _new_track(
+        self,
+        item: VoxelizedObject,
+    ) -> int:
         track_id = self.next_track_id
         self.next_track_id += 1
         self.tracks[track_id] = Track(
@@ -35,37 +66,174 @@ class SimpleObjectTracker:
         )
         return track_id
 
-    def _assign_tracks(self, current: list[VoxelizedObject]) -> None:
-        candidates: list[tuple[float, int, int]] = []
-
-        for current_index, item in enumerate(current):
-            for previous_index, previous in enumerate(self.previous_objects):
-                distance = torch.linalg.norm(
-                    item.centroid_world - previous.centroid_world
+    @staticmethod
+    def _geometry_table(
+        objects: list[VoxelizedObject],
+    ) -> np.ndarray:
+        if not objects:
+            return np.empty(
+                (0, 9),
+                dtype=np.float32,
+            )
+        return torch.stack(
+            [
+                torch.cat(
+                    (
+                        item.centroid_world,
+                        item.aabb_min_world,
+                        item.aabb_max_world,
+                    )
                 )
-                if float(distance) > self.config.tracking.centroid_gate_m:
+                for item in objects
+            ]
+        ).detach().float().cpu().numpy()
+
+    def _assign_tracks(
+        self,
+        current: list[VoxelizedObject],
+    ) -> None:
+        current_geometry = self._geometry_table(
+            current
+        )
+        previous_geometry = self._geometry_table(
+            self.previous_objects
+        )
+
+        pending: list[
+            tuple[
+                int,
+                int,
+                float,
+                float,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = []
+        for current_index, item in enumerate(current):
+            for previous_index, previous in enumerate(
+                self.previous_objects
+            ):
+                if item.class_id != previous.class_id:
                     continue
-                if (
-                    item.class_id != previous.class_id
-                    and item.class_confidence
-                    > self.config.tracking.high_class_confidence
-                    and previous.class_confidence
-                    > self.config.tracking.high_class_confidence
+
+                centroid_distance = float(
+                    np.linalg.norm(
+                        current_geometry[current_index, :3]
+                        - previous_geometry[previous_index, :3]
+                    )
+                )
+                box_gap = _aabb_gap_numpy(
+                    current_geometry[current_index, 3:6],
+                    current_geometry[current_index, 6:9],
+                    previous_geometry[previous_index, 3:6],
+                    previous_geometry[previous_index, 6:9],
+                )
+                if not (
+                    centroid_distance
+                    <= self.config.tracking.centroid_gate_m
+                    or box_gap
+                    <= self.config.tracking.aabb_gap_gate_m
                 ):
                     continue
-                appearance = torch.dot(
-                    item.representative_embedding,
-                    previous.representative_embedding,
+
+                current_in_previous = (
+                    voxel_neighbor_coverage(
+                        item.voxel_keys,
+                        previous.voxel_coords,
+                        self.config.tracking.voxel_neighbor_radius,
+                    )
                 )
-                if float(appearance) < self.config.tracking.clip_threshold:
+                previous_in_current = (
+                    voxel_neighbor_coverage(
+                        previous.voxel_keys,
+                        item.voxel_coords,
+                        self.config.tracking.voxel_neighbor_radius,
+                    )
+                )
+                pending.append(
+                    (
+                        current_index,
+                        previous_index,
+                        centroid_distance,
+                        box_gap,
+                        current_in_previous,
+                        previous_in_current,
+                    )
+                )
+
+        candidates: list[
+            tuple[float, int, int]
+        ] = []
+        if pending:
+            coverages = torch.stack(
+                [
+                    torch.stack(
+                        (item[4], item[5])
+                    )
+                    for item in pending
+                ]
+            ).detach().float().cpu().numpy()
+
+            for item, values in zip(
+                pending,
+                coverages,
+                strict=True,
+            ):
+                (
+                    current_index,
+                    previous_index,
+                    centroid_distance,
+                    box_gap,
+                    *_unused,
+                ) = item
+                current_in_previous = float(values[0])
+                previous_in_current = float(values[1])
+                coverage_max = max(
+                    current_in_previous,
+                    previous_in_current,
+                )
+                coverage_mean = 0.5 * (
+                    current_in_previous
+                    + previous_in_current
+                )
+                if (
+                    coverage_max
+                    < self.config.tracking.voxel_coverage_threshold
+                ):
                     continue
+
+                normalized_gap = min(
+                    centroid_distance
+                    / max(
+                        self.config.tracking.centroid_gate_m,
+                        1.0e-6,
+                    ),
+                    box_gap
+                    / max(
+                        self.config.tracking.aabb_gap_gate_m,
+                        1.0e-6,
+                    ),
+                    1.0,
+                )
+                spatial_score = 1.0 - normalized_gap
+
+                # max coverage handles partial occlusion; mean coverage rewards
+                # mutually consistent visible surfaces.
+                voxel_score = 0.5 * (
+                    coverage_max + coverage_mean
+                )
                 score = (
-                    self.config.tracking.position_weight
-                    * (1.0 - distance / self.config.tracking.centroid_gate_m)
-                    + self.config.tracking.appearance_weight * appearance
+                    self.config.tracking.voxel_weight
+                    * voxel_score
+                    + self.config.tracking.spatial_weight
+                    * spatial_score
                 )
                 candidates.append(
-                    (float(score), current_index, previous_index)
+                    (
+                        score,
+                        current_index,
+                        previous_index,
+                    )
                 )
 
         used_current: set[int] = set()
@@ -74,10 +242,15 @@ class SimpleObjectTracker:
             candidates,
             reverse=True,
         ):
-            if current_index in used_current or previous_index in used_previous:
+            if (
+                current_index in used_current
+                or previous_index in used_previous
+            ):
                 continue
             current[current_index].track_id = (
-                self.previous_objects[previous_index].track_id
+                self.previous_objects[
+                    previous_index
+                ].track_id
             )
             used_current.add(current_index)
             used_previous.add(previous_index)
@@ -93,41 +266,115 @@ class SimpleObjectTracker:
         stamp_ns: int,
     ) -> MotionState:
         track = self.tracks[item.track_id]
-        speeds: list[float] = []
-        ious: list[float] = []
+        speeds: list[torch.Tensor] = []
+        ious: list[torch.Tensor] = []
 
         for lag in self.config.tracking.history_lags:
-            old = track.history.get(frame_index - lag)
+            old = track.history.get(
+                frame_index - lag
+            )
             if old is None:
                 continue
-            dt_s = (stamp_ns - old.stamp_ns) * 1.0e-9
+
+            dt_s = (
+                stamp_ns - old.stamp_ns
+            ) * 1.0e-9
             if dt_s <= 0.0:
                 continue
-            displacement = torch.linalg.norm(
-                item.centroid_world - old.centroid_world
-            )
-            speeds.append(float(displacement) / dt_s)
-            ious.append(float(voxel_iou(item.voxel_keys, old.voxel_keys)))
 
-        if not speeds:
+            displacement = torch.linalg.norm(
+                item.centroid_world
+                - old.centroid_world
+            )
+            speeds.append(displacement / dt_s)
+            ious.append(
+                voxel_iou(
+                    item.voxel_keys,
+                    old.voxel_keys,
+                )
+            )
+
+        if (
+            len(speeds)
+            < self.config.tracking.minimum_history_matches
+        ):
             return MotionState.STATIC
 
-        median_speed = statistics.median(speeds)
-        median_iou = statistics.median(ious)
+        median_speed = torch.stack(
+            speeds
+        ).median()
+        median_iou = torch.stack(
+            ious
+        ).median()
+
+        moving = (
+            median_speed
+            > self.config.tracking.centroid_speed_threshold_mps
+        ) | (
+            median_iou
+            < self.config.tracking.voxel_iou_threshold
+        )
         return (
             MotionState.MOVING
-            if (
-                median_speed
-                > self.config.tracking.centroid_speed_threshold_mps
-                or median_iou
-                < self.config.tracking.voxel_iou_threshold
-            )
+            if bool(moving)
             else MotionState.STATIC
         )
 
-    def update(self, frame: VoxelizedFrame) -> TrackedFrame:
+    def _moving_masks(
+        self,
+        frame: VoxelizedFrame,
+    ) -> dict[str, torch.Tensor]:
+        if not (
+            self.config.runtime.enable_visualization
+            and self.config.output.publish_moving_masks
+        ):
+            return {}
+
+        moving_members: dict[
+            str,
+            list[torch.Tensor],
+        ] = defaultdict(list)
+        for item in frame.objects:
+            if (
+                item.motion_state
+                != MotionState.MOVING
+            ):
+                continue
+            for member in item.members:
+                moving_members[
+                    member.camera_name
+                ].append(member.mask_original)
+
+        output: dict[str, torch.Tensor] = {}
+        for camera_name, result in (
+            frame.camera_results.items()
+        ):
+            masks = moving_members.get(
+                camera_name,
+                [],
+            )
+            if masks:
+                output[camera_name] = torch.stack(
+                    masks
+                ).any(dim=0)
+            else:
+                output[camera_name] = torch.zeros(
+                    result.camera.depth.shape,
+                    device=result.camera.depth.device,
+                    dtype=torch.bool,
+                )
+        return output
+
+    def update(
+        self,
+        frame: VoxelizedFrame,
+    ) -> TrackedFrame:
         self._assign_tracks(frame.objects)
 
+        max_lag = max(
+            self.config.tracking.history_lags,
+            default=0,
+        )
         for item in frame.objects:
             item.motion_state = self._classify_motion(
                 item,
@@ -136,43 +383,26 @@ class SimpleObjectTracker:
             )
             track = self.tracks[item.track_id]
             track.last_object = item
-            track.history[frame.frame_index] = TrackObservation(
+            track.history[
+                frame.frame_index
+            ] = TrackObservation(
                 frame_index=frame.frame_index,
                 stamp_ns=frame.stamp_ns,
                 centroid_world=item.centroid_world,
                 voxel_keys=item.voxel_keys,
                 points=item.points,
             )
-            oldest = frame.frame_index - max(
-                self.config.tracking.history_lags
-            ) - 1
+
+            oldest = (
+                frame.frame_index - max_lag - 1
+            )
             for key in tuple(track.history):
                 if key < oldest:
                     del track.history[key]
 
-        moving_members: dict[str, list[torch.Tensor]] = defaultdict(list)
-        for item in frame.objects:
-            if item.motion_state != MotionState.MOVING:
-                continue
-            for member in item.members:
-                moving_members[member.camera_name].append(
-                    member.mask_original
-                )
-
-        moving_masks: dict[str, torch.Tensor] = {}
-        for camera_name, result in frame.camera_results.items():
-            shape = result.camera.depth.shape
-            masks = moving_members.get(camera_name, [])
-            if masks:
-                moving_masks[camera_name] = torch.stack(masks).any(dim=0)
-            else:
-                moving_masks[camera_name] = torch.zeros(
-                    shape,
-                    device=result.camera.depth.device,
-                    dtype=torch.bool,
-                )
-
+        moving_masks = self._moving_masks(frame)
         self.previous_objects = frame.objects
+
         return TrackedFrame(
             frame_index=frame.frame_index,
             stamp_ns=frame.stamp_ns,
