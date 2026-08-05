@@ -1,9 +1,11 @@
 from __future__ import annotations
+from collections import defaultdict
 
 import torch
 
 from .config import PipelineConfig
 from .data_types import (
+    ImageDetection,
     MotionState,
     MultiCameraFrame,
     SceneVelocityOutput,
@@ -91,8 +93,8 @@ class ScenePredictionPipeline:
     def process(
         self,
         frame: MultiCameraFrame,
-        profiler: "CycleProfiler | None" = None,
-    ) -> dict[str, PerViewResult]:
+    ) -> SceneVelocityOutput:
+    
         self.profiler.start_cycle()
         self.last_flow_gap_s = None
 
@@ -199,14 +201,51 @@ class ScenePredictionPipeline:
 
         timings = self.profiler.finish()
 
+        image_detections: dict[str, list[ImageDetection]] = defaultdict(list)
+
+        for item in tracked.objects:
+            for member in item.members:
+                image_detections[
+                    member.camera_name
+                ].append(
+                    ImageDetection(
+                        bbox_xyxy=member.bbox_xyxy,
+                        class_id=member.class_id,
+                        class_name=member.class_name,
+                        confidence=member.class_confidence,
+                        track_id=item.track_id,
+                        motion_state=item.motion_state,
+                    )
+                )
+
         output = SceneVelocityOutput(
             stamp_ns=tracked.stamp_ns,
+
             background_points=tracked.background_points,
             static_points=static_points,
+
             moving_points=moving_points,
             moving_velocity=moving_velocity,
             moving_track_ids=moving_track_ids,
+
             moving_masks=tracked.moving_masks,
+
+            # Reuse the original CPU RGB received from ROS.
+            # Do not copy the GPU RGB back to CPU.
+            camera_rgb={
+                camera_name: camera.rgb
+                for camera_name, camera
+                in frame.cameras.items()
+            },
+
+            image_detections={
+                camera_name: image_detections.get(
+                    camera_name,
+                    [],
+                )
+                for camera_name in frame.cameras
+            },
+
             timings_ms=timings,
         )
 

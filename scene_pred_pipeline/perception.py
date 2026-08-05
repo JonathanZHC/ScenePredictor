@@ -84,6 +84,19 @@ def _binary_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     return ~_binary_dilate(~mask, pixels)
 
 
+def _class_name(
+    names,
+    class_id: int,
+) -> str:
+    if isinstance(names, dict):
+        return str(names.get(class_id, class_id))
+
+    if 0 <= class_id < len(names):
+        return str(names[class_id])
+
+    return str(class_id)
+
+
 def _masked_points_world(
     camera: CameraFrameGpu,
     mask: torch.Tensor,
@@ -265,6 +278,13 @@ class PerViewPerception:
                         .cpu()
                         .tolist()
                     )
+                    boxes_cpu = (
+                        result.boxes.xyxy
+                        .round()
+                        .to(torch.int32)
+                        .cpu()
+                        .tolist()
+                    )
 
                     for local_id in range(masks.shape[0]):
                         original = masks[local_id]
@@ -289,6 +309,13 @@ class PerViewPerception:
                         if points.shape[0] == 0:
                             continue
 
+                        class_id = int(classes_cpu[local_id])
+
+                        x0, y0, x1, y1 = (
+                            int(value)
+                            for value in boxes_cpu[local_id]
+                        )
+
                         centroid = points.mean(dim=0)
 
                         sparse = _uniform_points(
@@ -305,11 +332,21 @@ class PerViewPerception:
                         instance = ViewInstance(
                             camera_name=camera_name,
                             local_instance_id=local_id,
-                            class_id=classes_cpu[local_id],
-                            class_confidence=confidences_cpu[local_id],
+
+                            class_id=class_id,
+                            class_name=_class_name(
+                                result.names,
+                                class_id,
+                            ),
+                            class_confidence=float(
+                                confidences_cpu[local_id]
+                            ),
+                            bbox_xyxy=(x0, y0, x1, y1),
+
                             mask_original=original,
                             mask_eroded=eroded,
                             clip_embedding=placeholder,
+
                             pcd_world=points,
                             centroid_world=centroid,
                             reprojection_points_world=sparse,

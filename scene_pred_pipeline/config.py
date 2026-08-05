@@ -110,6 +110,7 @@ class OutputConfig:
     publish_velocity_cloud: bool = True
     publish_velocity_markers: bool = True
     publish_moving_masks: bool = True
+    publish_annotated_rgb: bool = True
     velocity_marker_stride: int = 32
     velocity_marker_scale: float = 0.20
     profile_interval_frames: int = 30

@@ -80,6 +80,7 @@ output:
   publish_velocity_cloud: true
   publish_velocity_markers: true
   publish_moving_masks: true
+  publish_annotated_rgb: true
   velocity_marker_stride: 32
   velocity_marker_scale: 0.20
   profile_interval_frames: 30

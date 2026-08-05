@@ -17,6 +17,14 @@ class PointType(IntEnum):
     STATIC_OBJECT = 1
     MOVING_OBJECT = 2
 
+@dataclass(frozen=True)
+class ImageDetection:
+    bbox_xyxy: tuple[int, int, int, int]
+    class_id: int
+    class_name: str
+    confidence: float
+    track_id: int
+    motion_state: MotionState
 
 @dataclass
 class CameraFrameCpu:
@@ -51,11 +59,16 @@ class MultiCameraFrame:
 class ViewInstance:
     camera_name: str
     local_instance_id: int
+
     class_id: int
+    class_name: str
     class_confidence: float
+    bbox_xyxy: tuple[int, int, int, int]
+
     mask_original: torch.Tensor
     mask_eroded: torch.Tensor
     clip_embedding: torch.Tensor
+
     pcd_world: torch.Tensor
     centroid_world: torch.Tensor
     reprojection_points_world: torch.Tensor
@@ -162,10 +175,17 @@ class FlowResult:
 @dataclass
 class SceneVelocityOutput:
     stamp_ns: int
+
     background_points: torch.Tensor
     static_points: torch.Tensor
+
     moving_points: torch.Tensor
     moving_velocity: torch.Tensor
     moving_track_ids: torch.Tensor
+
     moving_masks: dict[str, torch.Tensor]
+
+    camera_rgb: dict[str, np.ndarray]
+    image_detections: dict[str, list[ImageDetection]]
+
     timings_ms: dict[str, float]

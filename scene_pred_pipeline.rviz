@@ -27,6 +27,22 @@ Visualization Manager:
       Marker Topic:
         Value: /scene_predictor/velocity_markers
     - Class: rviz_default_plugins/Image
+      Name: Camera 0 Raw RGB
+      Topic:
+        Value: /camera_0/color/image_raw
+    - Class: rviz_default_plugins/Image
+      Name: Camera 0 Detections
+      Topic:
+        Value: /scene_predictor/camera_0/rgb_annotated
+    - Class: rviz_default_plugins/Image
+      Name: Camera 1 Raw RGB
+      Topic:
+        Value: /camera_1/color/image_raw
+    - Class: rviz_default_plugins/Image
+      Name: Camera 1 Detections
+      Topic:
+        Value: /scene_predictor/camera_1/rgb_annotated
+    - Class: rviz_default_plugins/Image
       Name: Camera 0 Moving Mask
       Topic:
         Value: /scene_predictor/camera_0/moving_mask
