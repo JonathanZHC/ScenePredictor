@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import numpy as np
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
@@ -360,9 +361,24 @@ class PerViewPerception:
                             )
                         )
                         instances.append(instance)
+                
+                source_rgb = frame.cameras[camera_name].rgb
+
+                # Ultralytics plot() expects a BGR uint8 image.
+                source_bgr = np.ascontiguousarray(source_rgb[..., ::-1])
+                annotated_bgr = result.plot(
+                    img=source_bgr,
+                    boxes=True,
+                    labels=True,
+                    conf=True,
+                    masks=False,
+                )
+                # ROS output uses rgb8.
+                annotated_rgb = np.ascontiguousarray(
+                    annotated_bgr[..., ::-1]
+                )
 
                 background_mask = ~exclusion
-
                 background_points = _masked_points_world(
                     camera,
                     background_mask,
@@ -374,6 +390,7 @@ class PerViewPerception:
                     camera=camera,
                     instances=instances,
                     background_pcd_world=background_points,
+                    annotated_rgb=annotated_rgb,
                 )
 
         crops: torch.Tensor | None = None

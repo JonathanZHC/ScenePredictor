@@ -94,7 +94,7 @@ class ScenePredictionPipeline:
         self,
         frame: MultiCameraFrame,
     ) -> SceneVelocityOutput:
-    
+
         self.profiler.start_cycle()
         self.last_flow_gap_s = None
 
@@ -237,13 +237,9 @@ class ScenePredictionPipeline:
                 for camera_name, camera
                 in frame.cameras.items()
             },
-
-            image_detections={
-                camera_name: image_detections.get(
-                    camera_name,
-                    [],
-                )
-                for camera_name in frame.cameras
+            annotated_rgb={
+                camera_name: result.annotated_rgb
+                for camera_name, result in per_view.items()
             },
 
             timings_ms=timings,

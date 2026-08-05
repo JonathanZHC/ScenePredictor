@@ -109,7 +109,7 @@ def _velocity_cloud(
     return message
 
 
-def _rgb8_message(
+def _rgb8_image(
     node: Node,
     image: np.ndarray,
     stamp_ns: int,
@@ -119,12 +119,6 @@ def _rgb8_message(
         image,
         dtype=np.uint8,
     )
-
-    if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(
-            f"Expected HxWx3 RGB image, got "
-            f"{image.shape}."
-        )
 
     message = Image()
     message.header.stamp = _stamp_message(
@@ -141,102 +135,6 @@ def _rgb8_message(
     message.data = image.tobytes()
 
     return message
-
-
-def _annotated_rgb(
-    rgb: np.ndarray,
-    detections,
-) -> np.ndarray:
-    image = np.ascontiguousarray(
-        rgb.copy(),
-        dtype=np.uint8,
-    )
-
-    height, width = image.shape[:2]
-
-    for detection in detections:
-        x0, y0, x1, y1 = detection.bbox_xyxy
-
-        x0 = max(0, min(width - 1, x0))
-        x1 = max(0, min(width - 1, x1))
-        y0 = max(0, min(height - 1, y0))
-        y1 = max(0, min(height - 1, y1))
-
-        is_moving = (
-            detection.motion_state
-            == MotionState.MOVING
-        )
-
-        # Image is RGB, not BGR.
-        color = (
-            (255, 60, 40)
-            if is_moving
-            else (40, 220, 80)
-        )
-
-        state = (
-            "MOVING"
-            if is_moving
-            else "STATIC"
-        )
-
-        label = (
-            f"{detection.class_name} "
-            f"{detection.confidence:.2f} "
-            f"id={detection.track_id} "
-            f"{state}"
-        )
-
-        cv2.rectangle(
-            image,
-            (x0, y0),
-            (x1, y1),
-            color,
-            thickness=2,
-            lineType=cv2.LINE_AA,
-        )
-
-        (
-            text_width,
-            text_height,
-        ), baseline = cv2.getTextSize(
-            label,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            1,
-        )
-
-        text_y = max(
-            text_height + baseline + 2,
-            y0,
-        )
-
-        cv2.rectangle(
-            image,
-            (
-                x0,
-                text_y - text_height - baseline - 4,
-            ),
-            (
-                min(width - 1, x0 + text_width + 4),
-                text_y + 2,
-            ),
-            color,
-            thickness=-1,
-        )
-
-        cv2.putText(
-            image,
-            label,
-            (x0 + 2, text_y - baseline),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            thickness=1,
-            lineType=cv2.LINE_AA,
-        )
-
-    return image
 
 
 class RosVisualizer:
@@ -273,11 +171,8 @@ class RosVisualizer:
         self.annotated_rgb_pubs = {
             camera: node.create_publisher(
                 Image,
-                (
-                    f"/scene_predictor/"
-                    f"{camera}/rgb_annotated"
-                ),
-                image_qos,
+                f"/scene_predictor/{camera}/rgb_annotated",
+                qos,
             )
             for camera in config.ros.camera_names
         }
@@ -345,21 +240,17 @@ class RosVisualizer:
         self,
         output: SceneVelocityOutput,
     ) -> None:
-        for camera_name, rgb in output.camera_rgb.items():
-            annotated = _annotated_rgb(
-                rgb,
-                output.image_detections.get(
-                    camera_name,
-                    [],
-                ),
-            )
-
-            self.annotated_rgb_pubs[
+        for camera_name, image in output.annotated_rgb.items():
+            publisher = self.annotated_rgb_pubs.get(
                 camera_name
-            ].publish(
-                _rgb8_message(
+            )
+            if publisher is None:
+                continue
+
+            publisher.publish(
+                _rgb8_image(
                     self.node,
-                    annotated,
+                    image,
                     output.stamp_ns,
                     camera_name,
                 )

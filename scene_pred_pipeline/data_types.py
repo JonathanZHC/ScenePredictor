@@ -79,6 +79,7 @@ class PerViewResult:
     camera: CameraFrameGpu
     instances: list[ViewInstance]
     background_pcd_world: torch.Tensor
+    annotated_rgb: np.ndarray
 
 
 @dataclass
@@ -175,17 +176,12 @@ class FlowResult:
 @dataclass
 class SceneVelocityOutput:
     stamp_ns: int
-
     background_points: torch.Tensor
     static_points: torch.Tensor
-
     moving_points: torch.Tensor
     moving_velocity: torch.Tensor
     moving_track_ids: torch.Tensor
-
     moving_masks: dict[str, torch.Tensor]
-
     camera_rgb: dict[str, np.ndarray]
-    image_detections: dict[str, list[ImageDetection]]
-
+    annotated_rgb: dict[str, np.ndarray]
     timings_ms: dict[str, float]

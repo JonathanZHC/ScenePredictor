@@ -9,9 +9,9 @@ ros:
   incomplete_timeout_ms: 50.0
 
 models:
-  yolo_weights: yolo26n-seg.pt
+  yolo_weights: yolo26s-seg.pt
   yolo_image_size: 640
-  yolo_confidence: 0.25
+  yolo_confidence: 0.10
   yolo_iou: 0.70
   clip_model: ViT-B-32
   clip_pretrained: openai
