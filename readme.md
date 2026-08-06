@@ -41,7 +41,7 @@ cd /workspace/weights
 from ultralytics import YOLOE
 
 model = YOLOE(
-    "yoloe-26s-seg.pt",
+    "yoloe-26x-seg.pt",
     task="segment",
 )
 
@@ -49,7 +49,7 @@ print("YOLOE model loaded successfully")
 print("Model:", model)
 PY
 
-ls -lh /workspace/weights/yoloe-26s-seg.pt
+ls -lh /workspace/weights/yoloe-26x-seg.pt
 '
 ```
 
@@ -61,9 +61,9 @@ source /opt/ros/jazzy/setup.bash
 
 /isaac-sim/python.sh \
   /workspace/scripts/export_yoloe_tensorrt.py \
-  --weights /workspace/weights/yoloe-26s-seg.pt \
+  --weights /workspace/weights/yoloe-26x-seg.pt \
   --labels /workspace/configs/object_labels.txt \
-  --output /workspace/weights/yoloe-26s-seg.engine \
+  --output /workspace/weights/yoloe-26x-seg.engine \
   --imgsz 640 \
   --batch 2 \
   --device 0 \

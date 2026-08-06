@@ -1,13 +1,8 @@
-# One YOLOE text label per line.
-# File order defines class IDs in the exported TensorRT engine.
-# Re-export the engine whenever this file changes.
-
-person
-bottle
-shelf
-
 cereal box
 food can
+bottle
 mug
-apple
-bowl
+banana
+pudding box
+shelf
+ball

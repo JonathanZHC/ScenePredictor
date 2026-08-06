@@ -9,18 +9,18 @@ import time
 import traceback
 
 
-WARMUP_FRAMES = 20
+WARMUP_FRAMES = 30
 CAMERA_READY_MAX_ATTEMPTS = 60
 CAMERA_READY_LOG_INTERVAL = 10
-
 ROS_DOMAIN_ID = 117
+SCENE_CHOICES = ("static", "dynamic", "hybrid")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Publish two independent RGB-D camera streams and "
-            "full per-camera point clouds forever."
+            "Publish two independent RGB-D camera streams and full "
+            "per-camera point clouds from an asset-based Isaac Sim scene."
         )
     )
     parser.add_argument(
@@ -50,8 +50,7 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help=(
             "Full per-camera PointCloud2 publication rate. "
-            "Set to 0 to disable PointCloud2 generation "
-            "and publication."
+            "Set to 0 to disable PointCloud2 generation and publication."
         ),
     )
     parser.add_argument(
@@ -88,13 +87,15 @@ def parse_args() -> argparse.Namespace:
         "--scene",
         "--scene-mode",
         dest="scene_mode",
-        choices=("static", "dynamic"),
+        choices=SCENE_CHOICES,
         default="static",
         help=(
-            "Select the complete scene configuration: "
-            "'static' restores the original stationary tabletop; "
-            "'dynamic' uses the tall shelf, bottle and floating object. "
-            "Default: static."
+            "Complete tabletop configuration: "
+            "'static' loads shelf, ball and six daily objects; "
+            "'dynamic' loads a moving shelf, bouncing/translating ball, "
+            "moving bottle, food can and mug; "
+            "'hybrid' loads four stationary daily objects plus the moving "
+            "shelf and bouncing ball. Default: static."
         ),
     )
     parser.add_argument(
@@ -102,8 +103,25 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "Multiply all moving-object trajectory speeds. "
-            "Default: 1.0."
+            "Multiply all scripted moving-object trajectory speeds. "
+            "Used only by dynamic and hybrid modes. Default: 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--shelf-usd",
+        default=None,
+        help=(
+            "Optional absolute USD path/URL for the tabletop shelf. "
+            "When omitted, the script searches Isaac Sim's Modular and "
+            "Simple Warehouse asset folders."
+        ),
+    )
+    parser.add_argument(
+        "--ball-usd",
+        default=None,
+        help=(
+            "Optional absolute USD path/URL for the ball. When omitted, "
+            "the script tries YCB baseball, softball and tennis-ball assets."
         ),
     )
     parser.add_argument(
@@ -122,13 +140,9 @@ if ARGS.width <= 0 or ARGS.height <= 0:
 if ARGS.rgbd_hz <= 0.0:
     raise ValueError("rgbd-hz must be positive.")
 if ARGS.pointcloud_hz < 0.0:
-    raise ValueError(
-        "pointcloud-hz must be non-negative."
-    )
+    raise ValueError("pointcloud-hz must be non-negative.")
 if ARGS.pointcloud_hz > ARGS.rgbd_hz:
-    raise ValueError(
-        "pointcloud-hz cannot exceed rgbd-hz."
-    )
+    raise ValueError("pointcloud-hz cannot exceed rgbd-hz.")
 if ARGS.motion_speed_scale <= 0.0:
     raise ValueError("motion-speed-scale must be positive.")
 if ARGS.profile_every <= 0:
@@ -149,8 +163,16 @@ os.environ.setdefault(
     "rmw_fastrtps_cpp",
 )
 
-# SimulationApp must be created before importing omni, pxr or Replicator.
+if ARGS.shelf_usd:
+    os.environ["SCENEPREDICTOR_SHELF_USD"] = ARGS.shelf_usd
+if ARGS.ball_usd:
+    os.environ["SCENEPREDICTOR_BALL_USD"] = ARGS.ball_usd
+
+
+# SimulationApp must be created before importing omni, pxr, Replicator or any
+# local module that imports those packages.
 from isaacsim import SimulationApp
+
 
 simulation_app = SimulationApp(
     {
@@ -160,6 +182,7 @@ simulation_app = SimulationApp(
         "height": ARGS.height,
     }
 )
+
 
 import numpy as np
 import omni.timeline
@@ -174,10 +197,7 @@ from camera_settings import (
 )
 from moving_objects import MovingObjectController
 from ros_camera_publisher import RosCameraPublisher
-from scene_settings import (
-    DEFAULT_SCENE_CONFIG,
-    build_scene,
-)
+from scene_settings import build_scene
 
 
 def _print_profile(
@@ -199,7 +219,6 @@ def _print_profile(
             values = values[values > 0.0]
         if values.size == 0:
             continue
-
         print(
             f"  {key:<18}"
             f" mean={values.mean():8.3f}"
@@ -218,10 +237,11 @@ def _print_profile(
     )
     if period_values.size:
         print(
-            f"  achieved_hz       "
+            "  achieved_hz       "
             f"{1000.0 / period_values.mean():8.3f}",
             flush=True,
         )
+
 
 def _wait_until_cameras_ready(
     cameras,
@@ -231,7 +251,6 @@ def _wait_until_cameras_ready(
     """Wait until every RGB/depth annotator returns valid data."""
 
     last_error: RuntimeError | None = None
-
     empty_data_messages = (
         "annotator returned empty data",
         "RGB shape is (0,)",
@@ -251,8 +270,6 @@ def _wait_until_cameras_ready(
             )
         except RuntimeError as error:
             message = str(error)
-
-            # 不要掩盖其他真实错误
             if not any(
                 token in message
                 for token in empty_data_messages
@@ -260,7 +277,6 @@ def _wait_until_cameras_ready(
                 raise
 
             last_error = error
-
             if (
                 attempt == 1
                 or attempt % CAMERA_READY_LOG_INTERVAL == 0
@@ -272,8 +288,6 @@ def _wait_until_cameras_ready(
                     f"{error}",
                     flush=True,
                 )
-
-            # 再渲染一帧，然后重试
             simulation_app.update()
             continue
 
@@ -285,9 +299,8 @@ def _wait_until_cameras_ready(
             )
             for name, frame in frames.items()
         )
-
         print(
-            f"Camera annotators ready after "
+            "Camera annotators ready after "
             f"{attempt} attempt(s): {shapes}",
             flush=True,
         )
@@ -298,6 +311,7 @@ def _wait_until_cameras_ready(
         f"{CAMERA_READY_MAX_ATTEMPTS} attempts. "
         f"Last error: {last_error}"
     ) from last_error
+
 
 def main() -> None:
     ros_publisher = None
@@ -311,10 +325,13 @@ def main() -> None:
             scene_mode=ARGS.scene_mode,
         )
 
-        if ARGS.scene_mode == "dynamic":
+        if ARGS.scene_mode in ("dynamic", "hybrid"):
             moving_object_controller = MovingObjectController(
                 stage,
+                scene_mode=ARGS.scene_mode,
                 table_surface_z=scene.table_surface_z,
+                table_half_extent_xy=scene.table_half_extent_xy,
+                static_footprints=scene.static_footprints,
                 speed_scale=ARGS.motion_speed_scale,
             )
 
@@ -354,7 +371,9 @@ def main() -> None:
         timeline.play()
 
         print(
-            f"Warming up the renderer for {WARMUP_FRAMES} frames.",
+            f"Warming up the renderer for {WARMUP_FRAMES} frames. "
+            "The extra frames allow referenced shelf, ball and YCB "
+            "meshes/textures to finish streaming.",
             flush=True,
         )
         for _ in range(WARMUP_FRAMES):
@@ -366,12 +385,20 @@ def main() -> None:
             corruption,
         )
 
-        stream = "corrupted" if ARGS.corrupt else "clean"
-
+        stream = (
+            "corrupted"
+            if ARGS.corrupt
+            else "clean"
+        )
         pointcloud_mode = (
             "disabled"
             if ARGS.pointcloud_hz == 0.0
             else "separate_full_optical_frame"
+        )
+        moving_description = (
+            moving_object_controller.description()
+            if moving_object_controller is not None
+            else "none"
         )
 
         print(
@@ -381,6 +408,7 @@ def main() -> None:
             f"pointcloud_hz={ARGS.pointcloud_hz}, "
             f"headless={ARGS.headless}, "
             f"scene={ARGS.scene_mode}, "
+            f"moving_objects={moving_description}, "
             f"motion_speed_scale={ARGS.motion_speed_scale}, "
             f"stream={stream}, "
             f"rgb_corruption="
@@ -389,6 +417,11 @@ def main() -> None:
             f"{ARGS.corrupt and ARGS.depth_corruption}, "
             "depth_encoding=32FC1, "
             f"pointcloud={pointcloud_mode}, "
+            "foreground_geometry=isaac_asset_references, "
+            "all_foreground_objects_on_table=true, "
+            "canonical_usage_frames=true, "
+            "dynamic_shelf=true, "
+            "bouncing_ball=true, "
             "downsampling=false, fusion=false",
             flush=True,
         )
@@ -399,7 +432,10 @@ def main() -> None:
         published_frames = 0
         last_publish_time = None
         profile_samples: list[dict[str, float]] = []
-        log_every_frames = max(1, int(round(ARGS.rgbd_hz)))
+        log_every_frames = max(
+            1,
+            int(round(ARGS.rgbd_hz)),
+        )
 
         while simulation_app.is_running():
             if moving_object_controller is not None:
@@ -408,8 +444,8 @@ def main() -> None:
                     motion_now - motion_start_time
                 )
 
-            # Render after updating USD transforms so the captured RGB-D frame
-            # contains the current moving-object positions.
+            # Render after updating USD root transforms so captured RGB-D and
+            # point clouds contain the current asset positions.
             simulation_app.update()
 
             now = time.perf_counter()
@@ -443,22 +479,18 @@ def main() -> None:
 
             profile_samples.append(
                 {
-                    "capture_ms": 1000.0 * (
-                        capture_end - pipeline_start
-                    ),
-                    "ros_ms": 1000.0 * (
-                        ros_end - capture_end
-                    ),
+                    "capture_ms": 1000.0
+                    * (capture_end - pipeline_start),
+                    "ros_ms": 1000.0
+                    * (ros_end - capture_end),
                     "pointcloud_ms": pointcloud_ms,
-                    "pipeline_ms": 1000.0 * (
-                        ros_end - pipeline_start
-                    ),
+                    "pipeline_ms": 1000.0
+                    * (ros_end - pipeline_start),
                     "actual_period_ms": actual_period_ms,
                 }
             )
 
             published_frames += 1
-
             if published_frames % log_every_frames == 0:
                 point_counts = ", ".join(
                     f"{name}={count}"
@@ -468,7 +500,7 @@ def main() -> None:
                 print(
                     f"frame={published_frames:06d} "
                     f"points[{point_counts}] "
-                    f"pointcloud_ms="
+                    "pointcloud_ms="
                     f"{ros_publisher.last_pointcloud_ms:.3f}",
                     flush=True,
                 )

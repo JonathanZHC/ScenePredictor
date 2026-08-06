@@ -12,12 +12,12 @@ models:
   # The TensorRT engine already contains the fixed YOLOE vocabulary. Re-export
   # it whenever object_labels.txt, image_size or engine_batch_size changes.
   backend: tensorrt
-  weights: /workspace/weights/yoloe-26s-seg.engine
-  source_weights: /workspace/weights/yoloe-26s-seg.pt
+  weights: /workspace/weights/yoloe-26x-seg.engine
+  source_weights: /workspace/weights/yoloe-26x-seg.pt
   label_file: /workspace/configs/object_labels.txt
   image_size: 640
   engine_batch_size: 2
-  confidence: 0.20
+  confidence: 0.01
   iou: 0.70
   half: true
   retina_masks: true
