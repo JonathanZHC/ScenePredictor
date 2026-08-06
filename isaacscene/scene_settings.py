@@ -93,8 +93,8 @@ DEFAULT_SCENE_CONFIG = SceneConfig()
 # rear-left tabletop; daily objects form a dense front row; the ball remains
 # stationary in the rear-right area.
 STATIC_LAYOUT: tuple[StaticPlacement, ...] = (
-    StaticPlacement("shelf", (-0.30, 0.20), 0.0),
-    StaticPlacement("ball", (0.48, 0.18), 0.0),
+    StaticPlacement("shelf", (-0.20, 0.23), 0.0),
+    StaticPlacement("ball", (0.53, 0.10), 0.0),
     StaticPlacement("cereal_box", (-0.56, -0.34), -10.0),
     StaticPlacement("food_can", (-0.30, -0.34), 0.0),
     StaticPlacement("bottle", (-0.08, -0.34), -6.0),

@@ -181,6 +181,8 @@ ASSET_CATALOG: dict[str, AssetSpec] = {
         # Exact names have changed across asset-pack releases. These are tried
         # first; a bounded folder search is used if none exists.
         candidate_relative_usd_paths=(
+            # Complete upright rack assemblies. RackShelf files are individual
+            # horizontal boards and are deliberately excluded.
             "/Isaac/Environments/Simple_Warehouse/Props/SM_Rack_01.usd",
             "/Isaac/Environments/Simple_Warehouse/Props/SM_Rack_02.usd",
             "/Isaac/Environments/Simple_Warehouse/Props/SM_Rack_03.usd",
@@ -190,8 +192,8 @@ ASSET_CATALOG: dict[str, AssetSpec] = {
             "/Isaac/Environments/Modular_Warehouse/Props/WarehouseRack.usd",
         ),
         pose_style="installed",
-        target_longest_xy_m=0.44,
-        target_max_height_m=0.42,
+        target_longest_xy_m=0.40,
+        target_max_height_m=0.48,
         search=AssetSearch(
             relative_roots=(
                 "/Isaac/Environments/Modular_Warehouse/Props",
@@ -211,11 +213,14 @@ ASSET_CATALOG: dict[str, AssetSpec] = {
                 "board",
                 "rackshelf",
                 "rack_shelf",
+                "rack-shelf",
                 "shelfboard",
                 "shelf_board",
+                "shelf-board",
                 "plank",
                 "beam",
                 "brace",
+                "panel",
                 "multiple",
                 "full_warehouse",
                 "with_forklift",
@@ -301,6 +306,8 @@ def _score_discovered_asset(
     # Prefer complete rack/shelving assemblies. RackShelf assets in the Simple
     # Warehouse pack are individual horizontal shelf boards and are rejected
     # before this point.
+    if basename.startswith("sm_rack_"):
+        score += 240
     if "rack" in basename:
         score += 140
     if "shelf" in basename:
@@ -708,6 +715,21 @@ def create_asset_instance(
         size_x,
         size_y,
     )
+
+    if spec.key == "shelf":
+        horizontal_longest = max(size_x, size_y)
+        height_ratio = size_z / max(
+            horizontal_longest,
+            1.0e-6,
+        )
+        if size_z < 0.20 or height_ratio < 0.50:
+            raise RuntimeError(
+                "The selected shelf asset is not a complete upright rack. "
+                f"Measured size is {size_x:.3f} x {size_y:.3f} x "
+                f"{size_z:.3f} m (height ratio={height_ratio:.3f}). "
+                "RackShelf/shelf-board components are not valid. "
+                "Use --shelf-usd with a complete upright rack USD."
+            )
 
     print(
         f"[ASSET SIZE] {spec.key}: "

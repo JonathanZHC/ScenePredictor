@@ -82,14 +82,14 @@ def _shelf_motion(
     )
     return MotionPose(
         position_world=(
-            0.10 * math.sin(phase),
-            0.22,
+            -0.10 + 0.10 * math.sin(phase),
+            0.24,
             surface_z,
         ),
         rotation_xyz_deg=(
             0.0,
             0.0,
-            3.0 * math.sin(0.5 * phase),
+            2.0 * math.sin(0.5 * phase),
         ),
     )
 

@@ -21,6 +21,32 @@ if TYPE_CHECKING:
     from .profiler import CycleProfiler
 
 
+def _rgb8_to_ultralytics_bgr(
+    image: np.ndarray,
+) -> np.ndarray:
+    """Convert ROS rgb8 image to Ultralytics NumPy BGR input."""
+
+    if not isinstance(image, np.ndarray):
+        raise TypeError(
+            f"Expected NumPy image, got {type(image).__name__}."
+        )
+
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError(
+            f"Expected HxWx3 RGB image, got {image.shape}."
+        )
+
+    if image.dtype != np.uint8:
+        raise ValueError(
+            f"Expected uint8 image, got {image.dtype}."
+        )
+
+    # RGB -> BGR and remove the negative stride.
+    return np.ascontiguousarray(
+        image[..., ::-1]
+    )
+
+
 def _frame_to_gpu(
     frame,
     device: torch.device,
@@ -339,10 +365,15 @@ class PerViewPerception:
         if profiler is not None:
             profiler.stop("step1_geometry_h2d")
 
+        # ROS publishes rgb8, but Ultralytics assumes that NumPy HWC
+        # images are BGR and converts them internally to RGB.
         rgb_images = [
-            frame.cameras[name].rgb
+            _rgb8_to_ultralytics_bgr(
+                frame.cameras[name].rgb
+            )
             for name in ordered_names
         ]
+        
         if profiler is not None:
             profiler.start("step1_yoloe_tensorrt")
         with torch.inference_mode():
