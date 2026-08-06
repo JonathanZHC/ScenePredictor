@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from functools import wraps
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from ultralytics import YOLO, YOLOE
+from ultralytics.utils import ops as ultralytics_ops
 
 from .config import PipelineConfig
 from .data_types import (
@@ -19,6 +22,83 @@ from .labels import load_object_labels
 
 if TYPE_CHECKING:
     from .profiler import CycleProfiler
+
+
+
+def _install_ultralytics_mask_dtype_fix() -> None:
+    """Fix mixed FP16/FP32 mask postprocessing for TensorRT segmentation.
+
+    TensorRT may return FP16 mask coefficients, while Ultralytics explicitly
+    converts the mask prototypes to FP32. Both operands must have the same
+    dtype before matrix multiplication.
+    """
+
+    marker = "_scenepredictor_dtype_safe"
+
+    if getattr(
+        ultralytics_ops.process_mask_native,
+        marker,
+        False,
+    ):
+        return
+
+    original_process_mask_native = (
+        ultralytics_ops.process_mask_native
+    )
+    original_process_mask = (
+        ultralytics_ops.process_mask
+    )
+
+    @wraps(original_process_mask_native)
+    def process_mask_native_dtype_safe(
+        protos: torch.Tensor,
+        masks_in: torch.Tensor,
+        bboxes: torch.Tensor,
+        shape,
+    ):
+        return original_process_mask_native(
+            protos.float(),
+            masks_in.float(),
+            bboxes.float(),
+            shape,
+        )
+
+    @wraps(original_process_mask)
+    def process_mask_dtype_safe(
+        protos: torch.Tensor,
+        masks_in: torch.Tensor,
+        bboxes: torch.Tensor,
+        shape,
+        upsample: bool = False,
+    ):
+        return original_process_mask(
+            protos.float(),
+            masks_in.float(),
+            bboxes.float(),
+            shape,
+            upsample=upsample,
+        )
+
+    setattr(
+        process_mask_native_dtype_safe,
+        marker,
+        True,
+    )
+    setattr(
+        process_mask_dtype_safe,
+        marker,
+        True,
+    )
+
+    ultralytics_ops.process_mask_native = (
+        process_mask_native_dtype_safe
+    )
+    ultralytics_ops.process_mask = (
+        process_mask_dtype_safe
+    )
+
+
+_install_ultralytics_mask_dtype_fix()
 
 
 def _rgb8_to_ultralytics_bgr(
@@ -252,10 +332,11 @@ class PerViewPerception:
 
         # TensorRT precision is already fixed when the engine is built.
         # Only the PyTorch fallback needs an inference-precision argument.
-        if self.backend == "pytorch":
-            predict_kwargs["quantize"] = (
-                16 if self.config.models.quantize == 16 else 32
-            )
+        if (
+            self.backend == "pytorch"
+            and self.config.models.half
+        ):
+            predict_kwargs["quantize"] = 16
 
         return self.model.predict(**predict_kwargs)
 
