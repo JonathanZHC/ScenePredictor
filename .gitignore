@@ -33,3 +33,5 @@ kit/data/
 
 # Container and Isaac Sim runtime caches
 .container-cache/
+
+.home

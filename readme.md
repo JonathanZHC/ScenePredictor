@@ -5,29 +5,44 @@ git clone git@github.com:JonathanZHC/ScenePredictor.git
 git submodule update --init --recursive
 ```
 
+# Preparation on Host
+
+Lunch the following command on the 'host':
+
+```bash
+sudo tee /etc/sysctl.d/99-fastdds-large-data.conf >/dev/null <<'EOF'
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+
+net.ipv4.tcp_rmem=4096 4194304 16777216
+net.ipv4.tcp_wmem=4096 4194304 16777216
+EOF
+
+sudo sysctl --system
+```
+
+Check:
+
+```bash
+sysctl net.core.rmem_max
+sysctl net.core.wmem_max
+sysctl net.ipv4.tcp_rmem
+sysctl net.ipv4.tcp_wmem
+```
+
+This should output:
+
+```text
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096	4194304	16777216
+net.ipv4.tcp_wmem = 4096	4194304	16777216
+```
+
 # Build the docker:
 
 ```bash
 docker build --progress=plain -f .docker/dockerfile -t scenepredictor .
-```
-
-# Run isaacsim to generate the scene:
-
-```bash
-docker exec -it scenepredictor bash -lc '
-source /opt/ros/jazzy/setup.bash
-
-/isaac-sim/python.sh \
-  /workspace/isaacscene/run_isaacsim.py \
-  --scene dynamic \
-  --width 640 \
-  --height 480 \
-  --rgbd-hz 30 \
-  --pointcloud-hz 5 \
-  --corrupt \
-  --no-rgb-corruption \
-  --motion-speed-scale 1.0
-'
 ```
 
 # Download YOLO weight:
@@ -50,6 +65,35 @@ print("Model:", model)
 PY
 
 ls -lh /workspace/weights/yoloe-26x-seg.pt
+'
+```
+
+
+
+
+
+
+
+
+# Run isaacsim to generate the scene:
+
+```bash
+docker exec -it scenepredictor bash -lc '
+source /opt/ros/jazzy/setup.bash
+
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50'
+
+/isaac-sim/python.sh \
+  /workspace/isaacscene/run_isaacsim.py \
+  --scene dynamic \
+  --width 640 \
+  --height 480 \
+  --rgbd-hz 30 \
+  --pointcloud-hz 5 \
+  --corrupt \
+  --no-rgb-corruption \
+  --motion-speed-scale 1.0
 '
 ```
 
@@ -77,6 +121,9 @@ source /opt/ros/jazzy/setup.bash
 docker exec -it scenepredictor bash -lc '
 source /opt/ros/jazzy/setup.bash
 
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50'
+
 /isaac-sim/python.sh \
   /workspace/scripts/run_scene_pred_pipeline.py \
   --config /workspace/configs/default.yaml
@@ -88,6 +135,10 @@ source /opt/ros/jazzy/setup.bash
 ```bash
 docker exec -it scenepredictor bash -lc '
 export XDG_RUNTIME_DIR=/tmp/runtime-1234
+
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50'
+
 mkdir -p "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
 

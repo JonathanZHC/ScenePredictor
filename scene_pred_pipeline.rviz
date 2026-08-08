@@ -5,7 +5,8 @@ Panels:
     Property Tree Widget:
       Expanded: ~
       Splitter Ratio: 0.5
-    Tree Height: 1776
+    Tree Height: 1200
+
 Visualization Manager:
   Class: ""
   Displays:
@@ -31,7 +32,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.009999999776482582
+      Size (m): 0.01
       Style: Points
       Topic:
         Depth: 5
@@ -42,6 +43,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -64,7 +66,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.009999999776482582
+      Size (m): 0.01
       Style: Points
       Topic:
         Depth: 5
@@ -75,6 +77,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -97,7 +100,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 4
-      Size (m): 0.009999999776482582
+      Size (m): 0.01
       Style: Points
       Topic:
         Depth: 5
@@ -108,6 +111,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -130,7 +134,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.009999999776482582
+      Size (m): 0.01
       Style: Points
       Topic:
         Depth: 5
@@ -141,9 +145,10 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Predicted Velocity
+      Name: Predicted Scene Flow
       Namespaces:
         {}
       Topic:
@@ -151,8 +156,9 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: visualization_marker_array
+        Value: /scene_predictor/velocity_markers
       Value: true
+
     - Class: rviz_default_plugins/Image
       Enabled: false
       Max Value: 1
@@ -167,6 +173,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /camera_0/color/image_raw
       Value: false
+
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1
@@ -181,6 +188,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /scene_predictor/camera_0/rgb_annotated
       Value: true
+
     - Class: rviz_default_plugins/Image
       Enabled: false
       Max Value: 1
@@ -195,6 +203,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /camera_1/color/image_raw
       Value: false
+
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1
@@ -209,8 +218,9 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /scene_predictor/camera_1/rgb_annotated
       Value: true
+
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -222,9 +232,10 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /scene_predictor/camera_0/moving_mask
-      Value: true
+      Value: false
+
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -236,7 +247,8 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /scene_predictor/camera_1/moving_mask
-      Value: true
+      Value: false
+
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -245,9 +257,13 @@ Visualization Manager:
   Name: root
   Tools:
     - Class: rviz_default_plugins/Interact
-      Hide Inactive Objects: true
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+    - Class: rviz_default_plugins/SetGoal
+    - Class: rviz_default_plugins/PublishPoint
   Transformation:
     Current:
       Class: rviz_default_plugins/TF
@@ -255,45 +271,18 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.446293830871582
-      Enable Stereo Rendering:
-        Stereo Eye Separation: 0.05999999865889549
-        Stereo Focal Distance: 1
-        Swap Stereo Eyes: false
-        Value: false
+      Distance: 3.0
       Focal Point:
         X: 0
         Y: 0
-        Z: 0
-      Focal Shape Fixed Size: true
-      Focal Shape Size: 0.05000000074505806
-      Invert Z Axis: false
+        Z: 0.5
       Name: Current View
-      Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5553983449935913
-      Target Frame: <Fixed Frame>
-      Value: Orbit (rviz_default_plugins)
-      Yaw: 4.713579177856445
+      Near Clip Distance: 0.01
+      Pitch: 0.45
+      Target Frame: world
+      Yaw: 0.8
     Saved: ~
+
 Window Geometry:
-  Camera 0 Moving Mask:
-    collapsed: false
-  Camera 0 Raw RGB:
-    collapsed: false
-  Camera 0 YOLOE Detections:
-    collapsed: false
-  Camera 1 Moving Mask:
-    collapsed: false
-  Camera 1 Raw RGB:
-    collapsed: false
-  Camera 1 YOLOE Detections:
-    collapsed: false
-  Displays:
-    collapsed: false
-  Height: 2022
-  Hide Left Dock: false
-  Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000002000000000000024d00000754fc0200000003fb0000002000430061006d00650072006100200030002000520061007700200052004700420000000069000000870000002100fffffffb0000002000430061006d00650072006100200031002000520061007700200052004700420000000108000000930000002100fffffffb000000100044006900730070006c0061007900730100000069000007540000017800ffffff000000010000034600000754fc0200000004fb0000003200430061006d0065007200610020003000200059004f004c004f004500200044006500740065006300740069006f006e00730100000069000001ce0000002100fffffffb0000002800430061006d006500720061002000300020004d006f00760069006e00670020004d00610073006b0100000243000001c90000002100fffffffb0000003200430061006d0065007200610020003100200059004f004c004f004500200044006500740065006300740069006f006e00730100000418000001cb0000002100fffffffb0000002800430061006d006500720061002000310020004d006f00760069006e00670020004d00610073006b01000005ef000001ce0000002100ffffff000008d10000075400000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
-  Width: 3708
-  X: 132
-  Y: 64
+  Height: 1000
+  Width: 1700

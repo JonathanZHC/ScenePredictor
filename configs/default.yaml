@@ -12,8 +12,8 @@ models:
   # The TensorRT engine already contains the fixed YOLOE vocabulary. Re-export
   # it whenever object_labels.txt, image_size or engine_batch_size changes.
   backend: pytorch
-  weights: /workspace/weights/yoloe-26x-seg.engine
-  source_weights: /workspace/weights/yoloe-26x-seg.pt
+  weights: /workspace/weights/yoloe-26s-seg.engine
+  source_weights: /workspace/weights/yoloe-26s-seg.pt
   label_file: /workspace/configs/object_labels.txt
   image_size: 640
   engine_batch_size: 2
@@ -88,14 +88,22 @@ output:
   publish_velocity_markers: true
   publish_moving_masks: true
   publish_annotated_rgb: true
-  velocity_marker_stride: 32
-  velocity_marker_scale: 0.20
+
+  # 1 publishes one line for every recovered moving point.
+  # Use 2 or 4 only when RViz becomes the bottleneck.
+  velocity_marker_stride: 4
+
+  # Constant-velocity visualization horizon in seconds:
+  # target = current + velocity_marker_scale * velocity
+  #
+  # 0.0333333333 is one future frame at 30 Hz.
+  # 0.10 is easier to see and still produces short lines.
+  velocity_marker_scale: 0.03
   profile_interval_frames: 30
 
 runtime:
   device: cuda:0
   allow_tf32: true
-
   # Disable both for the lowest-latency deployment path.
   enable_profiling: true
   enable_cuda_timing: true

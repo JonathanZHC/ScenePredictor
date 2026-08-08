@@ -31,12 +31,8 @@ def _stamp_message(
     stamp_ns: int,
 ):
     message = node.get_clock().now().to_msg()
-    message.sec = (
-        stamp_ns // 1_000_000_000
-    )
-    message.nanosec = (
-        stamp_ns % 1_000_000_000
-    )
+    message.sec = stamp_ns // 1_000_000_000
+    message.nanosec = stamp_ns % 1_000_000_000
     return message
 
 
@@ -119,9 +115,7 @@ def _xyzrgb_cloud(
     ]
     message.is_bigendian = False
     message.point_step = 16
-    message.row_step = (
-        16 * cloud.shape[0]
-    )
+    message.row_step = 16 * cloud.shape[0]
     message.data = cloud.tobytes()
     message.is_dense = True
     return message
@@ -154,6 +148,17 @@ def _velocity_cloud(
         .numpy()
     )
 
+    if points.shape != velocity.shape:
+        raise RuntimeError(
+            "moving_points and moving_velocity must have identical shapes, "
+            f"got {points.shape} and {velocity.shape}."
+        )
+    if track_ids.shape[0] != points.shape[0]:
+        raise RuntimeError(
+            "moving_track_ids must contain one ID per moving point, "
+            f"got {track_ids.shape[0]} IDs for {points.shape[0]} points."
+        )
+
     structured = np.empty(
         points.shape[0],
         dtype=[
@@ -166,6 +171,7 @@ def _velocity_cloud(
             ("track_id", "<i4"),
         ],
     )
+
     if points.shape[0] > 0:
         (
             structured["x"],
@@ -234,9 +240,7 @@ def _velocity_cloud(
         ),
     ]
     message.is_bigendian = False
-    message.point_step = (
-        structured.dtype.itemsize
-    )
+    message.point_step = structured.dtype.itemsize
     message.row_step = (
         message.point_step
         * points.shape[0]
@@ -256,6 +260,7 @@ def _rgb8_image(
         image,
         dtype=np.uint8,
     )
+
     message = Image()
     message.header.stamp = _stamp_message(
         node,
@@ -271,11 +276,121 @@ def _rgb8_image(
     return message
 
 
+def _scene_flow_marker_array(
+    node: Node,
+    output: SceneVelocityOutput,
+    frame_id: str,
+    stride: int,
+    horizon_s: float,
+) -> MarkerArray:
+    """Build one LINE_LIST containing all per-point scene-flow segments.
+
+    Each segment is:
+
+        start = current moving point
+        end   = current moving point + horizon_s * moving velocity
+
+    ``moving_velocity`` is in metres per second. At 30 Hz, a one-frame
+    constant-velocity target uses ``horizon_s = 1 / 30``. A value of 0.10 s
+    is easier to see in RViz while still producing short lines.
+    """
+
+    stride = max(1, int(stride))
+    horizon_s = max(0.0, float(horizon_s))
+
+    current = output.moving_points[::stride]
+    velocity = output.moving_velocity[::stride]
+
+    if current.ndim != 2 or current.shape[1] != 3:
+        raise RuntimeError(
+            "moving_points must have shape [N, 3], "
+            f"got {tuple(current.shape)}."
+        )
+    if velocity.shape != current.shape:
+        raise RuntimeError(
+            "moving_velocity must match moving_points, "
+            f"got {tuple(velocity.shape)} and {tuple(current.shape)}."
+        )
+
+    if current.numel() > 0:
+        valid = (
+            torch.isfinite(current).all(dim=1)
+            & torch.isfinite(velocity).all(dim=1)
+        )
+        current = current[valid]
+        velocity = velocity[valid]
+
+    stamp = _stamp_message(
+        node,
+        output.stamp_ns,
+    )
+
+    # Clear the old implementation's many ARROW markers as well as the
+    # previous LINE_LIST.
+    delete_all = Marker()
+    delete_all.header.stamp = stamp
+    delete_all.header.frame_id = frame_id
+    delete_all.action = Marker.DELETEALL
+
+    flow = Marker()
+    flow.header.stamp = stamp
+    flow.header.frame_id = frame_id
+    flow.ns = "predicted_scene_flow"
+    flow.id = 0
+    flow.type = Marker.LINE_LIST
+    flow.action = Marker.ADD
+
+    # LINE_LIST uses scale.x as line width in metres.
+    flow.scale.x = 0.004
+    flow.color.r = 1.0
+    flow.color.g = 0.25
+    flow.color.b = 0.05
+    flow.color.a = 1.0
+
+    if (
+        current.shape[0] == 0
+        or horizon_s <= 0.0
+    ):
+        flow.points = []
+    else:
+        target = current + horizon_s * velocity
+
+        # [N, 2, 3] -> [2N, 3], with the ordering:
+        # current_0, target_0, current_1, target_1, ...
+        segment_points = (
+            torch.stack(
+                (current, target),
+                dim=1,
+            )
+            .reshape(-1, 3)
+            .detach()
+            .float()
+            .cpu()
+            .numpy()
+        )
+
+        flow.points = [
+            Point(
+                x=float(point[0]),
+                y=float(point[1]),
+                z=float(point[2]),
+            )
+            for point in segment_points
+        ]
+
+    array = MarkerArray()
+    array.markers = [
+        delete_all,
+        flow,
+    ]
+    return array
+
+
 class RosVisualizer:
     """Optional RViz publishing.
 
     If runtime.enable_visualization is false, no publisher is created and
-    publish() returns immediately. This avoids all GPU->CPU visualization
+    publish() returns immediately. This avoids all GPU-to-CPU visualization
     transfers.
     """
 
@@ -289,6 +404,7 @@ class RosVisualizer:
         self.enabled = bool(
             config.runtime.enable_visualization
         )
+
         if not self.enabled:
             return
 
@@ -303,12 +419,10 @@ class RosVisualizer:
             reliability=ReliabilityPolicy.RELIABLE,
         )
 
-        self.background_pub = (
-            node.create_publisher(
-                PointCloud2,
-                "/scene_predictor/background_points",
-                cloud_qos,
-            )
+        self.background_pub = node.create_publisher(
+            PointCloud2,
+            "/scene_predictor/background_points",
+            cloud_qos,
         )
         self.static_pub = node.create_publisher(
             PointCloud2,
@@ -358,12 +472,11 @@ class RosVisualizer:
         self,
         output: SceneVelocityOutput,
     ) -> None:
-        for camera, mask in (
-            output.moving_masks.items()
-        ):
+        for camera, mask in output.moving_masks.items():
             publisher = self.mask_pubs.get(camera)
             if publisher is None:
                 continue
+
             array = (
                 mask.detach()
                 .to(torch.uint8)
@@ -371,6 +484,7 @@ class RosVisualizer:
                 .cpu()
                 .numpy()
             )
+
             message = Image()
             message.header.stamp = _stamp_message(
                 self.node,
@@ -384,85 +498,30 @@ class RosVisualizer:
             message.encoding = "mono8"
             message.is_bigendian = 0
             message.step = message.width
-            message.data = (
-                np.ascontiguousarray(
-                    array
-                ).tobytes()
-            )
+            message.data = np.ascontiguousarray(
+                array
+            ).tobytes()
             publisher.publish(message)
 
     def _publish_markers(
         self,
         output: SceneVelocityOutput,
     ) -> None:
-        stride = max(
-            1,
-            self.config.output.velocity_marker_stride,
+        self.marker_pub.publish(
+            _scene_flow_marker_array(
+                node=self.node,
+                output=output,
+                frame_id=self.config.ros.world_frame,
+                stride=(
+                    self.config.output
+                    .velocity_marker_stride
+                ),
+                horizon_s=(
+                    self.config.output
+                    .velocity_marker_scale
+                ),
+            )
         )
-        points = (
-            output.moving_points[::stride]
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        velocity = (
-            output.moving_velocity[::stride]
-            .detach()
-            .cpu()
-            .numpy()
-        )
-
-        array = MarkerArray()
-        delete = Marker()
-        delete.action = Marker.DELETEALL
-        array.markers.append(delete)
-
-        scale = (
-            self.config.output.velocity_marker_scale
-        )
-        for index, (
-            point,
-            vector,
-        ) in enumerate(
-            zip(points, velocity)
-        ):
-            marker = Marker()
-            marker.header.stamp = _stamp_message(
-                self.node,
-                output.stamp_ns,
-            )
-            marker.header.frame_id = (
-                self.config.ros.world_frame
-            )
-            marker.ns = "predicted_velocity"
-            marker.id = index
-            marker.type = Marker.ARROW
-            marker.action = Marker.ADD
-            marker.scale.x = 0.008
-            marker.scale.y = 0.016
-            marker.scale.z = 0.020
-            marker.color.r = 1.0
-            marker.color.g = 0.25
-            marker.color.b = 0.05
-            marker.color.a = 1.0
-
-            start = Point(
-                x=float(point[0]),
-                y=float(point[1]),
-                z=float(point[2]),
-            )
-            end_point = (
-                point + scale * vector
-            )
-            end = Point(
-                x=float(end_point[0]),
-                y=float(end_point[1]),
-                z=float(end_point[2]),
-            )
-            marker.points = [start, end]
-            array.markers.append(marker)
-
-        self.marker_pub.publish(array)
 
     def _publish_annotated_rgb(
         self,
@@ -471,13 +530,12 @@ class RosVisualizer:
         for camera_name, image in (
             output.annotated_rgb.items()
         ):
-            publisher = (
-                self.annotated_rgb_pubs.get(
-                    camera_name
-                )
+            publisher = self.annotated_rgb_pubs.get(
+                camera_name
             )
             if publisher is None:
                 continue
+
             publisher.publish(
                 _rgb8_image(
                     self.node,
@@ -495,6 +553,7 @@ class RosVisualizer:
             return
 
         frame = self.config.ros.world_frame
+
         if self.config.output.publish_background:
             self.background_pub.publish(
                 _xyzrgb_cloud(
@@ -505,9 +564,8 @@ class RosVisualizer:
                     (128, 128, 128),
                 )
             )
-        if (
-            self.config.output.publish_static_objects
-        ):
+
+        if self.config.output.publish_static_objects:
             self.static_pub.publish(
                 _xyzrgb_cloud(
                     self.node,
@@ -517,9 +575,8 @@ class RosVisualizer:
                     (40, 220, 80),
                 )
             )
-        if (
-            self.config.output.publish_moving_objects
-        ):
+
+        if self.config.output.publish_moving_objects:
             self.moving_pub.publish(
                 _xyzrgb_cloud(
                     self.node,
@@ -529,9 +586,8 @@ class RosVisualizer:
                     (240, 50, 30),
                 )
             )
-        if (
-            self.config.output.publish_velocity_cloud
-        ):
+
+        if self.config.output.publish_velocity_cloud:
             self.velocity_pub.publish(
                 _velocity_cloud(
                     self.node,
@@ -539,15 +595,12 @@ class RosVisualizer:
                     frame,
                 )
             )
-        if (
-            self.config.output.publish_velocity_markers
-        ):
+
+        if self.config.output.publish_velocity_markers:
             self._publish_markers(output)
-        if (
-            self.config.output.publish_annotated_rgb
-        ):
+
+        if self.config.output.publish_annotated_rgb:
             self._publish_annotated_rgb(output)
-        if (
-            self.config.output.publish_moving_masks
-        ):
+
+        if self.config.output.publish_moving_masks:
             self._publish_masks(output)
