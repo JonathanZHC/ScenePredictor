@@ -2,3 +2,9 @@
 	path = DifFlow3D
 	url = https://github.com/JonathanZHC/DifFlow3D.git
 	branch = main
+[submodule "MultiViewRGBDTracker"]
+	path = MultiViewRGBDTracker
+	url = https://github.com/JonathanZHC/MultiViewRGBDTracker.git
+[submodule "isaacscene"]
+	path = isaacscene
+	url = https://github.com/JonathanZHC/isaacscene.git
