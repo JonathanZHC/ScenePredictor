@@ -1,30 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum
+from typing import Any
 
 import numpy as np
 import torch
 
-
-class MotionState(IntEnum):
-    STATIC = 0
-    MOVING = 1
-
-
-class PointType(IntEnum):
-    BACKGROUND = 0
-    STATIC_OBJECT = 1
-    MOVING_OBJECT = 2
-
-@dataclass(frozen=True)
-class ImageDetection:
-    bbox_xyxy: tuple[int, int, int, int]
-    class_id: int
-    class_name: str
-    confidence: float
-    track_id: int
-    motion_state: MotionState
 
 @dataclass
 class CameraFrameCpu:
@@ -38,119 +19,38 @@ class CameraFrameCpu:
 
 
 @dataclass
-class CameraFrameGpu:
-    camera_name: str
-    stamp_ns: int
-    rgb: torch.Tensor
-    depth: torch.Tensor
-    K: torch.Tensor
-    T_world_camera: torch.Tensor
-    T_camera_world: torch.Tensor
-    optical_frame_id: str
-
-
-@dataclass
 class MultiCameraFrame:
     stamp_ns: int
     cameras: dict[str, CameraFrameCpu]
 
 
 @dataclass
-class ViewInstance:
-    camera_name: str
-    local_instance_id: int
-
-    class_id: int
-    class_name: str
-    class_confidence: float
-    bbox_xyxy: tuple[int, int, int, int]
-
-    mask_original: torch.Tensor
-    mask_eroded: torch.Tensor
-    clip_embedding: torch.Tensor
-
-    pcd_world: torch.Tensor
-    centroid_world: torch.Tensor
-    reprojection_points_world: torch.Tensor
+class TrackedInstance:
+    global_track_id: int
+    semantic_label: str
+    points_world: torch.Tensor
 
 
 @dataclass
-class PerViewResult:
-    camera: CameraFrameGpu
-    instances: list[ViewInstance]
-    background_pcd_world: torch.Tensor
-    annotated_rgb: np.ndarray
-
-
-@dataclass
-class FusedObject:
-    frame_object_id: int
-    class_id: int
-    class_confidence: float
-    representative_embedding: torch.Tensor
-    view_embeddings: list[torch.Tensor]
-    pcd_world: torch.Tensor
-    centroid_world: torch.Tensor
-    source_camera_names: tuple[str, ...]
-    members: list[ViewInstance]
-
-
-@dataclass
-class FusedFrame:
-    stamp_ns: int
-    objects: list[FusedObject]
-    background_pcd_world: torch.Tensor
-    camera_results: dict[str, PerViewResult]
-
-
-@dataclass
-class VoxelizedObject:
-    frame_object_id: int
-    class_id: int
-    class_confidence: float
-    representative_embedding: torch.Tensor
-    points: torch.Tensor
-    voxel_keys: torch.Tensor
-    centroid_world: torch.Tensor
-    members: list[ViewInstance]
-    track_id: int = -1
-    motion_state: MotionState = MotionState.STATIC
-
-
-@dataclass
-class VoxelizedFrame:
+class TrackedInstanceFrame:
     frame_index: int
     stamp_ns: int
-    objects: list[VoxelizedObject]
-    background_points: torch.Tensor
-    background_keys: torch.Tensor
-    camera_results: dict[str, PerViewResult]
+    instances: list[TrackedInstance]
+    view_results: dict[str, Any] = field(default_factory=dict)
+    tracker_timings_ms: dict[str, float] = field(default_factory=dict)
+    tracker_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class TrackObservation:
-    frame_index: int
-    stamp_ns: int
-    centroid_world: torch.Tensor
-    voxel_keys: torch.Tensor
-    points: torch.Tensor
-
-
-@dataclass
-class Track:
-    track_id: int
-    last_object: VoxelizedObject
-    history: dict[int, TrackObservation] = field(default_factory=dict)
-
-
-@dataclass
-class TrackedFrame:
-    frame_index: int
-    stamp_ns: int
-    objects: list[VoxelizedObject]
-    background_points: torch.Tensor
-    background_keys: torch.Tensor
-    moving_masks: dict[str, torch.Tensor]
+class InstancePair:
+    previous_stamp_ns: int
+    current_stamp_ns: int
+    common_track_ids: tuple[int, ...]
+    previous_points: torch.Tensor
+    current_points: torch.Tensor
+    previous_track_ids: torch.Tensor
+    current_track_ids: torch.Tensor
+    dt_s: float
 
 
 @dataclass
@@ -163,6 +63,9 @@ class FlowInput:
     current_anchors: torch.Tensor
     previous_anchor_track_ids: torch.Tensor
     current_anchor_track_ids: torch.Tensor
+    current_dense_points: torch.Tensor
+    current_dense_track_ids: torch.Tensor
+    common_track_ids: tuple[int, ...]
     dt_s: float
 
 
@@ -176,12 +79,15 @@ class FlowResult:
 @dataclass
 class SceneVelocityOutput:
     stamp_ns: int
-    background_points: torch.Tensor
-    static_points: torch.Tensor
-    moving_points: torch.Tensor
-    moving_velocity: torch.Tensor
-    moving_track_ids: torch.Tensor
-    moving_masks: dict[str, torch.Tensor]
-    camera_rgb: dict[str, np.ndarray]
+    tracked_points: torch.Tensor
+    tracked_track_ids: torch.Tensor
+    flow_points: torch.Tensor
+    flow_velocity: torch.Tensor
+    flow_track_ids: torch.Tensor
+    source_anchors: torch.Tensor
+    warped_anchors: torch.Tensor
+    tracked_masks: dict[str, np.ndarray]
     annotated_rgb: dict[str, np.ndarray]
+    common_track_ids: tuple[int, ...]
+    flow_valid: bool
     timings_ms: dict[str, float]

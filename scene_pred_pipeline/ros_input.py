@@ -91,7 +91,7 @@ class MultiCameraRosInput:
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=config.ros.queue_depth,
-            reliability=ReliabilityPolicy.RELIABLE,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
         )
         for camera in config.ros.camera_names:
             bindings = {

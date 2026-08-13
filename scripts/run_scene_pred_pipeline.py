@@ -8,16 +8,13 @@ import traceback
 import rclpy
 from rclpy.node import Node
 
-from scene_pred_pipeline import (
-    ScenePredictionPipeline,
-    load_config,
-)
+from scene_pred_pipeline import ScenePredictionPipeline, load_config
 from scene_pred_pipeline.ros_input import MultiCameraRosInput
 from scene_pred_pipeline.ros_output import RosVisualizer
 
 
 class ScenePredictorNode(Node):
-    """ROS I/O stays responsive while one worker owns the GPU pipeline."""
+    """Latest-only ROS input; one worker owns tracker + DifFlow state."""
 
     def __init__(self, config_path: str) -> None:
         super().__init__("scene_predictor")
@@ -29,7 +26,6 @@ class ScenePredictorNode(Node):
         self._latest_frame = None
         self._stop_requested = False
         self.frame_count = 0
-
         self.input = MultiCameraRosInput(
             self,
             self.config,
@@ -41,14 +37,11 @@ class ScenePredictorNode(Node):
             daemon=True,
         )
         self._worker.start()
-
         self.get_logger().info(
-            "ScenePredictor ready for cameras: "
-            + ", ".join(self.config.ros.camera_names)
+            "ScenePredictor ready: " + ", ".join(self.config.ros.camera_names)
         )
 
     def _enqueue(self, frame) -> None:
-        # Latest-only queue: never build latency by processing stale frames.
         with self._condition:
             self._latest_frame = frame
             self._condition.notify()
@@ -57,10 +50,7 @@ class ScenePredictorNode(Node):
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: (
-                        self._latest_frame is not None
-                        or self._stop_requested
-                    )
+                    lambda: self._latest_frame is not None or self._stop_requested
                 )
                 if self._stop_requested:
                     return
@@ -75,23 +65,14 @@ class ScenePredictorNode(Node):
                 gap_s = self.pipeline.last_flow_gap_s
                 if gap_s is not None:
                     self.get_logger().warning(
-                        "Skipped one DifFlow3D pair and rebased "
-                        f"temporal state because dt={gap_s:.6f}s "
-                        "exceeded "
+                        "Skipped one DifFlow3D pair and rebased to the current "
+                        f"tracker frame because dt={gap_s:.6f}s exceeded "
                         f"{self.config.flow.max_frame_gap_s:.6f}s."
                     )
 
-                interval = (
-                    self.config.output.profile_interval_frames
-                )
-                if (
-                    interval > 0
-                    and self.frame_count % interval == 0
-                ):
-                    self.get_logger().info(
-                        "\n"
-                        + self.pipeline.profiler.format_summary()
-                    )
+                interval = int(self.config.output.profile_interval_frames)
+                if interval > 0 and self.frame_count % interval == 0:
+                    self.get_logger().info("\n" + self.pipeline.profiler.format_summary())
             except Exception:
                 self.get_logger().error(traceback.format_exc())
 
@@ -99,18 +80,18 @@ class ScenePredictorNode(Node):
         with self._condition:
             self._stop_requested = True
             self._condition.notify_all()
-        self._worker.join(timeout=10.0)
+        self._worker.join()
+        try:
+            self.pipeline.close()
+        except Exception:
+            self.get_logger().error("Pipeline shutdown failed:\n" + traceback.format_exc())
         return super().destroy_node()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        default="/workspace/configs/default.yaml",
-    )
+    parser.add_argument("--config", default="/workspace/configs/default.yaml")
     args, ros_args = parser.parse_known_args()
-
     rclpy.init(args=ros_args)
     node = ScenePredictorNode(args.config)
     try:

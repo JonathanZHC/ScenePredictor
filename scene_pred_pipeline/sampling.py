@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import torch
-
 from pointnet2 import pointnet2_utils
 
 from .config import PipelineConfig
-from .data_types import FlowInput, MotionState, TrackedFrame
+from .data_types import FlowInput, InstancePair
 
 
 def _even_candidate_indices(
@@ -14,7 +13,7 @@ def _even_candidate_indices(
     device: torch.device,
 ) -> torch.Tensor:
     if count <= target:
-        return torch.arange(count, device=device)
+        return torch.arange(count, device=device, dtype=torch.long)
     return torch.linspace(0, count - 1, target, device=device).long()
 
 
@@ -23,9 +22,9 @@ def _pad_points(
     track_ids: torch.Tensor,
     target: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    count = points.shape[0]
+    count = int(points.shape[0])
     if count == 0:
-        raise ValueError("Cannot pad an empty point cloud.")
+        raise ValueError("Cannot pad an empty point cloud")
     if count >= target:
         return points, track_ids
     repeated = torch.arange(target, device=points.device) % count
@@ -39,94 +38,113 @@ def _fps(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     points, track_ids = _pad_points(points, track_ids, target)
     if points.shape[0] == target:
-        return points, track_ids
+        return points.contiguous(), track_ids.contiguous()
     indices = pointnet2_utils.furthest_point_sample(
         points[None].contiguous(),
         target,
     )[0].long()
-    return points[indices], track_ids[indices]
+    return points[indices].contiguous(), track_ids[indices].contiguous()
 
 
-class MovingPointSampler:
-    """Step 5A: moving-point extraction, fast preselection and CUDA FPS."""
+def _repair_coverage(
+    full_points: torch.Tensor,
+    full_ids: torch.Tensor,
+    selected_points: torch.Tensor,
+    selected_ids: torch.Tensor,
+    common_track_ids: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Guarantee one selected point per common ID without evicting another ID.
+
+    ``selected_points`` is large (4096 candidates / 2048 anchors in the default
+    configuration) while the instance count is small, so an overrepresented donor
+    always exists whenever the selected capacity can represent every common ID.
+    """
+
+    if len(common_track_ids) > int(selected_points.shape[0]):
+        return selected_points, selected_ids
+
+    counts = {
+        int(track_id): int(torch.sum(selected_ids == int(track_id)).item())
+        for track_id in common_track_ids
+    }
+    for track_id in common_track_ids:
+        track_id = int(track_id)
+        if counts[track_id] > 0:
+            continue
+
+        full_index = torch.nonzero(full_ids == track_id, as_tuple=False)
+        if full_index.numel() == 0:
+            continue
+
+        donor_ids = [
+            donor_id for donor_id, count in counts.items() if count > 1
+        ]
+        if not donor_ids:
+            break
+        donor_mask = torch.zeros_like(selected_ids, dtype=torch.bool)
+        for donor_id in donor_ids:
+            donor_mask |= selected_ids == int(donor_id)
+        donor_positions = torch.nonzero(donor_mask, as_tuple=False)
+        if donor_positions.numel() == 0:
+            break
+        # Replace from the tail so the leading deterministic FPS order stays intact.
+        donor_position = int(donor_positions[-1, 0].item())
+        donor_id = int(selected_ids[donor_position].item())
+        source = int(full_index[0, 0])
+        selected_points[donor_position].copy_(full_points[source])
+        selected_ids[donor_position] = track_id
+        counts[donor_id] -= 1
+        counts[track_id] = 1
+
+    return selected_points, selected_ids
+
+
+class TrackedPointSampler:
+    """Candidate reduction + one global CUDA FPS for each side of the pair."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
 
-    def prepare(
-        self,
-        previous: TrackedFrame | None,
-        current: TrackedFrame,
-    ) -> FlowInput | None:
-        if previous is None:
-            return None
+    def prepare(self, pair: InstancePair) -> FlowInput:
+        target = int(self.config.flow.target_points)
+        if target < 1024:
+            raise ValueError("DifFlow3D optimized runner requires target_points >= 1024")
 
-        previous_by_track = {
-            item.track_id: item
-            for item in previous.objects
-        }
-        selected = [
-            item
-            for item in current.objects
-            if (
-                item.motion_state == MotionState.MOVING
-                and item.track_id in previous_by_track
-            )
-        ]
-        if not selected:
-            return None
-
-        previous_points = torch.cat(
-            [previous_by_track[item.track_id].points for item in selected],
-            dim=0,
-        )
-        current_points = torch.cat(
-            [item.points for item in selected],
-            dim=0,
-        )
-        previous_ids = torch.cat(
-            [
-                torch.full(
-                    (previous_by_track[item.track_id].points.shape[0],),
-                    item.track_id,
-                    device=item.points.device,
-                    dtype=torch.int64,
-                )
-                for item in selected
-            ]
-        )
-        current_ids = torch.cat(
-            [
-                torch.full(
-                    (item.points.shape[0],),
-                    item.track_id,
-                    device=item.points.device,
-                    dtype=torch.int64,
-                )
-                for item in selected
-            ]
-        )
-
-        target = self.config.flow.target_points
         candidate_target = max(
             target,
-            int(round(target * self.config.flow.pre_fps_factor)),
+            int(round(target * float(self.config.flow.pre_fps_factor))),
         )
 
-        previous_candidate_indices = _even_candidate_indices(
-            previous_points.shape[0],
+        previous_indices = _even_candidate_indices(
+            pair.previous_points.shape[0],
             candidate_target,
-            previous_points.device,
+            pair.previous_points.device,
         )
-        current_candidate_indices = _even_candidate_indices(
-            current_points.shape[0],
+        current_indices = _even_candidate_indices(
+            pair.current_points.shape[0],
             candidate_target,
-            current_points.device,
+            pair.current_points.device,
         )
-        previous_candidates = previous_points[previous_candidate_indices]
-        current_candidates = current_points[current_candidate_indices]
-        previous_candidate_ids = previous_ids[previous_candidate_indices]
-        current_candidate_ids = current_ids[current_candidate_indices]
+
+        previous_candidates = pair.previous_points[previous_indices].contiguous()
+        current_candidates = pair.current_points[current_indices].contiguous()
+        previous_candidate_ids = pair.previous_track_ids[previous_indices].contiguous()
+        current_candidate_ids = pair.current_track_ids[current_indices].contiguous()
+
+        previous_candidates, previous_candidate_ids = _repair_coverage(
+            pair.previous_points,
+            pair.previous_track_ids,
+            previous_candidates,
+            previous_candidate_ids,
+            pair.common_track_ids,
+        )
+        current_candidates, current_candidate_ids = _repair_coverage(
+            pair.current_points,
+            pair.current_track_ids,
+            current_candidates,
+            current_candidate_ids,
+            pair.common_track_ids,
+        )
 
         previous_anchors, previous_anchor_ids = _fps(
             previous_candidates,
@@ -138,9 +156,22 @@ class MovingPointSampler:
             current_candidate_ids,
             target,
         )
-        dt_s = (current.stamp_ns - previous.stamp_ns) * 1.0e-9
-        if dt_s <= 0.0:
-            raise ValueError(f"Non-increasing frame timestamp: dt={dt_s}.")
+
+        previous_anchors, previous_anchor_ids = _repair_coverage(
+            previous_candidates,
+            previous_candidate_ids,
+            previous_anchors,
+            previous_anchor_ids,
+            pair.common_track_ids,
+        )
+        current_anchors, current_anchor_ids = _repair_coverage(
+            current_candidates,
+            current_candidate_ids,
+            current_anchors,
+            current_anchor_ids,
+            pair.common_track_ids,
+        )
+
         return FlowInput(
             previous_candidates=previous_candidates,
             current_candidates=current_candidates,
@@ -150,5 +181,8 @@ class MovingPointSampler:
             current_anchors=current_anchors,
             previous_anchor_track_ids=previous_anchor_ids,
             current_anchor_track_ids=current_anchor_ids,
-            dt_s=dt_s,
+            current_dense_points=pair.current_points,
+            current_dense_track_ids=pair.current_track_ids,
+            common_track_ids=pair.common_track_ids,
+            dt_s=float(pair.dt_s),
         )

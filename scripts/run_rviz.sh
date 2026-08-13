@@ -7,7 +7,7 @@ MODE="${1:-predictor}"
 
 case "${MODE}" in
   predictor)
-    CONFIG=/workspace/scene_pred_pipeline.rviz
+    CONFIG=/workspace/rviz/scene_pred_pipeline.rviz
     ;;
   tracker)
     CONFIG=/workspace/MultiViewRGBDTracker/rviz/tracking.rviz

@@ -1,0 +1,151 @@
+runtime:
+  camera_names: [camera_0, camera_1]
+  target_hz: 30.0
+  queue_size: 1
+  drop_when_busy: true
+
+  # Only one EfficientTAM worker owns tracker state. SAM3 runs on a separate
+  # worker/CUDA stream, so do not serialize both models through the old global lock.
+  serialize_gpu: false
+  device: cuda
+  use_bf16: true
+  enable_tf32: true
+
+  # Keep visualization inside the synchronous measured pipeline.  When false,
+  # no RViz messages are built or published.
+  enable_visualization: true
+
+  # Debug rasters force raw full-resolution masks to be copied GPU->CPU every
+  # frame. Keep this false for the fast path; set true only when inspecting masks.
+  publish_debug_images: false
+  
+ros:
+  world_frame: world
+  color_topic: /{camera}/color/image_raw
+  depth_topic: /{camera}/depth/image_raw
+  camera_info_topic: /{camera}/camera_info
+  output_prefix: /tracking/{camera}
+  sync_slop_seconds: 0.02
+
+  # Local RGB-D tuples are paired across all cameras before EfficientTAM/SAM3.
+  multiview_sync_slop_seconds: 0.02
+
+pointcloud:
+  stride: 1
+  max_points_per_instance: 8192
+  transform_to_world: true
+
+# SAM3 is now a sparse asynchronous B=num_views detector. The initial SAM3 call
+# is blocking only because no tracker state exists yet. Later refreshes never
+# queue: if one SAM3 job is already in flight, another trigger is skipped.
+detector:
+  checkpoint: checkpoints/sam3.pt
+
+  # [semantic class, fixed EfficientTAM capacity]. Keep the class and its
+  # capacity together so adding/removing an object only changes this list.
+  # Total local slots/view = 1+1+1 = 3; inactive capacity stays reserved.
+  prompts:
+    - [ball, 1]
+    # - [red mug, 1]
+    - [red and white can, 1]
+    - [mustard bottle, 1]
+
+  score_threshold: 0.4
+  duplicate_iou_threshold: 0.7
+  min_mask_pixels: 10
+
+  refresh_seconds: 1.0
+  trigger_on_anomaly: false
+  min_frames_between_triggers: 5
+  anomaly_presence_threshold: 0.05
+
+tracker:
+  offload_video_to_cpu: false
+  offload_state_to_cpu: false
+  vos_optimized: true
+  gpu_preprocess: true
+  pin_input_memory: true
+
+  # Local slot lifecycle / SAM3 refresh continuity.
+  release_after_missing_frames: 30
+  local_slot_iou_threshold: 0.05
+
+  efficient_tam:
+    checkpoint: checkpoints/efficienttam_s_512x512.pt
+    config: configs/efficienttam/efficienttam_s_512x512.yaml
+    non_overlap_masks: false
+
+    # sequential  -> batched B=num_views feature snapshot + per-object B=1 propagation
+    # fixed_batch -> one B=num_views encoder + one fixed all-view/object batch
+    execution_mode: fixed_batch
+
+    # Slot count is derived directly from the capacities in detector.prompts.
+    # Compile optimization defaults to torch.compile(mode="default").
+    # Set true only when explicitly benchmarking max-autotune.
+    use_max_autotune: true
+
+    # Persistent EfficientTAM image-feature ring used by asynchronous SAM3
+    # corrected-reference inference. With 2 views this is ~4 MiB/frame for the
+    # current EfficientTAM-S model, so 32 frames is ~128 MiB. The raw normalized
+    # image store is also bounded and is automatically kept at least 2 frames
+    # larger than this history.
+    feature_history_frames: 32
+
+    # Prewarm normal cached-feature propagation plus the direct-correction path.
+    prewarm_enabled: true
+    prewarm_temporal_frames: 20
+    prewarm_post_reset_frames: 2
+    prewarm_passes: 2
+
+postprocess:
+  mask_threshold: 0.0
+  erosion_pixels: 2
+  min_component_pixels: 30
+  min_valid_depth_m: 0.10
+  max_valid_depth_m: 6.0
+
+  # Choose a larger point-sampling stride for unusually large masks *before*
+  # geometry coordinate extraction. The 2-D cleaned mask itself is unchanged.
+  adaptive_geometry_sampling: true
+
+  # The dense int32 owner map has no consumer in the current batched pipeline.
+  # Disable it to avoid a full HxW allocation/zero-fill per camera per frame.
+  build_owner_map: false
+
+# Same-time, different-camera geometry alignment. World voxels are sparse keys;
+# no dense 3-D volume is allocated.
+shared_voxel_grid:
+  voxel_size_m: 0.01
+  origin_world: [0.0, 0.0, 0.0]
+  match_radius_voxels: 1
+  min_alignment_score: 0.15
+  min_bidirectional_coverage: 0.20
+  # Optional bounded per-object local occupancy acceleration; never a global grid.
+  max_local_dense_voxels: 1000000
+
+# Different-time alignment: class+centroid hard gate -> batched GPU Chamfer ->
+# Hungarian. Cross-view output is voxel-deduplicated once more on the same
+# shared_voxel_grid lattice before Chamfer, removing overlapping view samples.
+cross_frame_alignment:
+  centroid_gate_m: 0.20
+  chamfer_max_workspace_mb: 512
+
+  # Pair capacity is derived automatically from detector.prompts as
+  # sum(class_capacity^2), because cross-frame Chamfer only compares same-class
+  # instances. Point capacity remains a startup hint and may grow if needed.
+  chamfer_preallocate_points: 8192
+  # Optional safety threshold; leave unset until measured on your scene.
+  # max_chamfer_m: 0.08
+
+profiling:
+  enabled: true
+  # Execute these first live bundles normally, but exclude them from all timing
+  # statistics/CSV so CUDA, BLAS, Chamfer workspace and allocator lazy-init do
+  # not contaminate mean/median/p95/max. Set 0 to disable.
+  warmup_frames: 30
+  summary_interval_frames: 100
+  cuda_events: true
+  csv_path: logs/timing.csv
+  rate_diagnostics: true
+  camera_diagnostics: true
+  rate_summary_interval_seconds: 5.0

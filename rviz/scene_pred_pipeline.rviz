@@ -1,61 +1,301 @@
 Panels:
   - Class: rviz_common/Displays
+    Help Height: 0
     Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Tracked Objects1/Status1
+        - /Scene Velocity Cloud1/Status1
+      Splitter Ratio: 0.5
+    Tree Height: 475
 Visualization Manager:
   Class: ""
   Displays:
-    - Class: rviz_default_plugins/PointCloud2
-      Name: Background
-      Topic:
-        Value: /scene_predictor/background_points
-      Size (Pixels): 2
-      Style: Points
-    - Class: rviz_default_plugins/PointCloud2
-      Name: Static Objects
-      Topic:
-        Value: /scene_predictor/static_object_points
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Tracked Objects
+      Position Transformer: XYZ
+      Selectable: true
       Size (Pixels): 3
+      Size (m): 0.009999999776482582
       Style: Points
-    - Class: rviz_default_plugins/PointCloud2
-      Name: Moving Objects
       Topic:
-        Value: /scene_predictor/moving_object_points
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scene_predictor/tracked_points
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Scene Velocity Cloud
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scene_predictor/scene_velocity
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: DifFlow Source Anchors
+      Position Transformer: XYZ
+      Selectable: true
       Size (Pixels): 4
+      Size (m): 0.009999999776482582
       Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scene_predictor/flow/source_anchors
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: DifFlow Warped Anchors
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 4
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scene_predictor/flow/warped_anchors
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
       Name: Predicted Velocity
-      Marker Topic:
-        Value: /scene_predictor/velocity_markers
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: visualization_marker_array
+      Value: true
     - Class: rviz_default_plugins/Image
+      Enabled: false
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
       Name: Camera 0 Raw RGB
+      Normalize Range: true
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
         Value: /camera_0/color/image_raw
+      Value: false
     - Class: rviz_default_plugins/Image
-      Name: Camera 0 Detections
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera 0 Tracker Overlay
+      Normalize Range: true
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
         Value: /scene_predictor/camera_0/rgb_annotated
+      Value: true
     - Class: rviz_default_plugins/Image
+      Enabled: false
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
       Name: Camera 1 Raw RGB
+      Normalize Range: true
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
         Value: /camera_1/color/image_raw
+      Value: false
     - Class: rviz_default_plugins/Image
-      Name: Camera 1 Detections
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera 1 Tracker Overlay
+      Normalize Range: true
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
         Value: /scene_predictor/camera_1/rgb_annotated
+      Value: true
     - Class: rviz_default_plugins/Image
-      Name: Camera 0 Moving Mask
+      Enabled: false
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera 0 Tracked Mask
+      Normalize Range: true
       Topic:
-        Value: /scene_predictor/camera_0/moving_mask
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scene_predictor/camera_0/tracked_mask
+      Value: false
     - Class: rviz_default_plugins/Image
-      Name: Camera 1 Moving Mask
+      Enabled: false
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Camera 1 Tracked Mask
+      Normalize Range: true
       Topic:
-        Value: /scene_predictor/camera_1/moving_mask
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scene_predictor/camera_1/tracked_mask
+      Value: false
+  Enabled: true
   Global Options:
+    Background Color: 48; 48; 48
     Fixed Frame: world
+    Frame Rate: 30
+  Name: root
   Tools:
     - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.4432098865509033
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 0.7053982615470886
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz_default_plugins)
+      Yaw: 4.798578262329102
+    Saved: ~
 Window Geometry:
-  Height: 900
-  Width: 1500
+  Camera 0 Raw RGB:
+    collapsed: false
+  Camera 0 Tracked Mask:
+    collapsed: false
+  Camera 0 Tracker Overlay:
+    collapsed: false
+  Camera 1 Raw RGB:
+    collapsed: false
+  Camera 1 Tracked Mask:
+    collapsed: false
+  Camera 1 Tracker Overlay:
+    collapsed: false
+  Displays:
+    collapsed: false
+  Height: 2022
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd00000001000000000000033f00000754fc0200000007fb0000003000430061006d0065007200610020003000200054007200610063006b006500720020004f007600650072006c006100790100000069000002820000002100fffffffb0000002000430061006d00650072006100200031002000520061007700200052004700420000000000ffffffff0000002100fffffffb0000002a00430061006d0065007200610020003000200054007200610063006b006500640020004d00610073006b0000000000ffffffff0000002100fffffffb0000003000430061006d0065007200610020003100200054007200610063006b006500720020004f007600650072006c0061007901000002f70000027b0000002100fffffffb0000002000430061006d00650072006100200030002000520061007700200052004700420000000000ffffffff0000002100fffffffb0000002a00430061006d0065007200610020003100200054007200610063006b006500640020004d00610073006b0000000200000000ec0000002100fffffffb000000100044006900730070006c006100790073010000057e0000023f0000017800ffffff00000b310000075400000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Width: 3708
+  X: 132
+  Y: 64

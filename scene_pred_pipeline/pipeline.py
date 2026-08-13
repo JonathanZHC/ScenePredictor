@@ -1,252 +1,219 @@
 from __future__ import annotations
-from collections import defaultdict
 
+import numpy as np
 import torch
+
+from sam_rgbd_tracking.visualization import make_overlay
 
 from .config import PipelineConfig
 from .data_types import (
-    ImageDetection,
-    MotionState,
     MultiCameraFrame,
     SceneVelocityOutput,
-    TrackedFrame,
+    TrackedInstanceFrame,
 )
 from .flow_prediction import DifFlowPredictor
-from .multiview import MultiViewFusion
-from .perception import PerViewPerception
+from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
-from .sampling import MovingPointSampler
-from .tracking import SimpleObjectTracker
+from .sampling import TrackedPointSampler
+from .tracker_adapter import MultiViewTrackerAdapter
 from .velocity_recovery import VelocityRecovery
-from .voxel import GlobalVoxelizer
 
 
 class ScenePredictionPipeline:
-    """Complete Step 1-5 scene prediction pipeline."""
+    """MultiViewRGBDTracker -> common-ID DifFlow3D -> dense velocity recovery."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
-        self.perception = PerViewPerception(config)
-        self.multiview = MultiViewFusion(config)
-        self.voxelizer = GlobalVoxelizer(config)
-        self.tracker = SimpleObjectTracker(config)
-        self.sampler = MovingPointSampler(config)
+        if config.runtime.allow_tf32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        # Capture DifFlow's CUDA graphs before constructing the tracker.
+        # EfficientTAM uses TorchInductor/CUDAGraph internally and SAM3 owns a
+        # separate CUDA worker/stream. One-time DifFlow capture must therefore
+        # happen while no tracker CUDA work or graph capture can be active.
         self.flow_predictor = DifFlowPredictor(config)
+        self.flow_predictor.prepare()
+
+        self.tracker = MultiViewTrackerAdapter(config)
+        self.instance_filter = CommonInstanceFilter()
+        self.sampler = TrackedPointSampler(config)
         self.recovery = VelocityRecovery(config)
-        self.profiler = CycleProfiler(
-            config.runtime.enable_cuda_timing
-        )
-        self.frame_index = 0
-        self.previous_tracked: TrackedFrame | None = None
+        self.profiler = CycleProfiler(config.runtime.enable_cuda_timing)
+        self.previous_tracked: TrackedInstanceFrame | None = None
         self.last_flow_gap_s: float | None = None
 
-    @staticmethod
-    def _cat_or_empty(
-        parts: list[torch.Tensor],
-        device: torch.device,
-    ) -> torch.Tensor:
-        return (
-            torch.cat(parts, dim=0)
-            if parts
-            else torch.empty((0, 3), device=device)
-        )
+    @property
+    def device(self) -> torch.device:
+        return torch.device(self.config.runtime.device)
 
-    @staticmethod
-    def _moving_without_flow(
-        tracked: TrackedFrame,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        moving_objects = [
-            item
-            for item in tracked.objects
-            if item.motion_state == MotionState.MOVING
-        ]
-        if not moving_objects:
-            return (
-                torch.empty((0, 3), device=device),
-                torch.empty((0, 3), device=device),
-                torch.empty(
-                    (0,),
-                    device=device,
-                    dtype=torch.int64,
-                ),
-            )
+    def _empty_points(self) -> torch.Tensor:
+        return torch.empty((0, 3), device=self.device, dtype=torch.float32)
 
+    def _empty_ids(self) -> torch.Tensor:
+        return torch.empty((0,), device=self.device, dtype=torch.int64)
+
+    def _all_tracked_points(
+        self,
+        tracked: TrackedInstanceFrame,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not tracked.instances:
+            return self._empty_points(), self._empty_ids()
         points = torch.cat(
-            [item.points for item in moving_objects],
-            dim=0,
-        )
-        track_ids = torch.cat(
+            [item.points_world for item in tracked.instances], dim=0
+        ).contiguous()
+        ids = torch.cat(
             [
                 torch.full(
-                    (item.points.shape[0],),
-                    item.track_id,
-                    device=device,
+                    (item.points_world.shape[0],),
+                    int(item.global_track_id),
+                    device=points.device,
                     dtype=torch.int64,
                 )
-                for item in moving_objects
+                for item in tracked.instances
             ],
             dim=0,
         )
-        return points, torch.zeros_like(points), track_ids
+        return points, ids
 
-    def process(
+    def _visualization_payload(
         self,
         frame: MultiCameraFrame,
+        tracked: TrackedInstanceFrame | None,
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        annotated: dict[str, np.ndarray] = {}
+        masks: dict[str, np.ndarray] = {}
+
+        if tracked is None:
+            if self.config.output.publish_annotated_rgb:
+                annotated = {
+                    name: np.ascontiguousarray(camera.rgb, dtype=np.uint8)
+                    for name, camera in frame.cameras.items()
+                }
+            return masks, annotated
+
+        for camera_name, result in tracked.view_results.items():
+            if self.config.output.publish_annotated_rgb:
+                annotated[camera_name] = make_overlay(result)
+            if self.config.output.publish_tracked_masks:
+                shape = result.frame.depth_m.shape
+                combined = np.zeros(shape, dtype=bool)
+                for instance in result.instances:
+                    combined |= np.asarray(instance.mask, dtype=bool)
+                masks[camera_name] = combined
+        return masks, annotated
+
+    def _empty_output(
+        self,
+        frame: MultiCameraFrame,
+        tracked: TrackedInstanceFrame | None,
     ) -> SceneVelocityOutput:
-
-        self.profiler.start_cycle()
-        self.last_flow_gap_s = None
-
-        # Step 1: YOLO, CLIP, masks and per-view point clouds.
-        self.profiler.start("step1_perception")
-        per_view = self.perception.process(
-            frame,
-            profiler=self.profiler,
-        )
-        self.profiler.stop("step1_perception")
-
-        # Step 2: Multi-view object association and fusion.
-        self.profiler.start("step2_multiview")
-        fused = self.multiview.process(
-            frame.stamp_ns,
-            per_view,
-        )
-        self.profiler.stop("step2_multiview")
-
-        # Step 3: Fixed world-frame voxel downsampling.
-        self.profiler.start("step3_voxel")
-        voxelized = self.voxelizer.process(
-            self.frame_index,
-            fused,
-        )
-        self.profiler.stop("step3_voxel")
-
-        # Step 4: Tracking and moving/static classification.
-        self.profiler.start("step4_tracking")
-        tracked = self.tracker.update(voxelized)
-        self.profiler.stop("step4_tracking")
-
-        device = tracked.background_points.device
-
-        static_points = self._cat_or_empty(
-            [
-                item.points
-                for item in tracked.objects
-                if item.motion_state == MotionState.STATIC
-            ],
-            device,
-        )
-
-        # Step 5A: Moving-point extraction, preselection and FPS.
-        self.profiler.start("step5_sampling")
-        flow_input = self.sampler.prepare(
-            self.previous_tracked,
-            tracked,
-        )
-        self.profiler.stop("step5_sampling")
-
-        gap_is_valid = (
-            flow_input is not None
-            and flow_input.dt_s
-            <= self.config.flow.max_frame_gap_s
-        )
-
-        if flow_input is None:
-            (
-                moving_points,
-                moving_velocity,
-                moving_track_ids,
-            ) = self._moving_without_flow(
-                tracked,
-                device,
-            )
-
-        elif not gap_is_valid:
-            # Skip this invalid temporal pair and make the current frame
-            # the source frame for the next iteration.
-            self.last_flow_gap_s = flow_input.dt_s
-            self.flow_predictor.reset()
-
-            moving_points = flow_input.current_candidates
-            moving_velocity = torch.zeros_like(
-                moving_points
-            )
-            moving_track_ids = (
-                flow_input.current_candidate_track_ids
-            )
-
-        else:
-            # Step 5B: DifFlow3D inference.
-            self.profiler.start("step5_difflow")
-            flow_result = self.flow_predictor.predict(
-                flow_input,
-                self.previous_tracked.stamp_ns,
-                tracked.stamp_ns,
-            )
-            self.profiler.stop("step5_difflow")
-
-            # Step 5C: Recover velocity to all moving candidate points.
-            self.profiler.start("step5_recovery")
-            moving_velocity = self.recovery.recover(
-                flow_input,
-                flow_result,
-            )
-            self.profiler.stop("step5_recovery")
-
-            moving_points = flow_input.current_candidates
-            moving_track_ids = (
-                flow_input.current_candidate_track_ids
-            )
-
+        tracked_points = self._empty_points()
+        tracked_ids = self._empty_ids()
+        if tracked is not None:
+            tracked_points, tracked_ids = self._all_tracked_points(tracked)
+        masks, annotated = self._visualization_payload(frame, tracked)
         timings = self.profiler.finish()
-
-        image_detections: dict[str, list[ImageDetection]] = defaultdict(list)
-
-        for item in tracked.objects:
-            for member in item.members:
-                image_detections[
-                    member.camera_name
-                ].append(
-                    ImageDetection(
-                        bbox_xyxy=member.bbox_xyxy,
-                        class_id=member.class_id,
-                        class_name=member.class_name,
-                        confidence=member.class_confidence,
-                        track_id=item.track_id,
-                        motion_state=item.motion_state,
-                    )
-                )
-
-        output = SceneVelocityOutput(
-            stamp_ns=tracked.stamp_ns,
-
-            background_points=tracked.background_points,
-            static_points=static_points,
-
-            moving_points=moving_points,
-            moving_velocity=moving_velocity,
-            moving_track_ids=moving_track_ids,
-
-            moving_masks=tracked.moving_masks,
-
-            # Reuse the original CPU RGB received from ROS.
-            # Do not copy the GPU RGB back to CPU.
-            camera_rgb={
-                camera_name: camera.rgb
-                for camera_name, camera
-                in frame.cameras.items()
-            },
-            annotated_rgb={
-                camera_name: result.annotated_rgb
-                for camera_name, result in per_view.items()
-            },
-
+        return SceneVelocityOutput(
+            stamp_ns=int(frame.stamp_ns if tracked is None else tracked.stamp_ns),
+            tracked_points=tracked_points,
+            tracked_track_ids=tracked_ids,
+            flow_points=self._empty_points(),
+            flow_velocity=self._empty_points(),
+            flow_track_ids=self._empty_ids(),
+            source_anchors=self._empty_points(),
+            warped_anchors=self._empty_points(),
+            tracked_masks=masks,
+            annotated_rgb=annotated,
+            common_track_ids=(),
+            flow_valid=False,
             timings_ms=timings,
         )
 
-        # Always advance the temporal state, including after a large frame gap.
-        self.previous_tracked = tracked
-        self.frame_index += 1
+    def process(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
+        self.profiler.start_cycle()
+        self.last_flow_gap_s = None
 
-        return output
+        with self.profiler.stage("tracker_total", cuda=False):
+            current = self.tracker.process(frame)
+
+        # The very first synchronized bundle may be consumed solely by the
+        # EfficientTAM prewarm path. It is intentionally not a temporal source.
+        if current is None:
+            return self._empty_output(frame, None)
+
+        for name, value in current.tracker_timings_ms.items():
+            self.profiler.record(f"tracker/{name}", value)
+
+        tracked_points, tracked_ids = self._all_tracked_points(current)
+
+        previous = self.previous_tracked
+        # Critical invariant: always advance to the immediately current tracker
+        # frame, even if this pair is empty, too old, or later skipped.
+        self.previous_tracked = current
+
+        with self.profiler.stage("instance_filter", cuda=True):
+            pair = self.instance_filter.select(previous, current)
+
+        flow_points = self._empty_points()
+        flow_velocity = self._empty_points()
+        flow_track_ids = self._empty_ids()
+        source_anchors = self._empty_points()
+        warped_anchors = self._empty_points()
+        common_ids: tuple[int, ...] = ()
+        flow_valid = False
+
+        if pair is None:
+            self.flow_predictor.reset()
+        else:
+            common_ids = pair.common_track_ids
+            if pair.dt_s > float(self.config.flow.max_frame_gap_s):
+                self.last_flow_gap_s = float(pair.dt_s)
+                self.flow_predictor.reset()
+            elif self.config.flow.enabled:
+                with self.profiler.stage("sampling_fps", cuda=True):
+                    flow_input = self.sampler.prepare(pair)
+
+                with self.profiler.stage("difflow", cuda=True):
+                    flow_result = self.flow_predictor.predict(
+                        flow_input,
+                        pair.previous_stamp_ns,
+                        pair.current_stamp_ns,
+                    )
+
+                with self.profiler.stage("velocity_recovery", cuda=True):
+                    flow_velocity = self.recovery.recover(
+                        flow_input,
+                        flow_result,
+                    )
+
+                flow_points = flow_input.current_dense_points
+                flow_track_ids = flow_input.current_dense_track_ids
+                source_anchors = flow_result.source_anchors
+                warped_anchors = flow_result.warped_anchors
+                flow_valid = True
+            else:
+                self.flow_predictor.reset()
+
+        with self.profiler.stage("visualization_build", cuda=False):
+            masks, annotated = self._visualization_payload(frame, current)
+
+        timings = self.profiler.finish()
+        return SceneVelocityOutput(
+            stamp_ns=int(current.stamp_ns),
+            tracked_points=tracked_points,
+            tracked_track_ids=tracked_ids,
+            flow_points=flow_points,
+            flow_velocity=flow_velocity,
+            flow_track_ids=flow_track_ids,
+            source_anchors=source_anchors,
+            warped_anchors=warped_anchors,
+            tracked_masks=masks,
+            annotated_rgb=annotated,
+            common_track_ids=common_ids,
+            flow_valid=flow_valid,
+            timings_ms=timings,
+        )
+
+    def close(self) -> None:
+        self.tracker.close()

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${IMAGE:-scenepredictor:latest}"
-CONTAINER="${CONTAINER:-scenepredictor}"
+IMAGE="${IMAGE:-sam-rgbd-tracking:latest}"
+CONTAINER="${CONTAINER:-sam-rgbd-tracking}"
 CACHE_ROOT="${REPO_ROOT}/.container-cache"
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || true)" == "true" ]]; then
@@ -12,6 +12,7 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || tr
 fi
 
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+
 mkdir -p \
   "${CACHE_ROOT}/kit" \
   "${CACHE_ROOT}/ov" \
@@ -24,6 +25,9 @@ mkdir -p \
   "${CACHE_ROOT}/config" \
   "${CACHE_ROOT}/data" \
   "${REPO_ROOT}/logs"
+
+# The Isaac image runs as UID/GID 1234. The repo stays owned by the host user;
+# only cache/output directories are made world-writable for the test branch.
 chmod -R a+rwX "${CACHE_ROOT}" "${REPO_ROOT}/logs" 2>/dev/null || true
 
 xhost +local:docker >/dev/null 2>&1 || true
