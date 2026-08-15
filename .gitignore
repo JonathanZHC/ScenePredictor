@@ -36,3 +36,6 @@ logs/
 *.tmp
 *.swp
 *~
+
+# Container
+.container-cache

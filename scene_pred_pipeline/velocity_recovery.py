@@ -1,70 +1,73 @@
 from __future__ import annotations
 
+import importlib
+from pathlib import Path
+import sys
+
 import torch
 
 from .config import PipelineConfig
-from .data_types import FlowInput, FlowResult
+from .data_types import FlowResult, InstancePair
 
 
 class VelocityRecovery:
-    """Recover sparse source-anchor flow onto dense current tracked points."""
+    """Dense current-frame velocity using DifFlow3D's world-space recoverer.
+
+    The numerical recovery method is configured only in difflow.yaml. The one
+    ScenePredictor-specific policy retained here is same-track conditioning,
+    which prevents velocity mixing between nearby independently moving objects.
+    """
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
 
-    def _recover_track(
-        self,
-        target_points: torch.Tensor,
-        warped_anchors: torch.Tensor,
-        anchor_velocity: torch.Tensor,
-    ) -> torch.Tensor:
-        if target_points.shape[0] == 0:
-            return torch.empty_like(target_points)
-        if warped_anchors.shape[0] == 0:
-            return torch.zeros_like(target_points)
+        repo_path = Path(config.flow.repo_path).expanduser().resolve()
+        if str(repo_path) not in sys.path:
+            sys.path.insert(0, str(repo_path))
+        runtime_module = importlib.import_module("difflow3d.runtime")
+        recoverer_class = getattr(runtime_module, "SoftmaxAnchorMotionRecoverer")
 
-        k = min(int(self.config.recovery.knn), int(warped_anchors.shape[0]))
-        temperature = max(float(self.config.recovery.temperature_m), 1.0e-6)
-        chunk_size = max(1, int(self.config.recovery.chunk_size))
-        outputs: list[torch.Tensor] = []
-
-        for begin in range(0, target_points.shape[0], chunk_size):
-            chunk = target_points[begin : begin + chunk_size]
-            distances = torch.cdist(chunk, warped_anchors)
-            values, indices = torch.topk(
-                distances,
-                k=k,
-                dim=1,
-                largest=False,
-                sorted=False,
-            )
-            weights = torch.softmax(-values / temperature, dim=1)
-            neighbors = anchor_velocity[indices]
-            outputs.append(torch.sum(weights[..., None] * neighbors, dim=1))
-        return torch.cat(outputs, dim=0)
+        recovery = config.difflow.recovery
+        self.recoverer = recoverer_class(
+            chunk_size=int(recovery.chunk_size),
+            softmax_sigma_m=float(recovery.softmax_sigma_m),
+            backend=str(recovery.backend),
+            local_radius_sigma=float(recovery.local_radius_sigma),
+            local_hash_size_factor=float(recovery.local_hash_size_factor),
+        )
 
     def recover(
         self,
-        flow_input: FlowInput,
+        pair: InstancePair,
         flow_result: FlowResult,
     ) -> torch.Tensor:
-        current = flow_input.current_dense_points
-        if not self.config.recovery.restrict_same_track:
-            return self._recover_track(
-                current,
-                flow_result.warped_anchors,
-                flow_result.anchor_velocity,
-            )
+        """Recover every current-frame point in one CUDA call.
 
-        output = torch.zeros_like(current)
-        for track_id in flow_input.common_track_ids:
-            target_mask = flow_input.current_dense_track_ids == int(track_id)
-            source_mask = flow_input.previous_anchor_track_ids == int(track_id)
-            if not bool(torch.any(target_mask)):
-                continue
-            output[target_mask] = self._recover_track(
-                current[target_mask],
-                flow_result.warped_anchors[source_mask],
-                flow_result.anchor_velocity[source_mask],
-            )
-        return output
+        When same-track conditioning is enabled, query and anchor track IDs are
+        passed into DifFlow3D's local CUDA kernel. The kernel rejects anchors
+        from other instances inside the hash-grid traversal, avoiding the old
+        per-track boolean gathers, repeated hash builds, and repeated launches.
+        """
+        current = pair.current_points
+        if current.shape[0] == 0:
+            return torch.empty_like(current)
+
+        kwargs = {}
+        if self.config.recovery.restrict_same_track:
+            if self.recoverer.backend != "local":
+                raise ValueError(
+                    "restrict_same_track requires difflow recovery.backend=local "
+                    "for the fused track-aware CUDA recovery path"
+                )
+            kwargs = {
+                "query_track_ids": pair.current_track_ids,
+                "anchor_track_ids": flow_result.source_anchor_track_ids,
+            }
+
+        return self.recoverer.recover(
+            query_points=current,
+            anchor_points=flow_result.warped_anchors,
+            anchor_flow=flow_result.anchor_flow,
+            dt_s=float(pair.dt_s),
+            **kwargs,
+        ).velocity

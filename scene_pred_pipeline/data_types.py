@@ -54,26 +54,14 @@ class InstancePair:
 
 
 @dataclass
-class FlowInput:
-    previous_candidates: torch.Tensor
-    current_candidates: torch.Tensor
-    previous_candidate_track_ids: torch.Tensor
-    current_candidate_track_ids: torch.Tensor
-    previous_anchors: torch.Tensor
-    current_anchors: torch.Tensor
-    previous_anchor_track_ids: torch.Tensor
-    current_anchor_track_ids: torch.Tensor
-    current_dense_points: torch.Tensor
-    current_dense_track_ids: torch.Tensor
-    common_track_ids: tuple[int, ...]
-    dt_s: float
-
-
-@dataclass
 class FlowResult:
     source_anchors: torch.Tensor
+    target_anchors: torch.Tensor
     warped_anchors: torch.Tensor
+    anchor_flow: torch.Tensor
     anchor_velocity: torch.Tensor
+    source_anchor_track_ids: torch.Tensor
+    target_anchor_track_ids: torch.Tensor
 
 
 @dataclass

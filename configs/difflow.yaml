@@ -1,0 +1,45 @@
+# DifFlow3D inference/deployment configuration used by ScenePredictor.
+# ScenePredictor loads this file once at startup. The checkpoint path is resolved
+# relative to flow.repo_path when it is not absolute.
+
+runtime:
+  device: cuda
+  enable_tf32: true
+  cuda_graph_warmup: 10
+  validate_finite: false
+
+model:
+  checkpoint: checkpoints/model_difflow_355_0.0114.pth
+
+  iterations:
+    coarse: 4
+    middle: 2
+    fine: 2
+
+  uncertainty: 0.20
+  strict_checkpoint: true
+  disable_bn_running_stats: true
+
+preprocessing:
+  fps_points: 2048
+  second_candidate_ratio: 1.1
+  final_selection: uniform
+
+  auto_spatial_scale: true
+  target_model_volume: 2.0
+  fixed_spatial_scale: 1.0
+
+recovery:
+  # Real/world metric bandwidth in metres.
+  softmax_sigma_m: 0.025
+
+  # Fast deployment path benchmarked on the current runtime.
+  backend: local
+  local_radius_sigma: 4.0
+  local_hash_size_factor: 4.0
+
+  # Leave false in deployment; diagnostics can require extra reductions/sync.
+  report_local_stats: false
+
+  # Used only by the PyTorch fallback backend.
+  chunk_size: 4096

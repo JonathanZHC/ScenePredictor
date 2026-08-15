@@ -64,83 +64,41 @@ RUN python3.12 -m venv /opt/difflow-build-venv \
 
 COPY DifFlow3D/ /opt/DifFlow3D/
 
-RUN test -d /opt/DifFlow3D/pointnet2/src \
-    && test -f /opt/DifFlow3D/pretrain_weights/model_difflow_355_0.0114.pth
+# The current DifFlow3D repository already contains the modern PyTorch/CUDA
+# PointNet2 wrappers. Build the extension in its package-local location so the
+# runtime imports exactly the ABI-matched binary from /opt/DifFlow3D.
+RUN test -d /opt/DifFlow3D/difflow3d/ops/pointnet2/src \
+    && test -f /opt/DifFlow3D/checkpoints/model_difflow_355_0.0114.pth \
+    && ! grep -RInE 'THC/THC\.h|THCState' \
+         /opt/DifFlow3D/difflow3d/ops/pointnet2/src \
+         --include='*.cpp' --include='*.cu' --include='*.h'
 
-# Modern PyTorch compatibility edits for the legacy PointNet++ extension API.
-RUN /opt/difflow-build-venv/bin/python - <<'PY'
-from pathlib import Path
-import re
-
-repo = Path('/opt/DifFlow3D')
-src_dir = repo / 'pointnet2' / 'src'
-if not src_dir.is_dir():
-    raise FileNotFoundError(src_dir)
-
-for path in sorted(src_dir.glob('*')):
-    if path.suffix not in {'.cpp', '.cu', '.h', '.hpp'}:
-        continue
-    text = path.read_text(encoding='utf-8')
-    original = text
-
-    text = re.sub(
-        r'^\s*#include\s*[<\"]THC/THC\.h[>\"]\s*$\n?',
-        '', text, flags=re.MULTILINE,
-    )
-    text = re.sub(
-        r'^\s*extern\s+THCState\s*\*\s*state\s*;\s*$\n?',
-        '', text, flags=re.MULTILINE,
-    )
-    text = re.sub(
-        r'\.data\s*<\s*([^>]+?)\s*>\s*\(\s*\)',
-        r'.data_ptr<\1>()', text,
-    )
-    text = text.replace('.type().is_cuda()', '.is_cuda()')
-
-    if 'getCurrentCUDAStream' in text:
-        text = text.replace(
-            'at::cuda::getCurrentCUDAStream()',
-            'c10::cuda::getCurrentCUDAStream().stream()',
-        )
-        text = text.replace(
-            'c10::cuda::getCurrentCUDAStream()',
-            'c10::cuda::getCurrentCUDAStream().stream()',
-        )
-        text = text.replace(
-            'c10::cuda::getCurrentCUDAStream().stream().stream()',
-            'c10::cuda::getCurrentCUDAStream().stream()',
-        )
-        include = '#include <c10/cuda/CUDAStream.h>'
-        if include not in text:
-            lines = text.splitlines()
-            insert_at = 0
-            for index, line in enumerate(lines):
-                if line.lstrip().startswith('#include'):
-                    insert_at = index + 1
-                elif insert_at:
-                    break
-            lines.insert(insert_at, include)
-            text = '\n'.join(lines)
-            if original.endswith('\n'):
-                text += '\n'
-
-    if text != original:
-        path.write_text(text, encoding='utf-8')
-        print('patched', path.relative_to(repo))
-PY
-
-RUN cd /opt/DifFlow3D/pointnet2 \
+RUN cd /opt/DifFlow3D/difflow3d/ops/pointnet2 \
     && rm -rf build pointnet2_cuda*.so \
     && /opt/difflow-build-venv/bin/python setup.py build_ext --inplace \
     && cd /opt/DifFlow3D \
-    && PYTHONPATH=/opt/DifFlow3D:/opt/DifFlow3D/pointnet2 \
+    && PYTHONPATH=/opt/DifFlow3D \
        /opt/difflow-build-venv/bin/python - <<'PY'
+from pathlib import Path
 import torch
-import pointnet2_cuda
-from pointnet2 import pointnet2_utils
+from difflow3d.ops.pointnet2 import pointnet2_utils
+
+required = (
+    'gaussian_softmax_recovery_wrapper',
+    'gaussian_recovery_hash_build_wrapper',
+    'gaussian_softmax_recovery_local_wrapper',
+    'gaussian_softmax_recovery_local_track_aware_wrapper',
+)
+loaded = Path(pointnet2_utils.extension_path()).resolve()
+expected = Path('/opt/DifFlow3D/difflow3d/ops/pointnet2').resolve()
+missing = [name for name in required if not hasattr(pointnet2_utils.pointnet2, name)]
 print('DifFlow builder torch:', torch.__version__, torch.version.cuda)
-print('pointnet2_cuda:', pointnet2_cuda.__file__)
-print('pointnet2_utils:', pointnet2_utils.__file__)
+print('pointnet2_cuda:', loaded)
+if loaded.parent != expected:
+    raise RuntimeError(f'Loaded PointNet2 extension from {loaded}; expected {expected}')
+if missing:
+    raise RuntimeError(f'Missing DifFlow recovery CUDA symbols: {missing}')
+print('[OK] DifFlow3D PointNet2 + recovery extension')
 PY
 
 RUN /opt/difflow-build-venv/bin/python - <<'PY'
@@ -203,7 +161,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       software-properties-common \
       python3 python3-dev python3.12 python3.12-dev python3.12-venv \
       build-essential cmake ninja-build pkg-config ffmpeg \
-      libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libx11-6 \
+      libgl1 libgl1-mesa-dri libglx-mesa0 libegl-mesa0 \
+      libglib2.0-0 libsm6 libxext6 libxrender1 libx11-6 \
       libxrandr2 libxinerama1 libxcursor1 libxi6 xauth mesa-utils \
       libgomp1 \
     && locale-gen en_US.UTF-8 \
@@ -327,26 +286,40 @@ RUN printf '%s\n' \
       '/workspace/MultiViewRGBDTracker' \
       '/workspace' \
       '/opt/DifFlow3D' \
-      '/opt/DifFlow3D/pointnet2' \
       > /opt/tracking-venv/lib/python3.12/site-packages/scenepredictor_paths.pth
 
 # Build-time smoke test. Source code under /workspace is bind-mounted only at runtime,
 # so this validates installed/upstream/compiled dependencies rather than project imports.
 RUN source /opt/ros/jazzy/setup.bash \
-    && PYTHONPATH=/opt/upstream/sam3:/opt/upstream/efficient-tam:/opt/DifFlow3D:/opt/DifFlow3D/pointnet2 \
+    && PYTHONPATH=/opt/upstream/sam3:/opt/upstream/efficient-tam:/opt/DifFlow3D \
        /opt/tracking-venv/bin/python - <<'PY'
+from pathlib import Path
 import rclpy
 import torch
 import sam3
 import efficient_track_anything
-import pointnet2_cuda
-from pointnet2 import pointnet2_utils
-import model_difflow
+import difflow3d
+from difflow3d.model import PointConvBidirection
+from difflow3d.runtime import DifFlow3DStreamingCudaGraphRunner, SoftmaxAnchorMotionRecoverer
+from difflow3d.ops.pointnet2 import pointnet2_utils
+
+required = (
+    'gaussian_softmax_recovery_wrapper',
+    'gaussian_recovery_hash_build_wrapper',
+    'gaussian_softmax_recovery_local_wrapper',
+    'gaussian_softmax_recovery_local_track_aware_wrapper',
+)
+loaded = Path(pointnet2_utils.extension_path()).resolve()
+missing = [name for name in required if not hasattr(pointnet2_utils.pointnet2, name)]
 print('inference torch:', torch.__version__, torch.version.cuda)
 print('SAM3:', sam3.__file__)
 print('EfficientTAM:', efficient_track_anything.__file__)
-print('PointNet++:', pointnet2_cuda.__file__)
-print('DifFlow3D:', model_difflow.__file__)
+print('DifFlow3D:', difflow3d.__file__)
+print('PointNet++:', loaded)
+if not str(loaded).startswith('/opt/DifFlow3D/difflow3d/ops/pointnet2/'):
+    raise RuntimeError(f'Unexpected PointNet2 extension: {loaded}')
+if missing:
+    raise RuntimeError(f'Missing DifFlow recovery CUDA symbols: {missing}')
 print('[OK] build-time inference dependencies')
 PY
 

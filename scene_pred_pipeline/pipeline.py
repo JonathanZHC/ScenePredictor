@@ -14,7 +14,6 @@ from .data_types import (
 from .flow_prediction import DifFlowPredictor
 from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
-from .sampling import TrackedPointSampler
 from .tracker_adapter import MultiViewTrackerAdapter
 from .velocity_recovery import VelocityRecovery
 
@@ -28,16 +27,26 @@ class ScenePredictionPipeline:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-        # Capture DifFlow's CUDA graphs before constructing the tracker.
-        # EfficientTAM uses TorchInductor/CUDAGraph internally and SAM3 owns a
-        # separate CUDA worker/stream. One-time DifFlow capture must therefore
-        # happen while no tracker CUDA work or graph capture can be active.
-        self.flow_predictor = DifFlowPredictor(config)
+        # Load/patch the upstream tracker configuration once. DifFlow needs the
+        # tracker output voxel resolution before any GPU model is constructed,
+        # while its CUDA graphs still need to be captured before tracker CUDA
+        # graphs/streams exist.
+        tracker_config = MultiViewTrackerAdapter.prepare_native_config(config)
+        upstream_voxel_size_m = MultiViewTrackerAdapter.output_voxel_size_m(
+            tracker_config
+        )
+
+        self.flow_predictor = DifFlowPredictor(
+            config,
+            upstream_voxel_size_m=upstream_voxel_size_m,
+        )
         self.flow_predictor.prepare()
 
-        self.tracker = MultiViewTrackerAdapter(config)
+        self.tracker = MultiViewTrackerAdapter(
+            config,
+            tracker_config=tracker_config,
+        )
         self.instance_filter = CommonInstanceFilter()
-        self.sampler = TrackedPointSampler(config)
         self.recovery = VelocityRecovery(config)
         self.profiler = CycleProfiler(config.runtime.enable_cuda_timing)
         self.previous_tracked: TrackedInstanceFrame | None = None
@@ -51,7 +60,7 @@ class ScenePredictionPipeline:
         return torch.empty((0, 3), device=self.device, dtype=torch.float32)
 
     def _empty_ids(self) -> torch.Tensor:
-        return torch.empty((0,), device=self.device, dtype=torch.int64)
+        return torch.empty((0,), device=self.device, dtype=torch.int32)
 
     def _all_tracked_points(
         self,
@@ -68,7 +77,7 @@ class ScenePredictionPipeline:
                     (item.points_world.shape[0],),
                     int(item.global_track_id),
                     device=points.device,
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
                 for item in tracked.instances
             ],
@@ -137,8 +146,8 @@ class ScenePredictionPipeline:
         with self.profiler.stage("tracker_total", cuda=False):
             current = self.tracker.process(frame)
 
-        # The very first synchronized bundle may be consumed solely by the
-        # EfficientTAM prewarm path. It is intentionally not a temporal source.
+        # The first synchronized bundle may be consumed solely by EfficientTAM
+        # prewarm and is intentionally not a temporal source.
         if current is None:
             return self._empty_output(frame, None)
 
@@ -148,8 +157,8 @@ class ScenePredictionPipeline:
         tracked_points, tracked_ids = self._all_tracked_points(current)
 
         previous = self.previous_tracked
-        # Critical invariant: always advance to the immediately current tracker
-        # frame, even if this pair is empty, too old, or later skipped.
+        # Always advance to the immediately current tracker frame, even when the
+        # pair is empty, stale, or skipped.
         self.previous_tracked = current
 
         with self.profiler.stage("instance_filter", cuda=True):
@@ -170,30 +179,20 @@ class ScenePredictionPipeline:
             if pair.dt_s > float(self.config.flow.max_frame_gap_s):
                 self.last_flow_gap_s = float(pair.dt_s)
                 self.flow_predictor.reset()
-            elif self.config.flow.enabled:
-                with self.profiler.stage("sampling_fps", cuda=True):
-                    flow_input = self.sampler.prepare(pair)
-
+            else:
+                # DifFlow is always present. It owns adaptive voxel-2, exact-count
+                # selection, frozen world/model scaling, and CUDA-Graph inference.
                 with self.profiler.stage("difflow", cuda=True):
-                    flow_result = self.flow_predictor.predict(
-                        flow_input,
-                        pair.previous_stamp_ns,
-                        pair.current_stamp_ns,
-                    )
+                    flow_result = self.flow_predictor.predict(pair)
 
                 with self.profiler.stage("velocity_recovery", cuda=True):
-                    flow_velocity = self.recovery.recover(
-                        flow_input,
-                        flow_result,
-                    )
+                    flow_velocity = self.recovery.recover(pair, flow_result)
 
-                flow_points = flow_input.current_dense_points
-                flow_track_ids = flow_input.current_dense_track_ids
+                flow_points = pair.current_points
+                flow_track_ids = pair.current_track_ids
                 source_anchors = flow_result.source_anchors
                 warped_anchors = flow_result.warped_anchors
                 flow_valid = True
-            else:
-                self.flow_predictor.reset()
 
         with self.profiler.stage("visualization_build", cuda=False):
             masks, annotated = self._visualization_payload(frame, current)

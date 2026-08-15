@@ -7,7 +7,7 @@ IMAGE_NAME="${IMAGE_NAME:-scenepredictor:latest}"
 DOCKERFILE="${REPO_ROOT}/Dockerfile"
 
 required=(
-  "${REPO_ROOT}/DifFlow3D/pointnet2/setup.py"
+  "${REPO_ROOT}/DifFlow3D/difflow3d/ops/pointnet2/setup.py"
   "${REPO_ROOT}/MultiViewRGBDTracker/sam_rgbd_tracking/__init__.py"
   "${REPO_ROOT}/isaacscene/run_isaacsim.py"
 )

@@ -2,9 +2,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${IMAGE:-sam-rgbd-tracking:latest}"
-CONTAINER="${CONTAINER:-sam-rgbd-tracking}"
+IMAGE="${IMAGE:-scenepredictor:latest}"
+CONTAINER="${CONTAINER:-scenepredictor}"
 CACHE_ROOT="${REPO_ROOT}/.container-cache"
+
+# Intel iGPU used for RViz/OpenGL. This is the stable PCI address reported by
+# /dev/dri/by-path on this workstation. Override if the hardware changes.
+INTEL_DRM_PCI="${INTEL_DRM_PCI:-0000:00:02.0}"
+INTEL_CARD_LINK="/dev/dri/by-path/pci-${INTEL_DRM_PCI}-card"
+INTEL_RENDER_LINK="/dev/dri/by-path/pci-${INTEL_DRM_PCI}-render"
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || true)" == "true" ]]; then
   echo "[OK] container ${CONTAINER} is already running"
@@ -63,6 +69,36 @@ DOCKER_ARGS=(
   -v "${CACHE_ROOT}/config:/isaac-sim/.nvidia-omniverse/config:rw"
   -v "${CACHE_ROOT}/data:/isaac-sim/.local/share/ov/data:rw"
 )
+
+# --gpus all exposes the NVIDIA GPU, but it does not expose the Intel DRM
+# nodes. Add the Intel card/render nodes explicitly so a process inside the
+# container (RViz) can render through Mesa/iris on the iGPU.
+if [[ -e "${INTEL_CARD_LINK}" && -e "${INTEL_RENDER_LINK}" ]]; then
+  INTEL_CARD="$(readlink -f "${INTEL_CARD_LINK}")"
+  INTEL_RENDER="$(readlink -f "${INTEL_RENDER_LINK}")"
+
+  DOCKER_ARGS+=(
+    --device "${INTEL_CARD}:${INTEL_CARD}"
+    --device "${INTEL_RENDER}:${INTEL_RENDER}"
+    -e "SCENEPRED_INTEL_DRM_PCI=${INTEL_DRM_PCI}"
+    -e "SCENEPRED_INTEL_CARD=${INTEL_CARD}"
+    -e "SCENEPRED_INTEL_RENDER=${INTEL_RENDER}"
+  )
+
+  # The container runs as UID 1234. Give it the host-side supplementary groups
+  # that own the DRM device nodes (normally video and render). Numeric GIDs are
+  # used deliberately so this also works if group names differ in the image.
+  INTEL_CARD_GID="$(stat -c '%g' "${INTEL_CARD}")"
+  INTEL_RENDER_GID="$(stat -c '%g' "${INTEL_RENDER}")"
+  DOCKER_ARGS+=(--group-add "${INTEL_CARD_GID}")
+  if [[ "${INTEL_RENDER_GID}" != "${INTEL_CARD_GID}" ]]; then
+    DOCKER_ARGS+=(--group-add "${INTEL_RENDER_GID}")
+  fi
+
+  echo "[INFO] exposing Intel iGPU ${INTEL_DRM_PCI}: ${INTEL_CARD}, ${INTEL_RENDER}"
+else
+  echo "[WARN] Intel iGPU DRM nodes not found for PCI ${INTEL_DRM_PCI}; RViz Intel offload will be unavailable" >&2
+fi
 
 CID="$(docker run "${DOCKER_ARGS[@]}" "${IMAGE}" sleep infinity)"
 sleep 0.5

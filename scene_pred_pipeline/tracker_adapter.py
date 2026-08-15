@@ -24,12 +24,18 @@ class MultiViewTrackerAdapter:
     No tracker data is serialized through ROS between tracking and scene flow.
     """
 
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        *,
+        tracker_config: TrackerNativeConfig | None = None,
+    ) -> None:
         self.config = config
         self.device = torch.device(config.runtime.device)
         self.camera_names = [str(name) for name in config.ros.camera_names]
 
-        tracker_config = self._load_and_patch_tracker_config()
+        if tracker_config is None:
+            tracker_config = self.prepare_native_config(config)
         self.tracker_config = tracker_config
 
         self._owner = ThreadPoolExecutor(
@@ -61,52 +67,79 @@ class MultiViewTrackerAdapter:
             path = Path(*parts[1:])
         return str((checkpoint_root / path).resolve())
 
-    def _load_and_patch_tracker_config(self) -> TrackerNativeConfig:
-        native = load_tracker_config(self.config.tracker.config_path)
+    @classmethod
+    def prepare_native_config(cls, config: PipelineConfig) -> TrackerNativeConfig:
+        """Load and patch the upstream tracker config without constructing GPU models."""
+        native = load_tracker_config(config.tracker.config_path)
         data = native.as_dict()
+        camera_names = [str(name) for name in config.ros.camera_names]
 
-        data.setdefault("runtime", {})["camera_names"] = list(self.camera_names)
+        data.setdefault("runtime", {})["camera_names"] = camera_names
 
         # SAM3's image-model builder currently moves the model to CUDA only for
         # the literal device string "cuda". ScenePredictor commonly uses
         # "cuda:0", which would otherwise leave SAM3 weights on CPU while the
         # processor creates CUDA inputs. Normalize GPU 0 to the dependency's
         # native "cuda" spelling; keep CPU unchanged.
-        requested_device = torch.device(self.config.runtime.device)
+        requested_device = torch.device(config.runtime.device)
         if requested_device.type == "cuda":
             if requested_device.index not in (None, 0):
                 raise ValueError(
                     "MultiViewRGBDTracker/SAM3 currently expects GPU 0 via "
                     "runtime.device='cuda'. Requested "
-                    f"{self.config.runtime.device!r}."
+                    f"{config.runtime.device!r}."
                 )
             data["runtime"]["device"] = "cuda"
         else:
             data["runtime"]["device"] = str(requested_device)
 
-        data["runtime"]["enable_tf32"] = bool(self.config.runtime.allow_tf32)
+        data["runtime"]["enable_tf32"] = bool(config.runtime.allow_tf32)
 
-        if self.config.tracker.disable_internal_visualization:
+        if config.tracker.disable_internal_visualization:
             # The ScenePredictor adapter still has access to the cleaned masks and
             # 2-D bboxes in FrameResult. This only disables tracker-side color/
             # marker bookkeeping and full debug rasters.
             data["runtime"]["enable_visualization"] = False
             data["runtime"]["publish_debug_images"] = False
 
-        checkpoint_root = Path(self.config.tracker.checkpoint_root).expanduser()
+        checkpoint_root = Path(config.tracker.checkpoint_root).expanduser()
         detector = data.setdefault("detector", {})
         if "checkpoint" in detector:
-            detector["checkpoint"] = self._resolve_checkpoint(
+            detector["checkpoint"] = cls._resolve_checkpoint(
                 str(detector["checkpoint"]), checkpoint_root
             )
 
         efficient = data.setdefault("tracker", {}).setdefault("efficient_tam", {})
         if "checkpoint" in efficient:
-            efficient["checkpoint"] = self._resolve_checkpoint(
+            efficient["checkpoint"] = cls._resolve_checkpoint(
                 str(efficient["checkpoint"]), checkpoint_root
             )
 
         return TrackerNativeConfig(data)
+
+    @staticmethod
+    def output_voxel_size_m(tracker_config: TrackerNativeConfig) -> float:
+        """Return the world-voxel resolution actually emitted by the tracker.
+
+        DifFlow uses this only as the base resolution for its adaptive second
+        voxel stage. Keeping the value owned by MultiViewRGBDTracker prevents
+        ScenePredictor and tracking.yaml from drifting out of sync.
+        """
+        try:
+            voxel_size_m = float(
+                tracker_config.shared_voxel_grid.voxel_size_m
+            )
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                "MultiViewRGBDTracker config must define "
+                "shared_voxel_grid.voxel_size_m"
+            ) from exc
+        if voxel_size_m <= 0.0:
+            raise ValueError(
+                "shared_voxel_grid.voxel_size_m must be positive, got "
+                f"{voxel_size_m}"
+            )
+        return voxel_size_m
 
     def _view_inputs(self, frame: MultiCameraFrame) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
         view_inputs: list[dict[str, Any]] = []

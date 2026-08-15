@@ -8,47 +8,38 @@ ros:
   queue_depth: 4
   incomplete_timeout_ms: 50.0
 
-# SAM3 prompts/capacity, EfficientTAM settings, cross-view fusion, voxelization,
-# and cross-frame global_track_id association are owned by this dependency config.
+# SAM3 / EfficientTAM / multiview tracking remain owned by the tracker config.
 tracker:
   config_path: /workspace/configs/tracking.yaml
   checkpoint_root: /workspace/checkpoints
   disable_internal_visualization: true
 
+# DifFlow is an always-on stage. Only ScenePredictor integration settings live
+# here; model/preprocessing/recovery hyperparameters live in difflow.yaml.
 flow:
-  enabled: true
-  repo_path: /workspace/DifFlow3D
-  model_module: model_difflow
-  checkpoint: /workspace/DifFlow3D/pretrain_weights/model_difflow_355_0.0114.pth
-  target_points: 2048
-  pre_fps_factor: 2.0
-  iterations: 4
-  uncertainty: 0.20
-  cuda_graph_warmup: 10
-  enable_tf32: true
-  strict_checkpoint: false
+  # Use the prebuilt ABI-matched copy produced by the Docker image. The source
+  # submodule under /workspace/DifFlow3D is copied here during image build.
+  repo_path: /opt/DifFlow3D
+  config_path: /workspace/configs/difflow.yaml
   max_frame_gap_s: 0.20
 
+# ScenePredictor-specific semantic recovery policy. Numerical Gaussian recovery
+# settings are loaded from difflow.yaml.
 recovery:
-  knn: 3
-  temperature_m: 0.02
-  chunk_size: 8192
   restrict_same_track: true
 
 output:
   publish_tracked_objects: true
-  publish_velocity_cloud: true
+  publish_velocity_cloud: false
   publish_velocity_markers: true
-  publish_tracked_masks: true
+  publish_tracked_masks: false
   publish_annotated_rgb: true
   publish_flow_anchors: true
-  velocity_marker_stride: 32
-  velocity_marker_scale: 0.20
+  velocity_marker_stride: 16
+  velocity_marker_scale: 0.50
   profile_interval_frames: 30
 
 runtime:
-  # Kept explicit for ScenePredictor/DifFlow. tracker_adapter maps cuda:0 -> cuda
-  # before constructing MultiViewRGBDTracker/SAM3.
   device: cuda:0
   enable_cuda_timing: true
   allow_tf32: true

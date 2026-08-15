@@ -3,160 +3,195 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 import sys
-from typing import Any
 
 import torch
 
 from .config import PipelineConfig
-from .data_types import FlowInput, FlowResult
+from .data_types import FlowResult, InstancePair
 
 
 class DifFlowPredictor:
-    """Fast DifFlow3D wrapper with safe streaming encoder reuse.
+    """Always-on adapter for DifFlow3D's production streaming runner.
 
-    CUDA graphs are captured once with dt=1.0. Predicted displacement is divided
-    by the real timestamp interval outside the graph. Encoder reuse is allowed
-    only if the previous source is exactly the target buffered by the last pair:
-    both timestamp and common global-ID signature must match.
+    ScenePredictor passes the tracker's first-downsampled world cloud directly
+    into DifFlow. DifFlow owns adaptive voxel-2 reduction, exact-count selection,
+    frozen spatial scaling, CUDA-Graph inference, and world-space anchor outputs.
+
+    Encoder reuse is valid only when the previous source is exactly the target
+    buffered by the last pair. Both timestamp and common-ID signature are used
+    because a changing instance intersection changes the combined input cloud.
     """
 
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        *,
+        upstream_voxel_size_m: float,
+    ) -> None:
         self.config = config
         self.device = torch.device(config.runtime.device)
-        self.enabled = bool(config.flow.enabled)
+        self.upstream_voxel_size_m = float(upstream_voxel_size_m)
+        if self.upstream_voxel_size_m <= 0.0:
+            raise ValueError("upstream_voxel_size_m must be positive")
         self.runner = None
         self._cached_target_stamp_ns: int | None = None
         self._cached_track_signature: tuple[int, ...] | None = None
 
-        if not self.enabled:
-            return
+        if self.device.type != "cuda":
+            raise ValueError("DifFlow3D deployment inference requires CUDA")
+
+        difflow_device = torch.device(config.difflow.runtime.device)
+        if difflow_device.type != "cuda":
+            raise ValueError("difflow.runtime.device must be CUDA for deployment")
+        if (
+            difflow_device.index is not None
+            and self.device.index is not None
+            and difflow_device.index != self.device.index
+        ):
+            raise ValueError(
+                "ScenePredictor and DifFlow must use the same CUDA device: "
+                f"runtime.device={config.runtime.device!r}, "
+                f"difflow.runtime.device={config.difflow.runtime.device!r}"
+            )
 
         repo_path = Path(config.flow.repo_path).expanduser().resolve()
-        checkpoint_path = Path(config.flow.checkpoint).expanduser().resolve()
+        if not repo_path.is_dir():
+            raise FileNotFoundError(f"DifFlow3D repository not found: {repo_path}")
         if str(repo_path) not in sys.path:
             sys.path.insert(0, str(repo_path))
 
-        module = importlib.import_module(config.flow.model_module)
-        model_class = getattr(module, "PointConvBidirection")
-        self.runner_class = getattr(module, "DifFlow3DStreamingCudaGraphRunner")
-        configure_fast = getattr(module, "configure_fast_inference", None)
-        if configure_fast is not None:
-            configure_fast(config.flow.enable_tf32)
+        model_module = importlib.import_module("difflow3d.model")
+        runtime_module = importlib.import_module("difflow3d.runtime")
 
-        model = model_class(iters=config.flow.iterations)
-        checkpoint: Any = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
+        self.runner_class = getattr(
+            runtime_module,
+            "DifFlow3DStreamingCudaGraphRunner",
         )
-        state_dict = self._strip_module_prefix(self._extract_state_dict(checkpoint))
-        incompatible = model.load_state_dict(
-            state_dict,
-            strict=config.flow.strict_checkpoint,
+        configure_fast = getattr(runtime_module, "configure_fast_inference")
+        load_checkpoint = getattr(runtime_module, "load_checkpoint")
+        model_class = getattr(model_module, "PointConvBidirection")
+
+        difflow = config.difflow
+        configure_fast(difflow.runtime.enable_tf32)
+        iterations = difflow.model.iterations
+        model = model_class(
+            iters=max(iterations.coarse, iterations.middle, iterations.fine),
+            coarse_iters=iterations.coarse,
+            middle_iters=iterations.middle,
+            fine_iters=iterations.fine,
         )
-        self.missing_keys = tuple(incompatible.missing_keys)
-        self.unexpected_keys = tuple(incompatible.unexpected_keys)
+
+        checkpoint = Path(difflow.model.checkpoint).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = repo_path / checkpoint
+        checkpoint = checkpoint.resolve()
+
+        self.checkpoint_report = load_checkpoint(
+            model,
+            checkpoint,
+            strict=difflow.model.strict_checkpoint,
+        )
+        self.missing_keys = tuple(self.checkpoint_report.missing_keys)
+        self.unexpected_keys = tuple(self.checkpoint_report.unexpected_keys)
+
         self.model = model.to(self.device).eval()
-
-    @staticmethod
-    def _extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
-        if not isinstance(checkpoint, dict):
-            raise TypeError("DifFlow3D checkpoint must be a mapping")
-        for key in ("state_dict", "model_state_dict", "model"):
-            nested = checkpoint.get(key)
-            if isinstance(nested, dict) and nested:
-                return nested
-        return checkpoint
-
-    @staticmethod
-    def _strip_module_prefix(
-        state_dict: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        if state_dict and all(key.startswith("module.") for key in state_dict):
-            return {
-                key.removeprefix("module."): value
-                for key, value in state_dict.items()
-            }
-        return state_dict
+        if difflow.model.disable_bn_running_stats:
+            for layer in self.model.modules():
+                if isinstance(layer, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
+                    layer.track_running_stats = False
 
     def _ensure_runner(self) -> None:
         if self.runner is not None:
             return
+
+        difflow = self.config.difflow
+        prep = difflow.preprocessing
         self.runner = self.runner_class(
             self.model,
             batch_size=1,
-            num_points=self.config.flow.target_points,
-            uncertainty=self.config.flow.uncertainty,
-            warmup=self.config.flow.cuda_graph_warmup,
-            enable_tf32=self.config.flow.enable_tf32,
+            num_points=int(prep.fps_points),
+            uncertainty=float(difflow.model.uncertainty),
+            warmup=int(difflow.runtime.cuda_graph_warmup),
+            enable_tf32=bool(difflow.runtime.enable_tf32),
+            # Decode predicts displacement. ScenePredictor divides by the true
+            # timestamp delta outside the graph, avoiding graph recapture when
+            # frame timing jitters around the nominal sensor rate.
             dt_s=1.0,
+            second_base_voxel_size_m=self.upstream_voxel_size_m,
+            second_candidate_ratio=float(prep.second_candidate_ratio),
+            auto_spatial_scale=bool(prep.auto_spatial_scale),
+            target_model_volume=float(prep.target_model_volume),
+            fixed_spatial_scale=float(prep.fixed_spatial_scale),
+            final_selection=str(prep.final_selection),
+            enable_profiling=False,
+            validate_finite=bool(difflow.runtime.validate_finite),
         )
 
     def prepare(self) -> None:
-        """Capture DifFlow CUDA graphs before tracker CUDAGraphs exist.
-
-        EfficientTAM uses TorchInductor/CUDAGraph internally. PyTorch CUDA graph
-        capture and RNG capture bookkeeping are process-wide enough that lazily
-        capturing this runner during live tracking can conflict with the
-        tracker's graph state. ScenePredictor therefore captures DifFlow once,
-        during pipeline construction and before MultiViewRGBDTracker is created.
-        """
-        if not self.enabled:
-            return
-        if self.device.type != "cuda":
-            raise ValueError("DifFlow CUDA-graph inference requires a CUDA device")
+        """Capture DifFlow CUDA graphs before tracker CUDA graphs are created."""
         torch.cuda.synchronize(self.device)
         self._ensure_runner()
         torch.cuda.synchronize(self.device)
 
     def reset(self) -> None:
+        """Reset temporal reuse while keeping frozen voxel/scale calibration."""
         if self.runner is not None:
             self.runner.reset()
         self._cached_target_stamp_ns = None
         self._cached_track_signature = None
 
-    def predict(
-        self,
-        flow_input: FlowInput,
-        previous_stamp_ns: int,
-        current_stamp_ns: int,
-    ) -> FlowResult:
-        if flow_input.dt_s <= 0.0:
-            raise ValueError(f"Flow dt_s must be positive, got {flow_input.dt_s:.9f}s")
-        if not self.enabled:
-            raise RuntimeError("DifFlowPredictor.predict called while flow is disabled")
+    def reset_calibration(self) -> None:
+        """Reset temporal state and one-shot DifFlow preprocessing calibration."""
+        if self.runner is not None:
+            self.runner.reset_preprocess_calibration()
+        self._cached_target_stamp_ns = None
+        self._cached_track_signature = None
+
+    def predict(self, pair: InstancePair) -> FlowResult:
+        if pair.dt_s <= 0.0:
+            raise ValueError(f"Flow dt_s must be positive, got {pair.dt_s:.9f}s")
 
         self._ensure_runner()
-        signature = tuple(int(value) for value in flow_input.common_track_ids)
+        signature = tuple(int(value) for value in pair.common_track_ids)
         source_is_cached = (
-            self._cached_target_stamp_ns == int(previous_stamp_ns)
+            self._cached_target_stamp_ns == int(pair.previous_stamp_ns)
             and self._cached_track_signature == signature
         )
 
         with torch.inference_mode():
             if not source_is_cached:
                 self.runner.reset()
-                self.runner.next_input.copy_(
-                    flow_input.previous_anchors[None],
-                    non_blocking=True,
+                self.runner.stage_world(
+                    pair.previous_points,
+                    point_ids=pair.previous_track_ids,
                 )
                 if self.runner.replay_next() is not None:
                     raise RuntimeError("First streaming frame must only buffer")
 
-            self.runner.next_input.copy_(
-                flow_input.current_anchors[None],
-                non_blocking=True,
+            self.runner.stage_world(
+                pair.current_points,
+                point_ids=pair.current_track_ids,
             )
             if self.runner.replay_next() is None:
                 raise RuntimeError("DifFlow3D did not produce a pair output")
 
-            displacement = self.runner.flow()[0]
+            anchor_flow = self.runner.flow_world()[0]
+            source_anchors = self.runner.source_points_world()[0]
+            target_anchors = self.runner.target_points_world()[0]
+            warped_anchors = self.runner.warped_points_world()[0]
+            source_anchor_ids = self.runner.source_point_ids()
+            target_anchor_ids = self.runner.target_point_ids()
+
             result = FlowResult(
-                source_anchors=self.runner.source_points()[0],
-                warped_anchors=self.runner.warped_points()[0],
-                anchor_velocity=displacement / float(flow_input.dt_s),
+                source_anchors=source_anchors,
+                target_anchors=target_anchors,
+                warped_anchors=warped_anchors,
+                anchor_flow=anchor_flow,
+                anchor_velocity=anchor_flow / float(pair.dt_s),
+                source_anchor_track_ids=source_anchor_ids,
+                target_anchor_track_ids=target_anchor_ids,
             )
 
-        self._cached_target_stamp_ns = int(current_stamp_ns)
+        self._cached_target_stamp_ns = int(pair.current_stamp_ns)
         self._cached_track_signature = signature
         return result

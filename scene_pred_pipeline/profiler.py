@@ -8,7 +8,13 @@ import torch
 
 
 class CycleProfiler:
-    """Mixed CPU/CUDA stage profiler with one CUDA synchronization per cycle."""
+    """Mixed CPU/CUDA stage profiler without a whole-device synchronization.
+
+    CUDA stage events are recorded on ScenePredictor's current stream. At cycle
+    end a fence event on that stream is synchronized, which makes elapsed-event
+    timing valid without waiting for independent streams such as asynchronous
+    SAM3 inference.
+    """
 
     def __init__(
         self,
@@ -63,7 +69,12 @@ class CycleProfiler:
 
     def finish(self) -> dict[str, float]:
         if self.cuda_enabled and self._cuda_events:
-            torch.cuda.synchronize()
+            # Wait only for ScenePredictor's current stream. A device-wide
+            # torch.cuda.synchronize() would unnecessarily block SAM3's
+            # independent asynchronous CUDA stream.
+            fence = torch.cuda.Event()
+            fence.record()
+            fence.synchronize()
 
         timings: dict[str, float] = dict(self._recorded)
         timings.update(self._cpu_values)

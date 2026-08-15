@@ -228,15 +228,22 @@ class RosVisualizer:
 
     def _publish_markers(self, output: SceneVelocityOutput) -> None:
         stride = max(1, int(self.config.output.velocity_marker_stride))
-        points = output.flow_points[::stride].detach().cpu().numpy()
-        velocity = output.flow_velocity[::stride].detach().cpu().numpy()
+        points = output.flow_points[::stride].detach().float().cpu().numpy()
+        velocity = output.flow_velocity[::stride].detach().float().cpu().numpy()
         array = MarkerArray()
+
+        # Clear markers from the previous frame before adding the current set.
         delete = Marker()
+        delete.header.stamp = _stamp_message(self.node, output.stamp_ns)
+        delete.header.frame_id = self.config.ros.world_frame
         delete.action = Marker.DELETEALL
         array.markers.append(delete)
 
         scale = float(self.config.output.velocity_marker_scale)
         for index, (point, vector) in enumerate(zip(points, velocity)):
+            if not (np.isfinite(point).all() and np.isfinite(vector).all()):
+                continue
+
             marker = Marker()
             marker.header.stamp = _stamp_message(self.node, output.stamp_ns)
             marker.header.frame_id = self.config.ros.world_frame
@@ -244,9 +251,20 @@ class RosVisualizer:
             marker.id = index
             marker.type = Marker.ARROW
             marker.action = Marker.ADD
-            marker.scale.x = 0.008
-            marker.scale.y = 0.016
-            marker.scale.z = 0.020
+
+            # Marker.pose defaults to a zero quaternion (0, 0, 0, 0), which is
+            # invalid. Even for point-defined ARROW markers, RViz still applies
+            # the marker pose, so publish an explicit identity transform.
+            marker.pose.orientation.x = 0.0
+            marker.pose.orientation.y = 0.0
+            marker.pose.orientation.z = 0.0
+            marker.pose.orientation.w = 1.0
+
+            # For a point-defined ARROW: x=shaft diameter, y=head diameter,
+            # z=head length. Keep these smaller than the typical ~2 cm arrows.
+            marker.scale.x = 0.003
+            marker.scale.y = 0.006
+            marker.scale.z = 0.008
             marker.color.r = 1.0
             marker.color.g = 0.25
             marker.color.b = 0.05

@@ -34,37 +34,37 @@ class CommonInstanceFilter:
         if not common_ids:
             return None
 
-        previous_points = torch.cat(
-            [previous_by_id[track_id].points_world for track_id in common_ids],
-            dim=0,
-        ).contiguous()
-        current_points = torch.cat(
-            [current_by_id[track_id].points_world for track_id in common_ids],
-            dim=0,
-        ).contiguous()
+        previous_chunks = [
+            previous_by_id[track_id].points_world for track_id in common_ids
+        ]
+        current_chunks = [
+            current_by_id[track_id].points_world for track_id in common_ids
+        ]
+        previous_points = torch.cat(previous_chunks, dim=0).contiguous()
+        current_points = torch.cat(current_chunks, dim=0).contiguous()
 
         device = current_points.device
         previous_ids = torch.cat(
             [
                 torch.full(
-                    (previous_by_id[track_id].points_world.shape[0],),
+                    (points.shape[0],),
                     track_id,
                     device=device,
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
-                for track_id in common_ids
+                for track_id, points in zip(common_ids, previous_chunks)
             ],
             dim=0,
         )
         current_ids = torch.cat(
             [
                 torch.full(
-                    (current_by_id[track_id].points_world.shape[0],),
+                    (points.shape[0],),
                     track_id,
                     device=device,
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                 )
-                for track_id in common_ids
+                for track_id, points in zip(common_ids, current_chunks)
             ],
             dim=0,
         )
