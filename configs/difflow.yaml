@@ -23,7 +23,7 @@ preprocessing:
   second_candidate_ratio: 1.1
   final_selection: uniform
   auto_spatial_scale: true
-  target_model_volume: 2.0
+  target_model_volume: 5.0
   fixed_spatial_scale: 1.0
 
 recovery:

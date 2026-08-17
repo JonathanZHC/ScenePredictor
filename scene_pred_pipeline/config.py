@@ -14,9 +14,11 @@ class RosConfig:
     color_topic: str = "/{camera}/color/image_raw"
     depth_topic: str = "/{camera}/depth/image_raw"
     camera_info_topic: str = "/{camera}/camera_info"
-    pose_topic: str = "/{camera}/pose"
+    camera_frame: str = "{camera}_color_optical_frame"
     queue_depth: int = 4
-    incomplete_timeout_ms: float = 50.0
+    sync_slop_seconds: float = 0.001
+    multiview_sync_slop_seconds: float = 0.02
+    tf_timeout_ms: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -25,7 +27,6 @@ class TrackerConfig:
 
     config_path: str = "/workspace/configs/tracking.yaml"
     checkpoint_root: str = "/workspace/checkpoints"
-    disable_internal_visualization: bool = True
 
 
 @dataclass(frozen=True)
@@ -265,8 +266,22 @@ def load_config(path: str | Path) -> PipelineConfig:
     difflow_config_path = Path(flow.config_path).expanduser().resolve()
     difflow = _load_difflow_config(difflow_config_path)
 
+    ros = _construct(RosConfig, raw.get("ros"))
+    if not ros.camera_names:
+        raise ValueError("ros.camera_names must contain at least one camera")
+    if len(set(ros.camera_names)) != len(ros.camera_names):
+        raise ValueError("ros.camera_names must not contain duplicates")
+    if ros.queue_depth < 1:
+        raise ValueError("ros.queue_depth must be >= 1")
+    if ros.sync_slop_seconds < 0.0:
+        raise ValueError("ros.sync_slop_seconds must be >= 0")
+    if ros.multiview_sync_slop_seconds < 0.0:
+        raise ValueError("ros.multiview_sync_slop_seconds must be >= 0")
+    if ros.tf_timeout_ms < 0.0:
+        raise ValueError("ros.tf_timeout_ms must be >= 0")
+
     return PipelineConfig(
-        ros=_construct(RosConfig, raw.get("ros")),
+        ros=ros,
         tracker=_construct(TrackerConfig, raw.get("tracker")),
         flow=flow,
         recovery=_construct(RecoveryConfig, raw.get("recovery")),

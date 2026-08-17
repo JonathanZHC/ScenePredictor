@@ -150,6 +150,7 @@ ENV LANG=en_US.UTF-8 \
     ROS_DISTRO=jazzy \
     ROS_DOMAIN_ID=117 \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+    FASTDDS_BUILTIN_TRANSPORTS='LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50' \
     ACCEPT_EULA=Y \
     PRIVACY_CONSENT=Y \
     OMNICLIENT_HUB_MODE=disabled \

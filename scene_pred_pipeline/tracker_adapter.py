@@ -98,13 +98,6 @@ class MultiViewTrackerAdapter:
 
         data["runtime"]["enable_tf32"] = bool(config.runtime.allow_tf32)
 
-        if config.tracker.disable_internal_visualization:
-            # The ScenePredictor adapter still has access to the cleaned masks and
-            # 2-D bboxes in FrameResult. This only disables tracker-side color/
-            # marker bookkeeping and full debug rasters.
-            data["runtime"]["enable_visualization"] = False
-            data["runtime"]["publish_debug_images"] = False
-
         checkpoint_root = Path(config.tracker.checkpoint_root).expanduser()
         detector = data.setdefault("detector", {})
         if "checkpoint" in detector:

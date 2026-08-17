@@ -1,18 +1,22 @@
 ros:
   world_frame: world
-  camera_names: [camera_0, camera_1]
-  color_topic: "/{camera}/color/image_raw"
-  depth_topic: "/{camera}/depth/image_raw"
-  camera_info_topic: "/{camera}/camera_info"
-  pose_topic: "/{camera}/pose"
+  camera_names: [camera_0] # [camera_0, camera_1]
+  color_topic: "/{camera}/color/image_raw" # "/{camera}/color/image_raw/compressed"
+  depth_topic: "/{camera}/depth/image_raw" # "/{camera}/depth/image_raw/compressedDepth"
+  camera_info_topic: "/{camera}/color/camera_info" # "/{camera}/camera_info"
+  camera_frame: "{camera}_color_optical_frame"
   queue_depth: 4
-  incomplete_timeout_ms: 50.0
+  # Orbbec RGB/depth stamps differ by ~0.15-0.20 ms in the current D2C stream.
+  # Pair each camera locally using RGB as the canonical view timestamp.
+  sync_slop_seconds: 0.001
+  # Only used when camera_names contains multiple cameras.
+  multiview_sync_slop_seconds: 0.01
+  tf_timeout_ms: 10.0
 
 # SAM3 / EfficientTAM / multiview tracking remain owned by the tracker config.
 tracker:
   config_path: /workspace/configs/tracking.yaml
   checkpoint_root: /workspace/checkpoints
-  disable_internal_visualization: true
 
 # DifFlow is an always-on stage. Only ScenePredictor integration settings live
 # here; model/preprocessing/recovery hyperparameters live in difflow.yaml.

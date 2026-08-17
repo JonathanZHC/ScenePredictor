@@ -1,25 +1,11 @@
 runtime:
-  camera_names: [camera_0, camera_1]
   target_hz: 30.0
   queue_size: 1
   drop_when_busy: true
   serialize_gpu: false
-  device: cuda
   use_bf16: true
-  enable_tf32: true
-  enable_visualization: true
+  enable_visualization: false
   publish_debug_images: false
-  
-ros:
-  world_frame: world
-  color_topic: /{camera}/color/image_raw
-  depth_topic: /{camera}/depth/image_raw
-  camera_info_topic: /{camera}/camera_info
-  output_prefix: /tracking/{camera}
-  sync_slop_seconds: 0.02
-
-  # Local RGB-D tuples are paired across all cameras before EfficientTAM/SAM3.
-  multiview_sync_slop_seconds: 0.02
 
 pointcloud:
   stride: 1
@@ -36,10 +22,11 @@ detector:
   # capacity together so adding/removing an object only changes this list.
   # Total local slots/view = 1+1+1 = 3; inactive capacity stays reserved.
   prompts:
-    - [ball, 1]
+    # - [ball, 1]
     # - [red mug, 1]
-    - [red and white can, 1]
-    - [mustard bottle, 1]
+    # - [red and white can, 1]
+    # - [mustard bottle, 1]
+    - [human, 1]
 
   score_threshold: 0.4
   duplicate_iou_threshold: 0.7
@@ -74,15 +61,7 @@ tracker:
     # Compile optimization defaults to torch.compile(mode="default").
     # Set true only when explicitly benchmarking max-autotune.
     use_max_autotune: true
-
-    # Persistent EfficientTAM image-feature ring used by asynchronous SAM3
-    # corrected-reference inference. With 2 views this is ~4 MiB/frame for the
-    # current EfficientTAM-S model, so 32 frames is ~128 MiB. The raw normalized
-    # image store is also bounded and is automatically kept at least 2 frames
-    # larger than this history.
     feature_history_frames: 32
-
-    # Prewarm normal cached-feature propagation plus the direct-correction path.
     prewarm_enabled: true
     prewarm_temporal_frames: 20
     prewarm_post_reset_frames: 2

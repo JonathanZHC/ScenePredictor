@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${IMAGE:-scenepredictor:latest}"
 CONTAINER="${CONTAINER:-scenepredictor}"
 CACHE_ROOT="${REPO_ROOT}/.container-cache"
+FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-LARGE_DATA?max_msg_size=4MB&sockets_size=8MB&non_blocking=true&tcp_negotiation_timeout=50}"
 
 # Intel iGPU used for RViz/OpenGL. This is the stable PCI address reported by
 # /dev/dri/by-path on this workstation. Override if the hardware changes.
@@ -44,7 +45,6 @@ DOCKER_ARGS=(
   --gpus all
   --network host
   --ipc host
-  --shm-size=16g
   --ulimit memlock=-1
   --ulimit stack=67108864
   -e "DISPLAY=${DISPLAY:-:0}"
@@ -53,6 +53,7 @@ DOCKER_ARGS=(
   -e PRIVACY_CONSENT=Y
   -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-117}"
   -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+  -e "FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS}"
   -e NVIDIA_VISIBLE_DEVICES=all
   -e NVIDIA_DRIVER_CAPABILITIES=all
   -e XDG_RUNTIME_DIR=/tmp/runtime-1234
