@@ -1,6 +1,6 @@
 ros:
   world_frame: world
-  camera_names: [camera_0] # [camera_0, camera_1]
+  camera_names: [camera_0, camera_1]
   color_topic: "/{camera}/color/image_raw" # "/{camera}/color/image_raw/compressed"
   depth_topic: "/{camera}/depth/image_raw" # "/{camera}/depth/image_raw/compressedDepth"
   camera_info_topic: "/{camera}/color/camera_info" # "/{camera}/camera_info"
@@ -40,7 +40,7 @@ output:
   publish_annotated_rgb: true
   publish_flow_anchors: true
   velocity_marker_stride: 16
-  velocity_marker_scale: 0.30
+  velocity_marker_scale: 0.033
   profile_interval_frames: 30
 
 runtime:
