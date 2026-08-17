@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONTAINER="${CONTAINER:-sam-rgbd-tracking}"
+CONTAINER="${CONTAINER:-scenepredictor}"
 SCENE="${1:-dynamic}"
 if [[ $# -gt 0 ]]; then shift; fi
 

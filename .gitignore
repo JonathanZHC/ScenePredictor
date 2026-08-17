@@ -39,3 +39,5 @@ logs/
 
 # Container
 .container-cache
+
+rosbags/

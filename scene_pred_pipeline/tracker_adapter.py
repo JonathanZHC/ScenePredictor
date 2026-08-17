@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
+import time
 
 import numpy as np
 import torch
@@ -32,6 +33,8 @@ class MultiViewTrackerAdapter:
     ) -> None:
         self.config = config
         self.device = torch.device(config.runtime.device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.camera_names = [str(name) for name in config.ros.camera_names]
 
         if tracker_config is None:
@@ -167,55 +170,122 @@ class MultiViewTrackerAdapter:
         return view_inputs, rgbs
 
     def _to_tracked_frame(self, results: list[Any]) -> TrackedInstanceFrame:
+        adapter_started = time.perf_counter()
+        groups_started = time.perf_counter()
         groups = self._run_owner(self.component.get_last_multiview_instances)
-        valid_groups = [
-            group
-            for group in groups
-            if group.global_track_id is not None
-            and group.points_world is not None
-            and int(group.points_world.shape[0]) > 0
-        ]
+        adapter_get_groups_ms = 1000.0 * (time.perf_counter() - groups_started)
+
+        valid_groups = sorted(
+            (
+                group
+                for group in groups
+                if group.global_track_id is not None
+                and group.points_world is not None
+                and len(group.points_world) > 0
+            ),
+            key=lambda group: int(group.global_track_id),
+        )
 
         instances: list[TrackedInstance] = []
+        track_offsets: dict[int, tuple[int, int]] = {}
+        track_ids = tuple(int(group.global_track_id) for group in valid_groups)
+        adapter_prepare_started = time.perf_counter()
+
         if valid_groups:
-            # One H2D transfer per synchronized frame, then cheap tensor views per
-            # instance. The previous TrackedInstanceFrame keeps this storage alive.
-            lengths = [int(group.points_world.shape[0]) for group in valid_groups]
-            packed_cpu = np.ascontiguousarray(
-                np.concatenate(
-                    [np.asarray(group.points_world, dtype=np.float32) for group in valid_groups],
-                    axis=0,
-                ),
-                dtype=np.float32,
-            )
-            packed_gpu = torch.from_numpy(packed_cpu).to(
-                self.device,
-                dtype=torch.float32,
-                non_blocking=False,
-            )
+            lengths = [int(len(group.points_world)) for group in valid_groups]
+
+            # CrossFrameAligner already uploads every fused cloud for Chamfer.
+            # Reuse those exact CUDA-bank views; silently falling back to another
+            # CPU->GPU upload would hide a performance regression.
+            ready_event = valid_groups[0].points_world_gpu_ready_event
+            if ready_event is not None:
+                torch.cuda.current_stream(self.device).wait_event(ready_event)
+
+            clouds_gpu: list[torch.Tensor] = []
             offset = 0
             for group, count in zip(valid_groups, lengths):
+                cloud_gpu = group.points_world_gpu
+                if not isinstance(cloud_gpu, torch.Tensor) or not cloud_gpu.is_cuda:
+                    raise RuntimeError(
+                        "ScenePredictor requires CrossFrame GPU-bank cloud views; "
+                        "the tracker returned a CPU-only fused cloud."
+                    )
+                if cloud_gpu.device != self.device:
+                    raise RuntimeError(
+                        f"Tracker cloud is on {cloud_gpu.device}, expected {self.device}."
+                    )
+                if cloud_gpu.dtype != torch.float32:
+                    raise RuntimeError(
+                        f"Tracker cloud dtype is {cloud_gpu.dtype}, expected float32."
+                    )
+                if int(cloud_gpu.shape[0]) != count:
+                    raise RuntimeError(
+                        "Tracker CPU/GPU fused-cloud sizes disagree: "
+                        f"{count} != {int(cloud_gpu.shape[0])}."
+                    )
+
+                track_id = int(group.global_track_id)
+                end_offset = offset + count
+                track_offsets[track_id] = (offset, end_offset)
+                clouds_gpu.append(cloud_gpu)
+                offset = end_offset
+
+            adapter_prepare_ms = 1000.0 * (
+                time.perf_counter() - adapter_prepare_started
+            )
+            adapter_pack_started = time.perf_counter()
+
+            # The CrossFrame bank is ping-pong workspace and will be overwritten.
+            # One D2D cat creates frame-owned storage without another CPU round trip.
+            packed_gpu = torch.cat(clouds_gpu, dim=0)
+            id_values = torch.tensor(track_ids, dtype=torch.int32, device=self.device)
+            repeats = torch.tensor(lengths, dtype=torch.long, device=self.device)
+            packed_ids_gpu = torch.repeat_interleave(
+                id_values, repeats, output_size=int(sum(lengths))
+            )
+            adapter_pack_submit_ms = 1000.0 * (
+                time.perf_counter() - adapter_pack_started
+            )
+
+            for group in valid_groups:
+                track_id = int(group.global_track_id)
+                begin, end_offset = track_offsets[track_id]
                 instances.append(
                     TrackedInstance(
-                        global_track_id=int(group.global_track_id),
+                        global_track_id=track_id,
                         semantic_label=str(group.semantic_label),
-                        points_world=packed_gpu[offset : offset + count],
+                        points_world=packed_gpu[begin:end_offset],
                     )
                 )
-                offset += count
+        else:
+            adapter_prepare_ms = 1000.0 * (
+                time.perf_counter() - adapter_prepare_started
+            )
+            adapter_pack_submit_ms = 0.0
+            packed_gpu = torch.empty((0, 3), device=self.device, dtype=torch.float32)
+            packed_ids_gpu = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         first = results[0]
+        adapter_total_ms = 1000.0 * (time.perf_counter() - adapter_started)
+        tracker_timings = {str(key): float(value) for key, value in first.timings_ms.items()}
+        tracker_timings.update(
+            {
+                "adapter_get_groups": float(adapter_get_groups_ms),
+                "adapter_prepare": float(adapter_prepare_ms),
+                "adapter_pack_submit": float(adapter_pack_submit_ms),
+                "adapter_total": float(adapter_total_ms),
+            }
+        )
         return TrackedInstanceFrame(
             frame_index=int(first.frame.frame_index),
             stamp_ns=int(first.frame.timestamp_ns),
             instances=instances,
-            view_results={
-                str(result.frame.camera_name): result for result in results
-            },
-            tracker_timings_ms={
-                str(key): float(value)
-                for key, value in first.timings_ms.items()
-            },
+            packed_points_world=packed_gpu,
+            packed_track_ids=packed_ids_gpu,
+            track_ids=track_ids,
+            track_offsets=track_offsets,
+            view_results={str(result.frame.camera_name): result for result in results},
+            tracker_timings_ms=tracker_timings,
             tracker_metadata=dict(first.metadata),
         )
 

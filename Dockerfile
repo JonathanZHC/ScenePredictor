@@ -22,6 +22,7 @@ ARG TRACKING_TORCHVISION_VERSION=0.23.0
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG TORCH_CUDA_ARCH_LIST=12.0
 ARG WARP_VERSION=1.15.0
+ARG PIP_VERSION=25.1.1
 
 ARG SAM3_REPOSITORY=https://github.com/facebookresearch/sam3.git
 ARG SAM3_REF=main
@@ -38,6 +39,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TRACKING_TORCH_VERSION
 ARG TORCH_INDEX_URL
 ARG TORCH_CUDA_ARCH_LIST
+ARG PIP_VERSION
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV LANG=C.UTF-8 \
@@ -56,7 +58,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3.12 -m venv /opt/difflow-build-venv \
-    && /opt/difflow-build-venv/bin/python -m pip install --upgrade pip setuptools wheel \
+    && /opt/difflow-build-venv/bin/python -m pip install --upgrade \
+      "pip==${PIP_VERSION}" "setuptools>=75,<81" "wheel>=0.45,<1" \
     && /opt/difflow-build-venv/bin/python -m pip install \
       torch==${TRACKING_TORCH_VERSION} \
       --index-url ${TORCH_INDEX_URL} \
@@ -130,6 +133,7 @@ ARG TRACKING_TORCH_VERSION
 ARG TRACKING_TORCHVISION_VERSION
 ARG TORCH_INDEX_URL
 ARG WARP_VERSION
+ARG PIP_VERSION
 ARG SAM3_REPOSITORY
 ARG SAM3_REF
 ARG EFFICIENT_TAM_REPOSITORY
@@ -218,10 +222,11 @@ print('created', pth)
 PY
 
 # Shared inference venv for MultiViewRGBDTracker + ScenePredictor + DifFlow3D.
+# Keep this package set aligned with MultiViewRGBDTracker/Dockerfile; SAM3 and
+# EfficientTAM are installed from source below with --no-deps.
 RUN python3.12 -m venv /opt/tracking-venv \
-    && /opt/tracking-venv/bin/python -m pip install --no-cache-dir --upgrade pip \
-    && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
-      "setuptools>=75,<81" "wheel>=0.45,<1" \
+    && /opt/tracking-venv/bin/python -m pip install --no-cache-dir --upgrade \
+      "pip==${PIP_VERSION}" "setuptools>=75,<81" "wheel>=0.45,<1" \
     && /opt/tracking-venv/bin/python -m pip install --no-cache-dir \
       torch==${TRACKING_TORCH_VERSION} \
       torchvision==${TRACKING_TORCHVISION_VERSION} \
@@ -253,9 +258,7 @@ RUN python3.12 -m venv /opt/tracking-venv \
       "decord==0.6.0" \
       "scikit-image>=0.24" \
       "scikit-learn>=1.5" \
-      joblib threadpoolctl cffi pycparser pypng \
-      "ultralytics-opencv-headless>=8.4,<9" \
-      "open_clip_torch>=3.3,<4"
+      "warp-lang==${WARP_VERSION}"
 
 # Upstream SAM3 + EfficientTAM model repositories used by the tracker source dependency.
 RUN mkdir -p /opt/upstream \
@@ -296,6 +299,7 @@ RUN source /opt/ros/jazzy/setup.bash \
 from pathlib import Path
 import rclpy
 import torch
+import warp
 import sam3
 import efficient_track_anything
 import difflow3d
@@ -312,6 +316,9 @@ required = (
 loaded = Path(pointnet2_utils.extension_path()).resolve()
 missing = [name for name in required if not hasattr(pointnet2_utils.pointnet2, name)]
 print('inference torch:', torch.__version__, torch.version.cuda)
+print('warp:', warp.__version__)
+if warp.__version__ != '1.15.0':
+    raise RuntimeError(f'Unexpected Warp version: {warp.__version__}')
 print('SAM3:', sam3.__file__)
 print('EfficientTAM:', efficient_track_anything.__file__)
 print('DifFlow3D:', difflow3d.__file__)

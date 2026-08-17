@@ -36,10 +36,10 @@ output:
   publish_annotated_rgb: true
   publish_flow_anchors: true
   velocity_marker_stride: 16
-  velocity_marker_scale: 0.50
+  velocity_marker_scale: 0.30
   profile_interval_frames: 30
 
 runtime:
-  device: cuda:0
+  device: cuda
   enable_cuda_timing: true
   allow_tf32: true

@@ -1,206 +1,131 @@
 # ScenePredictor
 
-ScenePredictor is a real-time multi-view RGB-D scene prediction stack built around three reusable components:
+ScenePredictor is a real-time multi-view RGB-D scene prediction pipeline built from three reusable repositories:
 
-- [`isaacscene`](https://github.com/JonathanZHC/isaacscene) for Isaac Sim scenes, synchronized RGB-D sensing, TF, and ROS 2 publication;
-- [`MultiViewRGBDTracker`](https://github.com/JonathanZHC/MultiViewRGBDTracker) for SAM3 + EfficientTAM instance tracking, cross-view fusion, and persistent cross-frame identities;
-- [`DifFlow3D`](https://github.com/JonathanZHC/DifFlow3D) for GPU scene-flow inference.
+- [`isaacscene`](https://github.com/JonathanZHC/isaacscene): optional Isaac Sim scenes, RGB-D sensing, TF, and ROS 2 publication;
+- [`MultiViewRGBDTracker`](https://github.com/JonathanZHC/MultiViewRGBDTracker): SAM3 + EfficientTAM tracking, multi-view fusion, and persistent global IDs;
+- [`DifFlow3D`](https://github.com/JonathanZHC/DifFlow3D): CUDA scene-flow inference and dense velocity recovery.
 
-The repository is currently being refactored so that tracking/alignment is delegated completely to `MultiViewRGBDTracker`, while ScenePredictor consumes its fused persistent instances and performs scene-flow estimation and velocity recovery downstream.
+The design is now **frozen**. ScenePredictor invokes the tracker in-process, keeps only persistent instances shared by consecutive frames, runs one combined DifFlow3D inference, and recovers dense same-track velocity.
 
-> **Development status:** the Docker/runtime/dependency layout described below is the intended current setup. The legacy `scene_pred_pipeline` implementation is still being replaced by the new tracker → scene-flow integration.
-
-## Intended pipeline
+## Frozen runtime architecture
 
 ```text
-Isaac Sim / RGB-D cameras
-        │
-        ▼
-isaacscene
-        │
-        │ synchronized RGB-D + camera calibration + TF
-        ▼
-MultiViewRGBDTracker
-        │
-        │ fused MultiViewInstance objects
-        │ persistent global_track_id
-        ▼
-ScenePredictor
-        │
-        ├── keep only instances present in both t-1 and t
-        ├── sample the filtered two-frame point clouds
-        ├── one combined DifFlow3D inference
-        └── same-instance dense velocity recovery
-        │
-        ▼
-ROS 2 / RViz output
+RGB-D cameras / rosbag / Isaac Sim
+                │
+                ▼
+        MultiViewRGBDTracker
+                │
+                ├─ SAM3: sparse asynchronous refresh
+                ├─ EfficientTAM: fixed-batch mask propagation
+                ├─ GPU mask/depth postprocess + deterministic voxelization
+                ├─ CPU cross-view matching/fusion
+                ├─ CPU temporal gating/Hungarian
+                └─ persistent GPU cloud bank + batched Chamfer
+                                │
+                                │ same GPU bank is reused
+                                ▼
+                         ScenePredictor
+                                │
+                common global_track_id(t-1, t)
+                                │
+                                ▼
+                     one DifFlow3D inference
+                                │
+                                ▼
+                 same-track dense velocity recovery
+                                │
+                                ▼
+                          ROS 2 / RViz
 ```
 
-The scene-flow stage always uses only the immediately previous frame (`t-1 → t`). A newly appearing instance is excluded from scene flow until it also exists in the previous frame.
+The scene-flow pair is always the immediately adjacent tracker pair `t-1 -> t`. New objects are excluded until they also exist in the previous frame.
+
+### CPU/GPU split
+
+The final split is intentional:
+
+- **GPU data plane:** mask processing, RGB-D geometry, voxel deduplication, depth prefetch, cross-frame cloud bank, Chamfer, DifFlow3D, dense recovery;
+- **CPU control plane:** cross-view gates/overlap, fusion bookkeeping, temporal centroid gate, Hungarian assignment, persistent IDs.
+
+Full GPU alignment was benchmarked and rejected because small-tensor launch/synchronization overhead was substantially slower than the CPU control path. The only GPU alignment primitive retained is the computationally heavy Chamfer stage.
 
 ## Repository layout
-
-The three external repositories are intentionally kept at the same level:
 
 ```text
 ScenePredictor/
 ├── Dockerfile
-│
-├── DifFlow3D/                  # top-level Git submodule
-├── MultiViewRGBDTracker/       # top-level Git submodule
-├── isaacscene/                 # top-level Git submodule
-│
-├── checkpoints/                # local model weights, ignored by Git
+├── README.md
 ├── configs/
-├── scene_pred_pipeline/        # ScenePredictor implementation
+│   ├── default.yaml
+│   ├── tracking.yaml
+│   └── difflow.yaml
+├── scene_pred_pipeline/
 ├── scripts/
-│   ├── build.sh
-│   ├── launch.sh
-│   ├── download_checkpoints.sh
-│   ├── run_isaac.sh
-│   ├── run_tracking.sh
-│   ├── run_inference.sh
-│   ├── run_rviz.sh
-│   ├── verify.sh
-│   └── stop.sh
-│
-├── tests/
-├── scene_pred_pipeline.rviz
-└── README.md
+├── DifFlow3D/                 # top-level submodule
+├── MultiViewRGBDTracker/      # top-level submodule
+└── isaacscene/                # top-level submodule
 ```
 
-`MultiViewRGBDTracker` itself also references `isaacscene` as a submodule for standalone use. ScenePredictor **does not use or initialize that nested copy**. It uses only the top-level:
-
-```text
-ScenePredictor/isaacscene
-```
+`MultiViewRGBDTracker` may also contain its own `isaacscene` submodule for standalone use. ScenePredictor uses only the top-level `ScenePredictor/isaacscene` checkout.
 
 ## Requirements
 
-Host requirements:
+- Ubuntu/Linux host with NVIDIA GPU;
+- Docker + NVIDIA Container Toolkit;
+- NVIDIA driver compatible with CUDA 12.8+/Blackwell;
+- X11 only when Isaac Sim or RViz GUI is required.
 
-- Linux with an NVIDIA GPU;
-- NVIDIA driver compatible with the selected Isaac Sim / CUDA images;
-- Docker;
-- NVIDIA Container Toolkit;
-- X11 access if Isaac Sim or RViz is run with a GUI.
-
-The default runtime uses:
+The tested RTX 5090 runtime uses:
 
 ```text
-Isaac Sim / sensors:
-    /isaac-sim/python.sh
-
-Tracker + ScenePredictor + DifFlow3D:
-    /opt/tracking-venv/bin/python
+Isaac Sim base          nvcr.io/nvidia/isaac-sim:6.0.1
+Tracking/DifFlow Torch  2.8.0 + cu128
+Warp                    1.15.0
+ROS 2                   Jazzy
+Python                   3.12 tracking venv
 ```
 
-The separation is intentional. Do not globally activate the tracking virtual environment inside Isaac Sim.
-
-DifFlow3D's PointNet++ CUDA extension is built against the same PyTorch/CUDA ABI as the tracking inference environment.
-
-## 0. Preparation on host
-
-Run once on the host:
-
-```bash
-sudo tee /etc/sysctl.d/99-fastdds-large-data.conf >/dev/null <<'EOF2'
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-
-net.ipv4.tcp_rmem=4096 4194304 16777216
-net.ipv4.tcp_wmem=4096 4194304 16777216
-EOF2
-
-sudo sysctl --system
-```
-
-Check:
-
-```bash
-sysctl net.core.rmem_max
-sysctl net.core.wmem_max
-sysctl net.ipv4.tcp_rmem
-sysctl net.ipv4.tcp_wmem
-```
-
-Expected values include:
-
-```text
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 4194304 16777216
-net.ipv4.tcp_wmem = 4096 4194304 16777216
-```
+Warp **1.15.0 is pinned explicitly in both Isaac Python and `/opt/tracking-venv`**. The Warp 1.15 device-index/codegen issues encountered during development were source-code issues and are already fixed in the frozen tracker kernels.
 
 ## 1. Clone
-
-Clone the parent repository first:
 
 ```bash
 git clone https://github.com/JonathanZHC/ScenePredictor.git
 cd ScenePredictor
-```
 
-Initialize **only the three top-level submodules**:
-
-```bash
 git submodule update --init \
   DifFlow3D \
   MultiViewRGBDTracker \
   isaacscene
 ```
 
-Do **not** use:
+Do not use `--recursive` for the parent repository unless you explicitly want the tracker's nested standalone `isaacscene` checkout.
 
-```bash
-git submodule update --init --recursive
-```
-
-because that would also initialize:
-
-```text
-MultiViewRGBDTracker/isaacscene
-```
-
-which ScenePredictor intentionally does not use.
-
-Check the top-level dependencies:
-
-```bash
-git submodule status
-```
-
-The nested tracker copy should remain uninitialized:
-
-```bash
-git -C MultiViewRGBDTracker submodule status
-```
-
-A leading `-` before the nested `isaacscene` commit means that nested submodule is registered but not initialized.
-
-## 2. Build the Docker image
-
-From the repository root:
+## 2. Build from source
 
 ```bash
 ./scripts/build.sh
 ```
 
-The default image is:
+Default image:
 
 ```text
 scenepredictor:latest
 ```
 
-The Dockerfile:
+The Docker build:
 
-- uses Isaac Sim 6.0.1 as the runtime base;
-- keeps Isaac Python isolated from the tracking Python environment;
-- installs SAM3 and EfficientTAM runtime sources;
-- builds the DifFlow3D PointNet++ CUDA extension in a matching PyTorch/CUDA environment;
-- exposes ROS 2 Jazzy to both runtime paths where needed;
-- bind-mounts the ScenePredictor repository at `/workspace` at runtime.
+1. creates an isolated `/opt/tracking-venv`;
+2. installs the pinned tracking Torch and Warp versions;
+3. clones the SAM3 and EfficientTAM runtime sources;
+4. removes any stale local DifFlow3D PointNet++ binary and **rebuilds the CUDA extension from source** against the exact tracking Torch/CUDA ABI;
+5. copies the ABI-matched DifFlow3D runtime into `/opt/DifFlow3D`;
+6. runs build-time import/API checks.
+
+ScenePredictor runtime source remains bind-mounted at `/workspace`; the compiled DifFlow3D runtime is loaded from `/opt/DifFlow3D` so an old `.so` in a source checkout cannot override the ABI-matched build.
+
+> For fully reproducible long-term images, override `SAM3_REF` and `EFFICIENT_TAM_REF` with tested commit hashes instead of their default `main` values.
 
 ## 3. Start the persistent container
 
@@ -208,19 +133,11 @@ The Dockerfile:
 ./scripts/launch.sh
 ```
 
-The default container name is:
-
-```text
-scenepredictor
-```
-
-The container stays alive so Isaac Sim, tracking/inference, and RViz can run as separate processes.
-
-If it is already running, `launch.sh` should simply reuse it.
+The default container name is `scenepredictor`.
 
 ## 4. Download checkpoints
 
-The runtime expects:
+The top-level runtime expects:
 
 ```text
 checkpoints/
@@ -228,289 +145,182 @@ checkpoints/
 └── efficienttam_s_512x512.pt
 ```
 
-Checkpoint files are ignored by Git.
-
-SAM3 is hosted in the gated `facebook/sam3` Hugging Face repository, so the Hugging Face account associated with the token must already have access.
-
-The recommended command is:
+SAM3 is gated. Use:
 
 ```bash
 HF_TOKEN=hf_xxxxxxxxxxxxxxxxx ./scripts/download_checkpoints.sh
 ```
 
-The script:
-
-- skips checkpoints that already exist;
-- downloads `efficienttam_s_512x512.pt`;
-- downloads `sam3.pt` using `HF_TOKEN`;
-- writes both weights into the top-level `checkpoints/` directory.
-
-If the checkpoint directory is not writable from the container, fix only that runtime directory, for example:
-
-```bash
-mkdir -p checkpoints
-chmod a+rwx checkpoints
-```
-
-Do not make the whole repository world-writable.
-
-DifFlow3D's pretrained scene-flow checkpoint is provided by the `DifFlow3D` dependency and does not need to be downloaded by this script.
+DifFlow3D's `model_difflow_355_0.0114.pth` stays inside the DifFlow3D dependency.
 
 ## 5. Verify the environment
-
-After the image is built and the container is running:
 
 ```bash
 ./scripts/verify.sh
 ```
 
-The verification script checks:
+Verification checks:
 
-1. NVIDIA GPU visibility;
-2. ROS 2 Jazzy;
-3. Isaac Python isolation;
-4. SAM3 / EfficientTAM / `MultiViewRGBDTracker` imports;
-5. DifFlow3D and the PointNet++ CUDA extension;
-6. the expected top-level repository layout.
+- NVIDIA GPU visibility;
+- ROS 2 Jazzy;
+- Isaac Python isolation;
+- Warp 1.15.0 in both Isaac and tracking Python;
+- SAM3 / EfficientTAM / MultiViewRGBDTracker imports;
+- DifFlow3D and the ABI-matched PointNet++/recovery CUDA symbols;
+- expected source layout.
 
-It also warns if `MultiViewRGBDTracker/isaacscene` was initialized, because ScenePredictor does not use that nested dependency.
+## 6. Run with real/recorded RGB-D
 
-## 6. Run Isaac Sim
-
-Open terminal 1:
-
-```bash
-./scripts/run_isaac.sh dynamic
-```
-
-Available scene modes:
-
-```bash
-./scripts/run_isaac.sh static
-./scripts/run_isaac.sh dynamic
-./scripts/run_isaac.sh hybrid
-./scripts/run_isaac.sh occlusion
-```
-
-Additional arguments are forwarded to `isaacscene/run_isaacsim.py`, for example:
-
-```bash
-./scripts/run_isaac.sh dynamic --headless
-```
-
-or:
-
-```bash
-./scripts/run_isaac.sh dynamic --pointcloud-hz 0
-```
-
-The default launcher uses:
-
-```text
-resolution:          640 × 480
-RGB-D rate:          30 Hz
-PointCloud2 rate:     5 Hz
-depth corruption:    enabled
-RGB corruption:      disabled
-motion speed scale:  1.0
-```
-
-ScenePredictor uses the top-level:
-
-```text
-/workspace/isaacscene
-```
-
-and not:
-
-```text
-/workspace/MultiViewRGBDTracker/isaacscene
-```
-
-## 8. Run ScenePredictor
-
-Open the inference process with:
+Start ScenePredictor:
 
 ```bash
 ./scripts/run_inference.sh
 ```
 
-By default it uses:
-
-```text
-/workspace/configs/default.yaml
-```
-
-A different config can be selected with:
+Play a bag in another terminal:
 
 ```bash
-CONFIG=/workspace/configs/my_config.yaml ./scripts/run_inference.sh
+./scripts/run_rosbag.sh /workspace/rosbags/<bag_name>
 ```
 
-> **Current implementation note:** the legacy `scene_pred_pipeline` is still being replaced. The intended new implementation will invoke `MultiViewRGBDTracker` directly and then perform instance-filtered DifFlow3D inference and velocity recovery. The runtime interface of `run_inference.sh` is intended to remain stable across that refactor.
-
-## 9. RViz
-
-ScenePredictor visualization:
+Additional `ros2 bag play` arguments are forwarded, for example:
 
 ```bash
-./scripts/run_rviz.sh
+./scripts/run_rosbag.sh /workspace/rosbags/<bag_name> --loop
 ```
 
-or explicitly:
+This is the preferred performance benchmark because a real RGB-D camera does not consume the same NVIDIA GPU for rendering.
 
-```bash
-./scripts/run_rviz.sh predictor
-```
+## 7. Run with Isaac Sim
 
-Tracker visualization:
-
-```bash
-./scripts/run_rviz.sh tracker
-```
-
-Isaac-only visualization:
-
-```bash
-./scripts/run_rviz.sh isaac
-```
-
-If the container user needs permission to save the config:
-
-```bash
-touch rviz/scene_pred_pipeline.rviz
-sudo setfacl -m u:1234:rw rviz/scene_pred_pipeline.rviz
-sudo setfacl -m u:1234:rwx rviz
-```
-
-## 10. Stop the container
-
-```bash
-./scripts/stop.sh
-```
-
-## Typical development workflow
-
-After the first build:
-
-**Terminal 1 — Isaac Sim**
+Terminal 1:
 
 ```bash
 ./scripts/run_isaac.sh dynamic
 ```
 
-**Terminal 2 — tracker-only debugging**
+Other scene modes supported by `isaacscene` can be forwarded in the same way. Isaac Sim shares the GPU with tracking/DifFlow and therefore produces more pessimistic inference timing than a physical camera or rosbag source.
+
+Terminal 2:
+
+```bash
+./scripts/run_inference.sh
+```
+
+## 8. RViz
+
+```bash
+./scripts/run_rviz.sh predictor
+```
+
+Tracker-only and Isaac-only configs remain available:
+
+```bash
+./scripts/run_rviz.sh tracker
+./scripts/run_rviz.sh isaac
+```
+
+Visualization is lazy: masks, overlays, point-cloud messages, and markers are materialized only when required by subscribers, outside the numerical hot path where possible.
+
+## 9. Tracker-only standalone use
+
+`MultiViewRGBDTracker` remains a standalone repository with its own Dockerfile, scripts, config, README, and optional nested `isaacscene` dependency.
+
+Inside ScenePredictor's container you can also run the tracker directly:
 
 ```bash
 ./scripts/run_tracking.sh
 ```
 
-**Terminal 3 — tracker RViz**
+For an independent checkout, follow `MultiViewRGBDTracker/README.md` and use its own:
 
 ```bash
-./scripts/run_rviz.sh tracker
+./scripts/build.sh
+./scripts/launch.sh
+./scripts/run_tracking.sh
 ```
 
-For the integrated ScenePredictor path, terminal 2 will instead be:
+The frozen tracker path keeps:
+
+- GPU mask resize/threshold/erosion;
+- asynchronous depth prefetch;
+- fused Warp RGB-D/world/voxel geometry;
+- deterministic per-voxel representative selection;
+- compact D2H for CPU alignment;
+- lazy CPU mask materialization;
+- CPU cross-view alignment;
+- persistent-bank GPU Chamfer.
+
+## 10. DifFlow3D standalone use
+
+`DifFlow3D` remains independently buildable and testable. Its source tree contains no required prebuilt PointNet++ `.so`; after a fresh checkout build the extension with:
 
 ```bash
-./scripts/run_inference.sh
+cd DifFlow3D
+bash scripts/build_pointnet2_ops.sh
 ```
 
-with:
+or build the standalone image using `DifFlow3D/Dockerfile`.
+
+See `DifFlow3D/README.md` for runtime tests and benchmarks.
+
+## 11. Configuration ownership
+
+`configs/default.yaml` contains only ScenePredictor integration settings.
+
+`configs/tracking.yaml` owns tracker behavior, including prompts, EfficientTAM execution, postprocessing, voxel matching, alignment, and tracker profiling.
+
+The production postprocess optimization bundle is intentionally frozen. `postprocess.gpu_geometry: true` enables the validated CUDA path; the former independent A/B switches for direct geometry, compact D2H, depth prefetch, and lazy masks were removed.
+
+`configs/difflow.yaml` owns all DifFlow numerical settings. The current deployment uses 2048 sampled anchors with the configured coarse/middle/fine iterations and local track-aware CUDA recovery.
+
+## 12. Current performance reference
+
+On an RTX 5090, using rosbag RGB-D input without Isaac Sim rendering contention, one representative run produced:
+
+```text
+tracker_total   median 13.144 ms   p95 21.437 ms
+DifFlow3D       median  9.981 ms   p95 20.696 ms
+adapter_total   median  0.442 ms   p95  1.136 ms
+cycle_total     median 23.363 ms   p95 56.517 ms
+```
+
+The typical-frame latency is comfortably below the 33.33 ms budget for 30 Hz. Tail latency remains workload/GPU-scheduling dependent, so compare changes using the same rosbag and profiling window.
+
+## 13. Design invariants
+
+These are intentional and should not be changed casually during cleanup:
+
+1. EfficientTAM state has one owner thread; SAM3 refresh is asynchronous.
+2. Scene flow uses only `t-1 -> t`.
+3. DifFlow inference is one combined call over all common persistent instances.
+4. CPU alignment consumes compact voxel data; do not reintroduce full raw-cloud D2H.
+5. Cross-frame Chamfer uploads each fused cloud once and retains the previous bank on GPU.
+6. ScenePredictor reuses the already-uploaded CrossFrame bank and never silently performs a second fused-cloud CPU->GPU copy.
+7. RViz/debug output must not move expensive materialization back into the numerical critical path.
+8. Runtime cleanup must not add per-frame allocations/synchronizations to the hot path without benchmark evidence.
+
+## 14. Stop
 
 ```bash
-./scripts/run_rviz.sh predictor
+./scripts/stop.sh
 ```
 
-for visualization.
+## Development hygiene
 
-## Updating the dependencies
+Do not commit generated runtime/build data such as:
 
-The parent repository pins exact commits for reproducibility.
-
-To update one dependency, enter it, update to the desired commit, and then commit the changed gitlink in ScenePredictor. For example:
-
-```bash
-cd MultiViewRGBDTracker
-git pull origin main
-cd ..
-
-git add MultiViewRGBDTracker
-git commit -m "Update MultiViewRGBDTracker dependency"
-```
-
-The same pattern applies to `isaacscene` and `DifFlow3D`.
-
-Do not recursively initialize nested submodules unless a specific dependency explicitly requires them.
-
-## Git hygiene
-
-Runtime-generated data should not be committed.
-
-The repository `.gitignore` should exclude at least:
-
-```gitignore
+```text
 checkpoints/
-*.pt
-*.pth
-*.ckpt
-*.engine
-
+.container-cache/
 .home/
 .cache/
-.container-cache/
-
 logs/
 profiles/
-
 __pycache__/
-*.py[cod]
-.pytest_cache/
+*.pyc
+*.so
+*.engine
 ```
 
-In particular, Isaac Sim / NVIDIA runtime caches such as `.cache/`, `.container-cache/`, and `.home/` should never be added to Git.
-
-## ROS / DDS
-
-The Docker runtime uses ROS 2 Jazzy with:
-
-```text
-ROS_DOMAIN_ID=117
-RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-```
-
-The launch scripts also configure Fast DDS large-data transport for RGB-D / point-cloud traffic.
-
-If large ROS messages are dropped, host socket buffer limits may need to be increased depending on the machine and network configuration.
-
-## Planned ScenePredictor integration
-
-The implementation refactor will make the interface between tracking and scene flow explicit:
-
-```text
-MultiViewRGBDTracker output at t-1
-MultiViewRGBDTracker output at t
-        │
-        ▼
-intersection of persistent global_track_id values
-        │
-        ▼
-filter both frames to the same instance set
-        │
-        ▼
-point sampling / FPS
-        │
-        ▼
-one combined DifFlow3D inference
-        │
-        ▼
-same-global-ID velocity recovery
-        │
-        ▼
-ROS / RViz output
-```
-
-If an object first appears at frame `t`, it is excluded from scene flow at `t`. If it remains visible at `t+1`, it can participate in the `t → t+1` scene-flow estimate.
-
-The previous-frame state is updated every frame even if no common instance exists, so scene flow never unintentionally spans more than one frame.
+The PointNet++ `.so` is a build artifact and should be regenerated for the active Torch/CUDA ABI.

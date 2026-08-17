@@ -33,7 +33,7 @@ mkdir -p \
   "${REPO_ROOT}/logs"
 
 # The Isaac image runs as UID/GID 1234. The repo stays owned by the host user;
-# only cache/output directories are made world-writable for the test branch.
+# only cache/output directories are made writable for the container user.
 chmod -R a+rwX "${CACHE_ROOT}" "${REPO_ROOT}/logs" 2>/dev/null || true
 
 xhost +local:docker >/dev/null 2>&1 || true

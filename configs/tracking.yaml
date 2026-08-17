@@ -95,6 +95,13 @@ postprocess:
   min_valid_depth_m: 0.10
   max_valid_depth_m: 6.0
 
+  # Frozen CUDA geometry path. Set false only for standalone CPU/debug fallback.
+  gpu_geometry: true
+
+  # Eroded masks and prefetched depth feed the fused Warp
+  # geometry backend directly. Compact voxel D2H and lazy CPU masks are
+  # part of the frozen production implementation.
+
   # Choose a larger point-sampling stride for unusually large masks *before*
   # geometry coordinate extraction. The 2-D cleaned mask itself is unchanged.
   adaptive_geometry_sampling: true
@@ -120,16 +127,10 @@ shared_voxel_grid:
 cross_frame_alignment:
   centroid_gate_m: 0.20
   chamfer_max_workspace_mb: 512
-
-  # Pair capacity is derived automatically from detector.prompts as
-  # sum(class_capacity^2), because cross-frame Chamfer only compares same-class
-  # instances. Point capacity remains a startup hint and may grow if needed.
   chamfer_preallocate_points: 8192
-  # Optional safety threshold; leave unset until measured on your scene.
-  # max_chamfer_m: 0.08
 
 profiling:
-  enabled: false
+  enabled: true
   # Execute these first live bundles normally, but exclude them from all timing
   # statistics/CSV so CUDA, BLAS, Chamfer workspace and allocator lazy-init do
   # not contaminate mean/median/p95/max. Set 0 to disable.
@@ -137,6 +138,8 @@ profiling:
   summary_interval_frames: 100
   cuda_events: true
   csv_path: logs/timing.csv
+  # Buffer profiler CSV rows to avoid per-frame filesystem open/write/close.
+  csv_flush_interval_frames: 100
   rate_diagnostics: true
   camera_diagnostics: true
   rate_summary_interval_seconds: 5.0

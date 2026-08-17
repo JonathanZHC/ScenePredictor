@@ -11,6 +11,8 @@ from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header
 from visualization_msgs.msg import Marker, MarkerArray
 
+from sam_rgbd_tracking.visualization import instance_mask_cpu, make_overlay
+
 from .config import PipelineConfig
 from .data_types import SceneVelocityOutput
 
@@ -168,7 +170,12 @@ def _rgb8_image(node: Node, image: np.ndarray, stamp_ns: int, frame_id: str) -> 
 
 
 class RosVisualizer:
-    """Publish tracker identities, dense scene velocity and flow diagnostics."""
+    """Publish diagnostics only when they have an active ROS subscriber.
+
+    This keeps all expensive visualization work -- D2H copies, overlay drawing,
+    mask merging, PointCloud2 serialization and Marker construction -- outside
+    the numerical critical path when RViz/other consumers are disconnected.
+    """
 
     def __init__(self, node: Node, config: PipelineConfig) -> None:
         self.node = node
@@ -178,44 +185,67 @@ class RosVisualizer:
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
-        self.tracked_pub = node.create_publisher(
-            PointCloud2, "/scene_predictor/tracked_points", qos
+        output = config.output
+        self.tracked_pub = (
+            node.create_publisher(PointCloud2, "/scene_predictor/tracked_points", qos)
+            if output.publish_tracked_objects else None
         )
-        self.velocity_pub = node.create_publisher(
-            PointCloud2, "/scene_predictor/scene_velocity", qos
+        self.velocity_pub = (
+            node.create_publisher(PointCloud2, "/scene_predictor/scene_velocity", qos)
+            if output.publish_velocity_cloud else None
         )
-        self.source_anchor_pub = node.create_publisher(
-            PointCloud2, "/scene_predictor/flow/source_anchors", qos
+        self.source_anchor_pub = (
+            node.create_publisher(PointCloud2, "/scene_predictor/flow/source_anchors", qos)
+            if output.publish_flow_anchors else None
         )
-        self.warped_anchor_pub = node.create_publisher(
-            PointCloud2, "/scene_predictor/flow/warped_anchors", qos
+        self.warped_anchor_pub = (
+            node.create_publisher(PointCloud2, "/scene_predictor/flow/warped_anchors", qos)
+            if output.publish_flow_anchors else None
         )
-        self.marker_pub = node.create_publisher(
-            MarkerArray, "/scene_predictor/velocity_markers", qos
+        self.marker_pub = (
+            node.create_publisher(MarkerArray, "/scene_predictor/velocity_markers", qos)
+            if output.publish_velocity_markers else None
         )
-        self.annotated_rgb_pubs = {
-            camera: node.create_publisher(
-                Image,
-                f"/scene_predictor/{camera}/rgb_annotated",
-                qos,
-            )
-            for camera in config.ros.camera_names
-        }
-        self.mask_pubs = {
-            camera: node.create_publisher(
-                Image,
-                f"/scene_predictor/{camera}/tracked_mask",
-                qos,
-            )
-            for camera in config.ros.camera_names
-        }
+        self.annotated_rgb_pubs = (
+            {
+                camera: node.create_publisher(
+                    Image,
+                    f"/scene_predictor/{camera}/rgb_annotated",
+                    qos,
+                )
+                for camera in config.ros.camera_names
+            }
+            if output.publish_annotated_rgb else {}
+        )
+        self.mask_pubs = (
+            {
+                camera: node.create_publisher(
+                    Image,
+                    f"/scene_predictor/{camera}/tracked_mask",
+                    qos,
+                )
+                for camera in config.ros.camera_names
+            }
+            if output.publish_tracked_masks else {}
+        )
+
+    @staticmethod
+    def _subscribed(publisher) -> bool:
+        return publisher is not None and int(publisher.get_subscription_count()) > 0
 
     def _publish_masks(self, output: SceneVelocityOutput) -> None:
-        for camera, mask in output.tracked_masks.items():
+        for camera, result in output.view_results.items():
             publisher = self.mask_pubs.get(camera)
-            if publisher is None:
+            if not self._subscribed(publisher):
                 continue
-            array = np.ascontiguousarray(mask, dtype=np.uint8) * np.uint8(255)
+            shape = result.frame.depth_m.shape
+            combined = np.zeros(shape, dtype=bool)
+            for instance in result.instances:
+                # Lazy-mask mode keeps the normal-frame mask on CUDA. This
+                # D2H happens only after the ROS subscription check above, so
+                # it cannot re-enter the numerical ScenePredictor hot path.
+                combined |= instance_mask_cpu(instance, shape)
+            array = np.ascontiguousarray(combined, dtype=np.uint8) * np.uint8(255)
             message = Image()
             message.header.stamp = _stamp_message(self.node, output.stamp_ns)
             message.header.frame_id = camera
@@ -225,6 +255,15 @@ class RosVisualizer:
             message.step = message.width
             message.data = array.tobytes()
             publisher.publish(message)
+
+    def _publish_annotated_rgb(self, output: SceneVelocityOutput) -> None:
+        for camera, result in output.view_results.items():
+            publisher = self.annotated_rgb_pubs.get(camera)
+            if not self._subscribed(publisher):
+                continue
+            # make_overlay is intentionally executed only after subscription check.
+            image = make_overlay(result)
+            publisher.publish(_rgb8_image(self.node, image, output.stamp_ns, camera))
 
     def _publish_markers(self, output: SceneVelocityOutput) -> None:
         stride = max(1, int(self.config.output.velocity_marker_stride))
@@ -251,17 +290,10 @@ class RosVisualizer:
             marker.id = index
             marker.type = Marker.ARROW
             marker.action = Marker.ADD
-
-            # Marker.pose defaults to a zero quaternion (0, 0, 0, 0), which is
-            # invalid. Even for point-defined ARROW markers, RViz still applies
-            # the marker pose, so publish an explicit identity transform.
             marker.pose.orientation.x = 0.0
             marker.pose.orientation.y = 0.0
             marker.pose.orientation.z = 0.0
             marker.pose.orientation.w = 1.0
-
-            # For a point-defined ARROW: x=shaft diameter, y=head diameter,
-            # z=head length. Keep these smaller than the typical ~2 cm arrows.
             marker.scale.x = 0.003
             marker.scale.y = 0.006
             marker.scale.z = 0.008
@@ -282,13 +314,17 @@ class RosVisualizer:
 
     def publish(self, output: SceneVelocityOutput) -> None:
         frame = self.config.ros.world_frame
-        if self.config.output.publish_tracked_objects:
+
+        if self._subscribed(self.tracked_pub):
             self.tracked_pub.publish(_tracked_cloud(self.node, output, frame))
-        if self.config.output.publish_velocity_cloud:
+
+        if self._subscribed(self.velocity_pub):
             self.velocity_pub.publish(_velocity_cloud(self.node, output, frame))
-        if self.config.output.publish_velocity_markers:
+
+        if self._subscribed(self.marker_pub):
             self._publish_markers(output)
-        if self.config.output.publish_flow_anchors:
+
+        if self._subscribed(self.source_anchor_pub):
             self.source_anchor_pub.publish(
                 _xyzrgb_cloud(
                     self.node,
@@ -298,6 +334,7 @@ class RosVisualizer:
                     (80, 150, 240),
                 )
             )
+        if self._subscribed(self.warped_anchor_pub):
             self.warped_anchor_pub.publish(
                 _xyzrgb_cloud(
                     self.node,
@@ -307,12 +344,8 @@ class RosVisualizer:
                     (235, 190, 70),
                 )
             )
-        if self.config.output.publish_annotated_rgb:
-            for camera, image in output.annotated_rgb.items():
-                publisher = self.annotated_rgb_pubs.get(camera)
-                if publisher is not None:
-                    publisher.publish(
-                        _rgb8_image(self.node, image, output.stamp_ns, camera)
-                    )
-        if self.config.output.publish_tracked_masks:
+
+        if self.annotated_rgb_pubs:
+            self._publish_annotated_rgb(output)
+        if self.mask_pubs:
             self._publish_masks(output)

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
-
-from sam_rgbd_tracking.visualization import make_overlay
 
 from .config import PipelineConfig
 from .data_types import (
@@ -19,7 +16,12 @@ from .velocity_recovery import VelocityRecovery
 
 
 class ScenePredictionPipeline:
-    """MultiViewRGBDTracker -> common-ID DifFlow3D -> dense velocity recovery."""
+    """MultiViewRGBDTracker -> common-ID DifFlow3D -> dense velocity recovery.
+
+    The numerical pipeline intentionally does not build ROS visualization data.
+    Raw tracker result references are carried to RosVisualizer, which lazily
+    materializes overlays/masks/clouds only when a subscriber is connected.
+    """
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -66,51 +68,9 @@ class ScenePredictionPipeline:
         self,
         tracked: TrackedInstanceFrame,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not tracked.instances:
-            return self._empty_points(), self._empty_ids()
-        points = torch.cat(
-            [item.points_world for item in tracked.instances], dim=0
-        ).contiguous()
-        ids = torch.cat(
-            [
-                torch.full(
-                    (item.points_world.shape[0],),
-                    int(item.global_track_id),
-                    device=points.device,
-                    dtype=torch.int32,
-                )
-                for item in tracked.instances
-            ],
-            dim=0,
-        )
-        return points, ids
-
-    def _visualization_payload(
-        self,
-        frame: MultiCameraFrame,
-        tracked: TrackedInstanceFrame | None,
-    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-        annotated: dict[str, np.ndarray] = {}
-        masks: dict[str, np.ndarray] = {}
-
-        if tracked is None:
-            if self.config.output.publish_annotated_rgb:
-                annotated = {
-                    name: np.ascontiguousarray(camera.rgb, dtype=np.uint8)
-                    for name, camera in frame.cameras.items()
-                }
-            return masks, annotated
-
-        for camera_name, result in tracked.view_results.items():
-            if self.config.output.publish_annotated_rgb:
-                annotated[camera_name] = make_overlay(result)
-            if self.config.output.publish_tracked_masks:
-                shape = result.frame.depth_m.shape
-                combined = np.zeros(shape, dtype=bool)
-                for instance in result.instances:
-                    combined |= np.asarray(instance.mask, dtype=bool)
-                masks[camera_name] = combined
-        return masks, annotated
+        # These are already one contiguous CUDA allocation per frame.  Do not
+        # rebuild them from per-instance views with torch.cat()/torch.full().
+        return tracked.packed_points_world, tracked.packed_track_ids
 
     def _empty_output(
         self,
@@ -119,9 +79,10 @@ class ScenePredictionPipeline:
     ) -> SceneVelocityOutput:
         tracked_points = self._empty_points()
         tracked_ids = self._empty_ids()
+        view_results = {}
         if tracked is not None:
             tracked_points, tracked_ids = self._all_tracked_points(tracked)
-        masks, annotated = self._visualization_payload(frame, tracked)
+            view_results = tracked.view_results
         timings = self.profiler.finish()
         return SceneVelocityOutput(
             stamp_ns=int(frame.stamp_ns if tracked is None else tracked.stamp_ns),
@@ -132,8 +93,7 @@ class ScenePredictionPipeline:
             flow_track_ids=self._empty_ids(),
             source_anchors=self._empty_points(),
             warped_anchors=self._empty_points(),
-            tracked_masks=masks,
-            annotated_rgb=annotated,
+            view_results=view_results,
             common_track_ids=(),
             flow_valid=False,
             timings_ms=timings,
@@ -158,7 +118,8 @@ class ScenePredictionPipeline:
 
         previous = self.previous_tracked
         # Always advance to the immediately current tracker frame, even when the
-        # pair is empty, stale, or skipped.
+        # pair is empty, stale, or skipped.  This also keeps the packed source
+        # CUDA storage alive for the next zero-copy common-instance selection.
         self.previous_tracked = current
 
         with self.profiler.stage("instance_filter", cuda=True):
@@ -194,9 +155,9 @@ class ScenePredictionPipeline:
                 warped_anchors = flow_result.warped_anchors
                 flow_valid = True
 
-        with self.profiler.stage("visualization_build", cuda=False):
-            masks, annotated = self._visualization_payload(frame, current)
-
+        # Visualization is deliberately absent from the numerical critical path.
+        # RosVisualizer checks subscription counts before any D2H conversion,
+        # overlay construction, mask merge, PointCloud2 packing, or marker build.
         timings = self.profiler.finish()
         return SceneVelocityOutput(
             stamp_ns=int(current.stamp_ns),
@@ -207,8 +168,7 @@ class ScenePredictionPipeline:
             flow_track_ids=flow_track_ids,
             source_anchors=source_anchors,
             warped_anchors=warped_anchors,
-            tracked_masks=masks,
-            annotated_rgb=annotated,
+            view_results=current.view_results,
             common_track_ids=common_ids,
             flow_valid=flow_valid,
             timings_ms=timings,

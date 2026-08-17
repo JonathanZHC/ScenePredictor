@@ -86,6 +86,11 @@ class MultiCameraRosInput:
             lambda: defaultdict(dict)
         )
         self.first_seen: dict[int, float] = {}
+        # Message bundles can become complete out of timestamp order (for
+        # example during rosbag playback).  ScenePredictor is latest-only, so a
+        # completed bundle older than one already emitted is stale and should
+        # never enter the stateful tracker.
+        self.last_emitted_stamp_ns: int | None = None
         self.subscriptions = []
 
         qos = QoSProfile(
@@ -156,6 +161,19 @@ class MultiCameraRosInput:
 
         del self.pending[stamp]
         self.first_seen.pop(stamp, None)
+
+        # Completion order is not guaranteed to match timestamp order: a newer
+        # bundle can receive its last required message before an older bundle.
+        # Dropping the late bundle is consistent with the node's latest-only
+        # queue and prevents stateful tracking / scene flow from moving backward
+        # in time.
+        if (
+            self.last_emitted_stamp_ns is not None
+            and stamp <= self.last_emitted_stamp_ns
+        ):
+            return None
+
+        self.last_emitted_stamp_ns = stamp
         return MultiCameraFrame(stamp_ns=stamp, cameras=frames)
 
     def _drop_expired(self) -> None:

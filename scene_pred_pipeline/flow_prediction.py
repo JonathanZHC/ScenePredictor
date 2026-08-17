@@ -177,19 +177,14 @@ class DifFlowPredictor:
 
             anchor_flow = self.runner.flow_world()[0]
             source_anchors = self.runner.source_points_world()[0]
-            target_anchors = self.runner.target_points_world()[0]
             warped_anchors = self.runner.warped_points_world()[0]
             source_anchor_ids = self.runner.source_point_ids()
-            target_anchor_ids = self.runner.target_point_ids()
 
             result = FlowResult(
                 source_anchors=source_anchors,
-                target_anchors=target_anchors,
                 warped_anchors=warped_anchors,
                 anchor_flow=anchor_flow,
-                anchor_velocity=anchor_flow / float(pair.dt_s),
                 source_anchor_track_ids=source_anchor_ids,
-                target_anchor_track_ids=target_anchor_ids,
             )
 
         self._cached_target_stamp_ns = int(pair.current_stamp_ns)
