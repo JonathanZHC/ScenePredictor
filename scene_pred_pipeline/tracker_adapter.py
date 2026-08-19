@@ -100,6 +100,19 @@ class MultiViewTrackerAdapter:
 
         checkpoint_root = Path(config.tracker.checkpoint_root).expanduser()
         detector = data.setdefault("detector", {})
+        tracked_prompts = [
+            [str(label), int(capacity)]
+            for label, capacity in config.tracker.tracked_prompts
+        ]
+        excluded_prompts = [
+            [str(label), int(capacity)]
+            for label, capacity in config.tracker.excluded_prompts
+        ]
+        detector["prompts"] = tracked_prompts + excluded_prompts
+        # The native tracker still allocates/propagates all slots, but only these
+        # labels are allowed to take the lightweight exclusion-only postprocess path.
+        detector["tracked_labels"] = [item[0] for item in tracked_prompts]
+        detector["excluded_labels"] = [item[0] for item in excluded_prompts]
         if "checkpoint" in detector:
             detector["checkpoint"] = cls._resolve_checkpoint(
                 str(detector["checkpoint"]), checkpoint_root

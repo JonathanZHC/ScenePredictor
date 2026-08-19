@@ -1,6 +1,6 @@
 ros:
   world_frame: world
-  camera_names: [camera_0, camera_1]
+  camera_names: [camera_0] # [camera_0, camera_1]
   color_topic: "/{camera}/color/image_raw" # "/{camera}/color/image_raw/compressed"
   depth_topic: "/{camera}/depth/image_raw" # "/{camera}/depth/image_raw/compressedDepth"
   camera_info_topic: "/{camera}/color/camera_info" # "/{camera}/camera_info"
@@ -13,10 +13,24 @@ ros:
   multiview_sync_slop_seconds: 0.01
   tf_timeout_ms: 10.0
 
-# SAM3 / EfficientTAM / multiview tracking remain owned by the tracker config.
 tracker:
   config_path: /workspace/configs/tracking.yaml
   checkpoint_root: /workspace/checkpoints
+
+  # [semantic class, fixed EfficientTAM capacity]. ScenePredictor owns prompt
+  # semantics; tracking.yaml owns only tracker/model/postprocess behavior.
+  tracked_prompts:
+    - [human, 1]
+    # - [ball, 1]
+    # - [red mug, 1]
+    # - [mustard bottle, 1]
+
+  # These classes still participate in SAM3 refresh + EfficientTAM propagation,
+  # but stop after 2-D morphology. They never enter RGB-D geometry/alignment or
+  # DifFlow and are removed from the rest-scene point cloud.
+  excluded_prompts:
+    # - [human, 1]
+    # - [can, 1]
 
 # DifFlow is an always-on stage. Only ScenePredictor integration settings live
 # here; model/preprocessing/recovery hyperparameters live in difflow.yaml.
@@ -34,13 +48,16 @@ recovery:
 
 output:
   publish_tracked_objects: true
+  publish_rest_scene: true
   publish_velocity_cloud: false
   publish_velocity_markers: true
   publish_tracked_masks: false
   publish_annotated_rgb: true
   publish_flow_anchors: true
+  # Max update rate for all RViz/diagnostic topics. 0 disables throttling.
+  visualization_publish_hz: 0
   velocity_marker_stride: 16
-  velocity_marker_scale: 0.033
+  velocity_marker_scale: 0.06
   profile_interval_frames: 30
 
 runtime:

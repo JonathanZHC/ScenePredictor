@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import struct
+import time
+from typing import Any
 
+import cv2
 import numpy as np
 import torch
 from geometry_msgs.msg import Point
@@ -15,6 +18,9 @@ from sam_rgbd_tracking.visualization import instance_mask_cpu, make_overlay
 
 from .config import PipelineConfig
 from .data_types import SceneVelocityOutput
+
+
+_EXCLUDED_OVERLAY_COLOR = np.asarray([255, 70, 220], dtype=np.uint8)
 
 
 _PALETTE = np.asarray(
@@ -66,6 +72,36 @@ def _xyzrgb_cloud(
     message.point_step = 16
     message.row_step = 16 * cloud.shape[0]
     message.data = cloud.tobytes()
+    message.is_dense = True
+    return message
+
+
+def _xyz_cloud(
+    node: Node,
+    points: torch.Tensor,
+    stamp_ns: int,
+    frame_id: str,
+) -> PointCloud2:
+    """Pack an XYZ-only cloud; RViz supplies the fixed display color.
+
+    Rest-scene visualization intentionally omits a per-point RGB field.  This
+    reduces PointCloud2 payload from 16 to 12 bytes/point while preserving the
+    requested all-white appearance through RViz's FlatColor transformer.
+    """
+    cpu = np.ascontiguousarray(points.detach().float().cpu().numpy(), dtype=np.float32)
+    message = PointCloud2()
+    message.header = Header(stamp=_stamp_message(node, stamp_ns), frame_id=frame_id)
+    message.height = 1
+    message.width = cpu.shape[0]
+    message.fields = [
+        PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+    message.is_bigendian = False
+    message.point_step = 12
+    message.row_step = 12 * cpu.shape[0]
+    message.data = cpu.tobytes()
     message.is_dense = True
     return message
 
@@ -177,7 +213,13 @@ class RosVisualizer:
     the numerical critical path when RViz/other consumers are disconnected.
     """
 
-    def __init__(self, node: Node, config: PipelineConfig) -> None:
+    def __init__(
+        self,
+        node: Node,
+        config: PipelineConfig,
+        *,
+        tracker_config: Any | None = None,
+    ) -> None:
         self.node = node
         self.config = config
         qos = QoSProfile(
@@ -186,9 +228,25 @@ class RosVisualizer:
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
         output = config.output
+
+        # One cheap global gate controls every visualization topic so all enabled
+        # RViz displays stay on the same SceneVelocityOutput/frame. The gate runs
+        # before subscription checks and before any D2H/serialization/geometry.
+        publish_hz = float(output.visualization_publish_hz)
+        self._visualization_period_ns = (
+            max(1, int(round(1_000_000_000.0 / publish_hz)))
+            if publish_hz > 0.0
+            else 0
+        )
+        self._next_visualization_ns = 0
+
         self.tracked_pub = (
             node.create_publisher(PointCloud2, "/scene_predictor/tracked_points", qos)
             if output.publish_tracked_objects else None
+        )
+        self.rest_scene_pub = (
+            node.create_publisher(PointCloud2, "/scene_predictor/rest_points", qos)
+            if output.publish_rest_scene else None
         )
         self.velocity_pub = (
             node.create_publisher(PointCloud2, "/scene_predictor/scene_velocity", qos)
@@ -229,9 +287,254 @@ class RosVisualizer:
             if output.publish_tracked_masks else {}
         )
 
+        # Rest-scene geometry is a visualization-only CUDA path.  All persistent
+        # setup is tiny and happens once; no per-frame work is submitted unless an
+        # actual subscriber is connected to /scene_predictor/rest_points.
+        self._rest_ray_cache: dict[
+            tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._rest_device = torch.device(config.runtime.device)
+        if self._rest_device.type == "cuda" and self._rest_device.index is None:
+            self._rest_device = torch.device("cuda", torch.cuda.current_device())
+        self._rest_voxel_size_m = 0.0
+        self._rest_inv_voxel_size = 0.0
+        self._rest_origin = None
+        self._rest_min_depth_m = 0.0
+        self._rest_max_depth_m = float("inf")
+        if self.rest_scene_pub is not None:
+            if tracker_config is None:
+                # Backward-compatible fallback for external RosVisualizer users.
+                # ScenePredictor itself passes the already-loaded native config so
+                # its tracker and visualization always share the exact same values.
+                from sam_rgbd_tracking.config import load_config as load_tracker_config
+
+                tracker_config = load_tracker_config(config.tracker.config_path)
+            self._configure_rest_scene(tracker_config)
+
     @staticmethod
     def _subscribed(publisher) -> bool:
         return publisher is not None and int(publisher.get_subscription_count()) > 0
+
+    def _visualization_publish_due(self) -> bool:
+        """Return True at the configured global visualization update rate.
+
+        This is intentionally a monotonic integer-clock check in the pipeline
+        worker thread: no ROS timer, lock, CUDA synchronization, or retained output
+        is needed. A zero period preserves the original publish-every-frame behavior.
+        """
+        period_ns = self._visualization_period_ns
+        if period_ns <= 0:
+            return True
+
+        now_ns = time.monotonic_ns()
+        if now_ns < self._next_visualization_ns:
+            return False
+
+        self._next_visualization_ns = now_ns + period_ns
+        return True
+
+    def _configure_rest_scene(self, tracker_config: Any) -> None:
+        try:
+            voxel_size_m = float(tracker_config.shared_voxel_grid.voxel_size_m)
+            origin_world = np.asarray(
+                tracker_config.shared_voxel_grid.origin_world, dtype=np.float32
+            ).reshape(3)
+            min_depth_m = float(tracker_config.postprocess.min_valid_depth_m)
+            max_depth_m = float(tracker_config.postprocess.max_valid_depth_m)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Rest-scene visualization requires tracker "
+                "shared_voxel_grid.voxel_size_m/origin_world and "
+                "postprocess min/max depth settings."
+            ) from exc
+        if voxel_size_m <= 0.0:
+            raise ValueError(
+                f"shared_voxel_grid.voxel_size_m must be positive, got {voxel_size_m}"
+            )
+        if max_depth_m < min_depth_m:
+            raise ValueError(
+                "postprocess.max_valid_depth_m must be >= min_valid_depth_m"
+            )
+
+        self._rest_voxel_size_m = voxel_size_m
+        self._rest_inv_voxel_size = 1.0 / voxel_size_m
+        self._rest_origin = torch.as_tensor(
+            origin_world, dtype=torch.float32, device=self._rest_device
+        ).contiguous()
+        self._rest_min_depth_m = min_depth_m
+        self._rest_max_depth_m = max_depth_m
+
+    def _rest_rays(self, frame: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached flattened camera rays for dense GPU backprojection."""
+        intrinsics = frame.intrinsics
+        height, width = map(int, frame.depth_m.shape)
+        key = (
+            height,
+            width,
+            float(intrinsics.fx),
+            float(intrinsics.fy),
+            float(intrinsics.cx),
+            float(intrinsics.cy),
+            str(self._rest_device),
+        )
+        cached = self._rest_ray_cache.get(key)
+        if cached is not None:
+            return cached
+
+        x_ray = (
+            torch.arange(width, dtype=torch.float32, device=self._rest_device)
+            - float(intrinsics.cx)
+        ) / float(intrinsics.fx)
+        y_ray = (
+            torch.arange(height, dtype=torch.float32, device=self._rest_device)
+            - float(intrinsics.cy)
+        ) / float(intrinsics.fy)
+        # Flattened dense rays avoid torch.nonzero() and its CUDA host sync.  The
+        # fixed-size dense arithmetic is cheap on the GPU and lets us sort one
+        # shared voxel-key array for all cameras.
+        cached = (x_ray.repeat(height), y_ray.repeat_interleave(width))
+        self._rest_ray_cache[key] = cached
+        return cached
+
+    def _rest_exclusion_mask_gpu(
+        self, result: Any, shape: tuple[int, int]
+    ) -> torch.Tensor:
+        """Union tracked final masks + the tracker-provided exclusion-only mask."""
+        excluded_cpu = np.zeros(shape, dtype=bool)
+        gpu_masks: list[torch.Tensor] = []
+        for instance in result.instances:
+            mask = getattr(instance, "mask", None)
+            if mask is not None and not torch.is_tensor(mask):
+                value = np.asarray(mask)
+                if value.shape == shape:
+                    np.logical_or(excluded_cpu, value, out=excluded_cpu)
+                    continue
+            elif torch.is_tensor(mask) and tuple(mask.shape) == shape:
+                gpu_masks.append(mask)
+                continue
+
+            mask_gpu = getattr(instance, "mask_gpu", None)
+            if torch.is_tensor(mask_gpu) and tuple(mask_gpu.shape) == shape:
+                gpu_masks.append(mask_gpu)
+
+        semantic_exclusion = getattr(result, "exclusion_mask_gpu", None)
+        if torch.is_tensor(semantic_exclusion) and tuple(semantic_exclusion.shape) == shape:
+            gpu_masks.append(semantic_exclusion)
+        elif semantic_exclusion is not None:
+            value = np.asarray(semantic_exclusion)
+            if value.shape == shape:
+                np.logical_or(excluded_cpu, value, out=excluded_cpu)
+
+        excluded = torch.as_tensor(
+            excluded_cpu, dtype=torch.bool, device=self._rest_device
+        )
+        for mask_gpu in gpu_masks:
+            if mask_gpu.device != self._rest_device:
+                mask_gpu = mask_gpu.to(self._rest_device)
+            if mask_gpu.dtype == torch.bool:
+                excluded.logical_or_(mask_gpu)
+            else:
+                excluded.logical_or_(mask_gpu != 0)
+        return excluded
+
+    def _rest_scene_points(self, output: SceneVelocityOutput) -> torch.Tensor:
+        """Build one white rest-scene cloud on the tracker's exact world lattice.
+
+        The path stays on CUDA through mask exclusion, depth validation, dense
+        backprojection, world transform, voxel quantization and cross-view unique.
+        Only the final compact XYZ cloud is copied to CPU by _xyz_cloud().
+        """
+        if self._rest_origin is None:
+            return torch.empty(
+                (0, 3), dtype=torch.float32, device=self._rest_device
+            )
+
+        all_points: list[torch.Tensor] = []
+        all_keys: list[torch.Tensor] = []
+        bias = 1 << 20
+        key_mask = (1 << 21) - 1
+        invalid_key = torch.iinfo(torch.int64).max
+
+        for result in output.view_results.values():
+            frame = result.frame
+            depth_cpu = np.asarray(frame.depth_m, dtype=np.float32)
+            if depth_cpu.ndim != 2 or depth_cpu.size == 0:
+                continue
+            height, width = map(int, depth_cpu.shape)
+            shape = (height, width)
+
+            world_from_camera = getattr(frame, "world_from_camera", None)
+            if world_from_camera is None:
+                continue
+            transform_cpu = np.asarray(world_from_camera, dtype=np.float32)
+            if transform_cpu.shape not in {(4, 4), (3, 4)}:
+                continue
+
+            depth = torch.as_tensor(
+                depth_cpu, dtype=torch.float32, device=self._rest_device
+            ).reshape(-1)
+            excluded = self._rest_exclusion_mask_gpu(result, shape).reshape(-1)
+            valid = (
+                (~excluded)
+                & torch.isfinite(depth)
+                & (depth >= self._rest_min_depth_m)
+                & (depth <= self._rest_max_depth_m)
+            )
+
+            # Keep a fixed H*W shape instead of CUDA nonzero()/variable-size
+            # compaction. Invalid pixels use z=0 and receive a sentinel voxel key.
+            z = depth.clone()
+            z.masked_fill_(~valid, 0.0)
+            ray_x, ray_y = self._rest_rays(frame)
+            points_camera = torch.empty(
+                (height * width, 3),
+                dtype=torch.float32,
+                device=self._rest_device,
+            )
+            points_camera[:, 0] = ray_x * z
+            points_camera[:, 1] = ray_y * z
+            points_camera[:, 2] = z
+
+            transform = torch.as_tensor(
+                transform_cpu, dtype=torch.float32, device=self._rest_device
+            )
+            points_world = points_camera @ transform[:3, :3].T
+            points_world.add_(transform[:3, 3])
+
+            voxel_coords = torch.floor(
+                (points_world - self._rest_origin) * self._rest_inv_voxel_size
+            ).to(torch.int64)
+            shifted = voxel_coords + bias
+            in_key_range = (shifted >= 0).all(dim=1) & (shifted <= key_mask).all(dim=1)
+            valid.logical_and_(in_key_range)
+
+            keys = (
+                (shifted[:, 0] << 42)
+                | (shifted[:, 1] << 21)
+                | shifted[:, 2]
+            )
+            keys.masked_fill_(~valid, invalid_key)
+            all_points.append(points_world)
+            all_keys.append(keys)
+
+        if not all_points:
+            return torch.empty(
+                (0, 3), dtype=torch.float32, device=self._rest_device
+            )
+
+        points = all_points[0] if len(all_points) == 1 else torch.cat(all_points, dim=0)
+        keys = all_keys[0] if len(all_keys) == 1 else torch.cat(all_keys, dim=0)
+
+        # One global sort deduplicates both each camera and cross-view overlap on
+        # exactly the same voxel_size/origin lattice used by selected objects.
+        sorted_keys, order = torch.sort(keys)
+        keep = torch.empty_like(sorted_keys, dtype=torch.bool)
+        keep[0] = sorted_keys[0] != invalid_key
+        if sorted_keys.numel() > 1:
+            keep[1:] = (sorted_keys[1:] != sorted_keys[:-1]) & (
+                sorted_keys[1:] != invalid_key
+            )
+        return points[order[keep]]
 
     def _publish_masks(self, output: SceneVelocityOutput) -> None:
         for camera, result in output.view_results.items():
@@ -256,13 +559,62 @@ class RosVisualizer:
             message.data = array.tobytes()
             publisher.publish(message)
 
+    @staticmethod
+    def _exclusion_mask_cpu(result: Any, shape: tuple[int, int]) -> np.ndarray | None:
+        """Materialize the per-view semantic exclusion union only on demand.
+
+        Excluded EfficientTAM slots intentionally stop before 3D geometry and are
+        represented downstream only by ``FrameResult.exclusion_mask_gpu``.  The
+        annotated-RGB path is already subscriber/rate gated, so this single mask
+        D2H stays completely outside the numerical hot path.
+        """
+        mask = getattr(result, "exclusion_mask_gpu", None)
+        if mask is None:
+            return None
+        if torch.is_tensor(mask):
+            value = mask.detach().cpu().numpy()
+        else:
+            value = np.asarray(mask)
+        if tuple(value.shape) != tuple(shape):
+            return None
+        return np.asarray(value, dtype=bool)
+
+    def _overlay_excluded(self, image: np.ndarray, result: Any) -> np.ndarray:
+        """Overlay the exact dilated exclusion region used by rest-scene filtering."""
+        mask = self._exclusion_mask_cpu(result, result.frame.depth_m.shape)
+        if mask is None or not bool(mask.any()):
+            return image
+
+        color = _EXCLUDED_OVERLAY_COLOR
+        blended = (
+            image[mask].astype(np.float32) * 0.55
+            + color.astype(np.float32) * 0.45
+        )
+        image[mask] = np.clip(blended, 0, 255).astype(np.uint8)
+
+        labels = ", ".join(label for label, _ in self.config.tracker.excluded_prompts)
+        text = f"Excluded: {labels}" if labels else "Excluded"
+        cv2.putText(
+            image,
+            text,
+            (8, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color.tolist(),
+            2,
+            cv2.LINE_AA,
+        )
+        return image
+
     def _publish_annotated_rgb(self, output: SceneVelocityOutput) -> None:
         for camera, result in output.view_results.items():
             publisher = self.annotated_rgb_pubs.get(camera)
             if not self._subscribed(publisher):
                 continue
-            # make_overlay is intentionally executed only after subscription check.
+            # Both tracked and excluded overlays are intentionally materialized
+            # only after the subscriber check. Excluded slots remain 2D-only.
             image = make_overlay(result)
+            image = self._overlay_excluded(image, result)
             publisher.publish(_rgb8_image(self.node, image, output.stamp_ns, camera))
 
     def _publish_markers(self, output: SceneVelocityOutput) -> None:
@@ -313,10 +665,21 @@ class RosVisualizer:
         self.marker_pub.publish(array)
 
     def publish(self, output: SceneVelocityOutput) -> None:
+        # Rate-limit before *any* subscriber query or expensive visualization work.
+        # One decision gates every topic, keeping RGB/masks/PCDs/markers frame-aligned.
+        if not self._visualization_publish_due():
+            return
+
         frame = self.config.ros.world_frame
 
         if self._subscribed(self.tracked_pub):
             self.tracked_pub.publish(_tracked_cloud(self.node, output, frame))
+
+        if self._subscribed(self.rest_scene_pub):
+            rest_points = self._rest_scene_points(output)
+            self.rest_scene_pub.publish(
+                _xyz_cloud(self.node, rest_points, output.stamp_ns, frame)
+            )
 
         if self._subscribed(self.velocity_pub):
             self.velocity_pub.publish(_velocity_cloud(self.node, output, frame))

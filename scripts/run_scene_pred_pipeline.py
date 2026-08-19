@@ -20,7 +20,11 @@ class ScenePredictorNode(Node):
         super().__init__("scene_predictor")
         self.config = load_config(config_path)
         self.pipeline = ScenePredictionPipeline(self.config)
-        self.visualizer = RosVisualizer(self, self.config)
+        self.visualizer = RosVisualizer(
+            self,
+            self.config,
+            tracker_config=self.pipeline.tracker.tracker_config,
+        )
 
         self._condition = threading.Condition()
         self._latest_frame = None

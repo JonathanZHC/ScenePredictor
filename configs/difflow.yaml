@@ -14,12 +14,12 @@ model:
     coarse: 4
     middle: 2
     fine: 2
-  uncertainty: 0.20
+  uncertainty: 0.10
   strict_checkpoint: true
   disable_bn_running_stats: true
 
 preprocessing:
-  fps_points: 2048
+  fps_points: 1024
   second_candidate_ratio: 1.1
   final_selection: uniform
   auto_spatial_scale: true

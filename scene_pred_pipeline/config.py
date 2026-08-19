@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,8 @@ class TrackerConfig:
 
     config_path: str = "/workspace/configs/tracking.yaml"
     checkpoint_root: str = "/workspace/checkpoints"
+    tracked_prompts: tuple[tuple[str, int], ...] = (("human", 1),)
+    excluded_prompts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,11 +113,14 @@ class DifFlowConfig:
 @dataclass(frozen=True)
 class OutputConfig:
     publish_tracked_objects: bool = True
+    publish_rest_scene: bool = True
     publish_velocity_cloud: bool = True
     publish_velocity_markers: bool = True
     publish_tracked_masks: bool = True
     publish_annotated_rgb: bool = True
     publish_flow_anchors: bool = True
+    # Maximum update rate for visualization-only ROS topics. 0 = unthrottled.
+    visualization_publish_hz: float = 10.0
     velocity_marker_stride: int = 32
     velocity_marker_scale: float = 0.20
     profile_interval_frames: int = 30
@@ -160,6 +166,88 @@ def _mapping(value: Any, *, name: str) -> dict[str, Any]:
 def _resolve_from(base_dir: Path, value: str) -> str:
     path = Path(value).expanduser()
     return str(path.resolve() if path.is_absolute() else (base_dir / path).resolve())
+
+
+def _prompt_specs(value: Any, *, name: str) -> tuple[tuple[str, int], ...]:
+    """Parse ScenePredictor prompt entries as immutable ``(label, capacity)`` pairs."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a YAML list of [label, capacity] entries")
+
+    output: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            label = str(item[0]).strip()
+            capacity = int(item[1])
+        elif isinstance(item, dict):
+            raw_label = item.get("name", item.get("text", item.get("prompt")))
+            raw_capacity = item.get(
+                "capacity", item.get("max_instances", item.get("count", 1))
+            )
+            if raw_label is None:
+                raise ValueError(
+                    f"{name} mapping entries need name/text/prompt and capacity"
+                )
+            label = str(raw_label).strip()
+            capacity = int(raw_capacity)
+        else:
+            raise ValueError(
+                f"Each {name} entry must be [label, capacity] or a mapping; got {item!r}"
+            )
+
+        if not label:
+            raise ValueError(f"{name} contains an empty semantic label")
+        if capacity <= 0:
+            raise ValueError(
+                f"{name} capacity for {label!r} must be > 0, got {capacity}"
+            )
+        if label in seen:
+            raise ValueError(f"{name} contains duplicate semantic class {label!r}")
+        seen.add(label)
+        output.append((label, capacity))
+    return tuple(output)
+
+
+def _tracker_config(value: Any, *, base_dir: Path) -> TrackerConfig:
+    values = _mapping(value, name="tracker")
+    has_prompt_keys = "tracked_prompts" in values or "excluded_prompts" in values
+    tracked = _prompt_specs(
+        values.pop("tracked_prompts", None), name="tracker.tracked_prompts"
+    )
+    excluded = _prompt_specs(
+        values.pop("excluded_prompts", None), name="tracker.excluded_prompts"
+    )
+
+    # Preserve the dataclass default only for genuinely old configs that specify
+    # neither key. Once either key is present, the supplied lists are authoritative.
+    if not has_prompt_keys:
+        tracked = TrackerConfig().tracked_prompts
+
+    overlap = {label for label, _ in tracked} & {label for label, _ in excluded}
+    if overlap:
+        raise ValueError(
+            "The same semantic class cannot be both tracked and excluded: "
+            + ", ".join(sorted(overlap))
+        )
+    if not tracked:
+        raise ValueError(
+            "tracker.tracked_prompts must contain at least one class; the current "
+            "3-D alignment workspace is sized from tracked classes only"
+        )
+
+    if "config_path" in values:
+        values["config_path"] = _resolve_from(base_dir, str(values["config_path"]))
+    if "checkpoint_root" in values:
+        values["checkpoint_root"] = _resolve_from(
+            base_dir, str(values["checkpoint_root"])
+        )
+    return TrackerConfig(
+        tracked_prompts=tracked,
+        excluded_prompts=excluded,
+        **values,
+    )
 
 
 def _iteration_config(value: Any) -> DifFlowIterationConfig:
@@ -280,12 +368,22 @@ def load_config(path: str | Path) -> PipelineConfig:
     if ros.tf_timeout_ms < 0.0:
         raise ValueError("ros.tf_timeout_ms must be >= 0")
 
+    output = _construct(OutputConfig, raw.get("output"))
+    visualization_publish_hz = float(output.visualization_publish_hz)
+    if not math.isfinite(visualization_publish_hz) or visualization_publish_hz < 0.0:
+        raise ValueError(
+            "output.visualization_publish_hz must be finite and >= 0 "
+            "(0 disables visualization throttling)"
+        )
+
+    tracker = _tracker_config(raw.get("tracker"), base_dir=base_dir)
+
     return PipelineConfig(
         ros=ros,
-        tracker=_construct(TrackerConfig, raw.get("tracker")),
+        tracker=tracker,
         flow=flow,
         recovery=_construct(RecoveryConfig, raw.get("recovery")),
-        output=_construct(OutputConfig, raw.get("output")),
+        output=output,
         runtime=_construct(RuntimeConfig, raw.get("runtime")),
         difflow=difflow,
     )

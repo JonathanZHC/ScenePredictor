@@ -72,6 +72,27 @@ class ScenePredictionPipeline:
         # rebuild them from per-instance views with torch.cat()/torch.full().
         return tracked.packed_points_world, tracked.packed_track_ids
 
+    def _record_tracker_breakdown(self, tracked: TrackedInstanceFrame) -> None:
+        values = tracked.tracker_timings_ms
+        tracking_model = sum(
+            float(values.get(name, 0.0))
+            for name in (
+                "tracker_reinit",
+                "tracker_propagate",
+                "tracker_direct_correction",
+            )
+        )
+        self.profiler.record("tracking_model", tracking_model)
+        self.profiler.record("postprocess", float(values.get("postprocess_total", 0.0)))
+        self.profiler.record("alignment", float(values.get("alignment_total", 0.0)))
+        self.profiler.record("adapter", float(values.get("adapter_total", 0.0)))
+
+        # These values are useful diagnostics, but SAM3 inference/filtering runs on
+        # its separate async worker and must never be visually added to cycle_total.
+        for name in ("sam3_async", "sam3_filter", "sam3_slot_assoc"):
+            if name in values:
+                self.profiler.record(name, float(values[name]))
+
     def _empty_output(
         self,
         frame: MultiCameraFrame,
@@ -111,8 +132,7 @@ class ScenePredictionPipeline:
         if current is None:
             return self._empty_output(frame, None)
 
-        for name, value in current.tracker_timings_ms.items():
-            self.profiler.record(f"tracker/{name}", value)
+        self._record_tracker_breakdown(current)
 
         tracked_points, tracked_ids = self._all_tracked_points(current)
 
@@ -143,8 +163,10 @@ class ScenePredictionPipeline:
             else:
                 # DifFlow is always present. It owns adaptive voxel-2, exact-count
                 # selection, frozen world/model scaling, and CUDA-Graph inference.
-                with self.profiler.stage("difflow", cuda=True):
-                    flow_result = self.flow_predictor.predict(pair)
+                with self.profiler.stage("difflow_total", cuda=True):
+                    flow_result = self.flow_predictor.predict(
+                        pair, profiler=self.profiler
+                    )
 
                 with self.profiler.stage("velocity_recovery", cuda=True):
                     flow_velocity = self.recovery.recover(pair, flow_result)

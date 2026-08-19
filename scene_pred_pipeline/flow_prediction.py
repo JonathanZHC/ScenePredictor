@@ -147,7 +147,7 @@ class DifFlowPredictor:
         self._cached_target_stamp_ns = None
         self._cached_track_signature = None
 
-    def predict(self, pair: InstancePair) -> FlowResult:
+    def predict(self, pair: InstancePair, *, profiler=None) -> FlowResult:
         if pair.dt_s <= 0.0:
             raise ValueError(f"Flow dt_s must be positive, got {pair.dt_s:.9f}s")
 
@@ -160,25 +160,52 @@ class DifFlowPredictor:
 
         with torch.inference_mode():
             if not source_is_cached:
-                self.runner.reset()
-                self.runner.stage_world(
-                    pair.previous_points,
-                    point_ids=pair.previous_track_ids,
+                source_context = (
+                    profiler.stage("source_prepare", cuda=True)
+                    if profiler is not None
+                    else _NullContext()
                 )
-                if self.runner.replay_next() is not None:
-                    raise RuntimeError("First streaming frame must only buffer")
+                with source_context:
+                    self.runner.reset()
+                    self.runner.stage_world(
+                        pair.previous_points,
+                        point_ids=pair.previous_track_ids,
+                    )
+                    if self.runner.replay_next() is not None:
+                        raise RuntimeError("First streaming frame must only buffer")
+            elif profiler is not None:
+                profiler.record("source_prepare", 0.0)
 
-            self.runner.stage_world(
-                pair.current_points,
-                point_ids=pair.current_track_ids,
+            target_context = (
+                profiler.stage("target_prepare", cuda=True)
+                if profiler is not None
+                else _NullContext()
             )
-            if self.runner.replay_next() is None:
-                raise RuntimeError("DifFlow3D did not produce a pair output")
+            with target_context:
+                self.runner.stage_world(
+                    pair.current_points,
+                    point_ids=pair.current_track_ids,
+                )
 
-            anchor_flow = self.runner.flow_world()[0]
-            source_anchors = self.runner.source_points_world()[0]
-            warped_anchors = self.runner.warped_points_world()[0]
-            source_anchor_ids = self.runner.source_point_ids()
+            inference_context = (
+                profiler.stage("inference", cuda=True)
+                if profiler is not None
+                else _NullContext()
+            )
+            with inference_context:
+                if self.runner.replay_next() is None:
+                    raise RuntimeError("DifFlow3D did not produce a pair output")
+
+            extract_context = (
+                profiler.stage("output_extract", cuda=True)
+                if profiler is not None
+                else _NullContext()
+            )
+            with extract_context:
+                anchor_flow = self.runner.flow_world()[0]
+                source_anchors = self.runner.source_points_world()[0]
+                warped_anchors = self.runner.warped_points_world()[0]
+                source_anchor_ids = self.runner.source_point_ids()
 
             result = FlowResult(
                 source_anchors=source_anchors,
@@ -190,3 +217,11 @@ class DifFlowPredictor:
         self._cached_target_stamp_ns = int(pair.current_stamp_ns)
         self._cached_track_signature = signature
         return result
+
+
+class _NullContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False

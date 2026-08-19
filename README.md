@@ -250,8 +250,8 @@ Terminal 2:
 If the container user needs permission to save the config:
 
 ```bash
-touch rviz/tracking.rviz
-sudo setfacl -m u:1234:rw rviz/tracking.rviz
+touch rviz/scene_pred_pipeline.rviz iz
+sudo setfacl -m u:1234:rw rviz/scene_pred_pipeline.rviz 
 sudo setfacl -m u:1234:rwx rviz
 ```
 
@@ -308,9 +308,9 @@ See `DifFlow3D/README.md` for runtime tests and benchmarks.
 
 ## 11. Configuration ownership
 
-`configs/default.yaml` contains only ScenePredictor integration settings.
+`configs/default.yaml` owns ScenePredictor integration settings and semantic prompt ownership. `tracker.tracked_prompts` enter the full 3-D tracking/DifFlow path; `tracker.excluded_prompts` still use SAM3 + EfficientTAM in 2-D but stop after a dilated GPU exclusion mask.
 
-`configs/tracking.yaml` owns tracker behavior, including prompts, EfficientTAM execution, postprocessing, voxel matching, alignment, and tracker profiling.
+`configs/tracking.yaml` owns native tracker/model behavior, including EfficientTAM execution, postprocessing, voxel matching, alignment, and tracker profiling. ScenePredictor injects `tracked_prompts + excluded_prompts` into the native detector at startup.
 
 The production postprocess optimization bundle is intentionally frozen. `postprocess.gpu_geometry: true` enables the validated CUDA path; the former independent A/B switches for direct geometry, compact D2H, depth prefetch, and lazy masks were removed.
 
