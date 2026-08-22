@@ -63,7 +63,7 @@ tracker:
 
 postprocess:
   mask_threshold: 0.0
-  tracking_erosion_pixels: 1
+  tracking_erosion_pixels: 2 # 1 for ZedX, 2 for isaacsim
   exclusion_dilation_pixels: 1
   min_component_pixels: 30
   min_valid_depth_m: 0.10

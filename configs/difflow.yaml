@@ -26,6 +26,14 @@ preprocessing:
   target_model_volume: 5.0
   fixed_spatial_scale: 1.0
 
+motion_estimation:
+  kalman:
+    enabled: false
+    process_velocity_std_mps: 0.15
+    measurement_noise_std_mps: 0.10
+    initial_velocity_std_mps: 0.30
+    min_innovation_variance: 1.0e-6
+
 recovery:
   softmax_sigma_m: 0.025  # Real/world metric bandwidth in metres.
   backend: local  # auto | global | local | torch

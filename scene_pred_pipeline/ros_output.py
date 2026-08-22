@@ -630,7 +630,9 @@ class RosVisualizer:
         delete.action = Marker.DELETEALL
         array.markers.append(delete)
 
-        scale = float(self.config.output.velocity_marker_scale)
+        dt_s = float(output.flow_dt_s)
+        factor = float(self.config.output.velocity_marker_scale_factor)
+        scale = dt_s * factor
         for index, (point, vector) in enumerate(zip(points, velocity)):
             if not (np.isfinite(point).all() and np.isfinite(vector).all()):
                 continue

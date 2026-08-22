@@ -75,6 +75,10 @@ class FlowResult:
 @dataclass
 class SceneVelocityOutput:
     stamp_ns: int
+    # Timestamp delta used to convert the current flow pair into velocity.
+    # Visualization reuses it so arrow length represents a configurable number
+    # of frame intervals instead of a fixed arbitrary time scale.
+    flow_dt_s: float
     tracked_points: torch.Tensor
     tracked_track_ids: torch.Tensor
     flow_points: torch.Tensor

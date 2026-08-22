@@ -122,7 +122,8 @@ class OutputConfig:
     # Maximum update rate for visualization-only ROS topics. 0 = unthrottled.
     visualization_publish_hz: float = 10.0
     velocity_marker_stride: int = 32
-    velocity_marker_scale: float = 0.20
+    # Marker endpoint = point + velocity * flow_dt_s * factor.
+    velocity_marker_scale_factor: float = 2.0
     profile_interval_frames: int = 30
 
 
@@ -368,12 +369,24 @@ def load_config(path: str | Path) -> PipelineConfig:
     if ros.tf_timeout_ms < 0.0:
         raise ValueError("ros.tf_timeout_ms must be >= 0")
 
-    output = _construct(OutputConfig, raw.get("output"))
+    output_values = _mapping(raw.get("output"), name="output")
+    if "velocity_marker_scale" in output_values:
+        raise ValueError(
+            "output.velocity_marker_scale has been removed. Use "
+            "output.velocity_marker_scale_factor instead; marker length is now "
+            "velocity * actual_flow_dt * factor."
+        )
+    output = _construct(OutputConfig, output_values)
     visualization_publish_hz = float(output.visualization_publish_hz)
     if not math.isfinite(visualization_publish_hz) or visualization_publish_hz < 0.0:
         raise ValueError(
             "output.visualization_publish_hz must be finite and >= 0 "
             "(0 disables visualization throttling)"
+        )
+    velocity_marker_scale_factor = float(output.velocity_marker_scale_factor)
+    if not math.isfinite(velocity_marker_scale_factor) or velocity_marker_scale_factor < 0.0:
+        raise ValueError(
+            "output.velocity_marker_scale_factor must be finite and >= 0"
         )
 
     tracker = _tracker_config(raw.get("tracker"), base_dir=base_dir)

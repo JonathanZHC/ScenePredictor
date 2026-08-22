@@ -107,6 +107,7 @@ class ScenePredictionPipeline:
         timings = self.profiler.finish()
         return SceneVelocityOutput(
             stamp_ns=int(frame.stamp_ns if tracked is None else tracked.stamp_ns),
+            flow_dt_s=0.0,
             tracked_points=tracked_points,
             tracked_track_ids=tracked_ids,
             flow_points=self._empty_points(),
@@ -148,6 +149,7 @@ class ScenePredictionPipeline:
         flow_points = self._empty_points()
         flow_velocity = self._empty_points()
         flow_track_ids = self._empty_ids()
+        flow_dt_s = 0.0
         source_anchors = self._empty_points()
         warped_anchors = self._empty_points()
         common_ids: tuple[int, ...] = ()
@@ -173,6 +175,7 @@ class ScenePredictionPipeline:
 
                 flow_points = pair.current_points
                 flow_track_ids = pair.current_track_ids
+                flow_dt_s = float(pair.dt_s)
                 source_anchors = flow_result.source_anchors
                 warped_anchors = flow_result.warped_anchors
                 flow_valid = True
@@ -183,6 +186,7 @@ class ScenePredictionPipeline:
         timings = self.profiler.finish()
         return SceneVelocityOutput(
             stamp_ns=int(current.stamp_ns),
+            flow_dt_s=flow_dt_s,
             tracked_points=tracked_points,
             tracked_track_ids=tracked_ids,
             flow_points=flow_points,
