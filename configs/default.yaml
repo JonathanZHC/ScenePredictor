@@ -1,6 +1,6 @@
 ros:
   world_frame: world
-  camera_names: [camera_0, camera_1] # [camera_0, camera_1]
+  camera_names: [camera_0] # [camera_0, camera_1]
   color_topic: "/{camera}/color/image_raw" # "/{camera}/color/image_raw/compressed"
   depth_topic: "/{camera}/depth/image_raw" # "/{camera}/depth/image_raw/compressedDepth"
   camera_info_topic: "/{camera}/color/camera_info" # "/{camera}/camera_info"
@@ -20,10 +20,10 @@ tracker:
   # [semantic class, fixed EfficientTAM capacity]. ScenePredictor owns prompt
   # semantics; tracking.yaml owns only tracker/model/postprocess behavior.
   tracked_prompts:
-    # - [human, 1]
-    - [ball, 1]
-    - [red mug, 1]
-    - [mustard bottle, 1]
+    - [human, 1]
+    # - [ball, 1]
+    # - [red mug, 1]
+    # - [mustard bottle, 1]
 
   # These classes still participate in SAM3 refresh + EfficientTAM propagation,
   # but stop after 2-D morphology. They never enter RGB-D geometry/alignment or
@@ -54,12 +54,19 @@ output:
   publish_tracked_masks: false
   publish_annotated_rgb: true
   publish_flow_anchors: true
+  # Single independent switch for the red removed-point RViz cloud. It does not
+  # enable DifFlow's expensive detailed per-block logging.
+  publish_removed_outlier_points: true
   # Max update rate for all RViz/diagnostic topics. 0 disables throttling.
-  visualization_publish_hz: 20
+  visualization_publish_hz: 10
   velocity_marker_stride: 16
   # Arrow endpoint = point + velocity * flow_dt_s * factor.
   # Uses the actual timestamp delta of the flow pair, not visualization_publish_hz.
   velocity_marker_scale_factor: 2.0
+  # The periodic profiler summary also reports DifFlow outlier-filter timing,
+  # block counts, and removed voxel statistics.
+  # Per-block text logs are controlled separately by detailed_output in
+  # difflow.yaml.
   profile_interval_frames: 30
 
 runtime:

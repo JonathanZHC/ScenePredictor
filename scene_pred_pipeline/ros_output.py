@@ -260,6 +260,12 @@ class RosVisualizer:
             node.create_publisher(PointCloud2, "/scene_predictor/flow/warped_anchors", qos)
             if output.publish_flow_anchors else None
         )
+        self.outlier_removed_pub = (
+            node.create_publisher(
+                PointCloud2, "/scene_predictor/outlier_filter/removed_points", qos
+            )
+            if output.publish_removed_outlier_points else None
+        )
         self.marker_pub = (
             node.create_publisher(MarkerArray, "/scene_predictor/velocity_markers", qos)
             if output.publish_velocity_markers else None
@@ -707,6 +713,17 @@ class RosVisualizer:
                     output.stamp_ns,
                     frame,
                     (235, 190, 70),
+                )
+            )
+
+        if self._subscribed(self.outlier_removed_pub):
+            self.outlier_removed_pub.publish(
+                _xyzrgb_cloud(
+                    self.node,
+                    output.removed_outlier_points,
+                    output.stamp_ns,
+                    frame,
+                    (255, 40, 40),
                 )
             )
 

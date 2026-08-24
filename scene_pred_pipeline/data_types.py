@@ -70,6 +70,9 @@ class FlowResult:
     warped_anchors: torch.Tensor
     anchor_flow: torch.Tensor
     source_anchor_track_ids: torch.Tensor
+    # Mask over InstancePair.current_points. Rejected dense points must not be
+    # passed to motion recovery, otherwise they still receive velocities.
+    target_input_keep_mask: torch.Tensor
 
 
 @dataclass
@@ -86,6 +89,7 @@ class SceneVelocityOutput:
     flow_track_ids: torch.Tensor
     source_anchors: torch.Tensor
     warped_anchors: torch.Tensor
+    removed_outlier_points: torch.Tensor
     # Keep lightweight tracker result references instead of eagerly building
     # masks/overlays.  RosVisualizer only materializes them when a subscriber is
     # actually connected.
@@ -93,3 +97,9 @@ class SceneVelocityOutput:
     common_track_ids: tuple[int, ...]
     flow_valid: bool
     timings_ms: dict[str, float]
+    # Resolved after the existing end-of-cycle CUDA fence. The nested
+    # statistics mapping is empty when adaptive voxel-2 was bypassed.
+    outlier_filter_info: dict[str, Any] = field(default_factory=dict)
+    # Populated only when outlier_filter.detailed_output is enabled. It is text
+    # diagnostics only; removed-point visualization is independent of it.
+    outlier_debug: dict[str, Any] = field(default_factory=dict)

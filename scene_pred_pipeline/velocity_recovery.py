@@ -41,14 +41,17 @@ class VelocityRecovery:
         pair: InstancePair,
         flow_result: FlowResult,
     ) -> torch.Tensor:
-        """Recover every current-frame point in one CUDA call.
+        """Recover every retained current-frame point in one CUDA call.
 
         When same-track conditioning is enabled, query and anchor track IDs are
         passed into DifFlow3D's local CUDA kernel. The kernel rejects anchors
         from other instances inside the hash-grid traversal, avoiding the old
         per-track boolean gathers, repeated hash builds, and repeated launches.
         """
-        current = pair.current_points
+        keep_mask = flow_result.target_input_keep_mask
+        if keep_mask.shape != (pair.current_points.shape[0],):
+            raise RuntimeError("DifFlow target keep mask does not match the input cloud")
+        current = pair.current_points[keep_mask]
         if current.shape[0] == 0:
             return torch.empty_like(current)
 
@@ -60,7 +63,7 @@ class VelocityRecovery:
                     "for the fused track-aware CUDA recovery path"
                 )
             kwargs = {
-                "query_track_ids": pair.current_track_ids,
+                "query_track_ids": pair.current_track_ids[keep_mask],
                 "anchor_track_ids": flow_result.source_anchor_track_ids,
             }
 

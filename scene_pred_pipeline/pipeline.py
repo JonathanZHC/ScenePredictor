@@ -115,6 +115,7 @@ class ScenePredictionPipeline:
             flow_track_ids=self._empty_ids(),
             source_anchors=self._empty_points(),
             warped_anchors=self._empty_points(),
+            removed_outlier_points=self._empty_points(),
             view_results=view_results,
             common_track_ids=(),
             flow_valid=False,
@@ -154,6 +155,10 @@ class ScenePredictionPipeline:
         warped_anchors = self._empty_points()
         common_ids: tuple[int, ...] = ()
         flow_valid = False
+        outlier_filter_info: dict[str, object] = {}
+        outlier_debug: dict[str, object] = {}
+        removed_outlier_points = self._empty_points()
+        dense_filter_counts: tuple[int, int, int] | None = None
 
         if pair is None:
             self.flow_predictor.reset()
@@ -167,14 +172,26 @@ class ScenePredictionPipeline:
                 # selection, frozen world/model scaling, and CUDA-Graph inference.
                 with self.profiler.stage("difflow_total", cuda=True):
                     flow_result = self.flow_predictor.predict(
-                        pair, profiler=self.profiler
+                        pair,
+                        track_labels={
+                            int(instance.global_track_id): instance.semantic_label
+                            for instance in current.instances
+                        },
                     )
 
                 with self.profiler.stage("velocity_recovery", cuda=True):
                     flow_velocity = self.recovery.recover(pair, flow_result)
 
-                flow_points = pair.current_points
-                flow_track_ids = pair.current_track_ids
+                target_keep = flow_result.target_input_keep_mask
+                flow_points = pair.current_points[target_keep]
+                flow_track_ids = pair.current_track_ids[target_keep]
+                dense_filter_counts = (
+                    int(pair.current_points.shape[0]),
+                    int(flow_points.shape[0]),
+                    int(pair.current_points.shape[0] - flow_points.shape[0]),
+                )
+                if self.config.output.publish_removed_outlier_points:
+                    removed_outlier_points = pair.current_points[~target_keep]
                 flow_dt_s = float(pair.dt_s)
                 source_anchors = flow_result.source_anchors
                 warped_anchors = flow_result.warped_anchors
@@ -184,6 +201,22 @@ class ScenePredictionPipeline:
         # RosVisualizer checks subscription counts before any D2H conversion,
         # overlay construction, mask merge, PointCloud2 packing, or marker build.
         timings = self.profiler.finish()
+        if flow_valid:
+            runner_timings, outlier_filter_info, outlier_debug = (
+                self.flow_predictor.resolve_after_cycle_fence()
+            )
+            if dense_filter_counts is not None:
+                (
+                    outlier_filter_info["dense_input_points"],
+                    outlier_filter_info["dense_retained_points"],
+                    outlier_filter_info["dense_removed_points"],
+                ) = dense_filter_counts
+            timings.update(runner_timings)
+            timings["difflow_other"] = self.profiler.record_difflow_timings(
+                runner_timings,
+                timings["difflow_total"],
+            )
+            self.profiler.record_outlier_filter(outlier_filter_info)
         return SceneVelocityOutput(
             stamp_ns=int(current.stamp_ns),
             flow_dt_s=flow_dt_s,
@@ -194,10 +227,13 @@ class ScenePredictionPipeline:
             flow_track_ids=flow_track_ids,
             source_anchors=source_anchors,
             warped_anchors=warped_anchors,
+            removed_outlier_points=removed_outlier_points,
             view_results=current.view_results,
             common_track_ids=common_ids,
             flow_valid=flow_valid,
             timings_ms=timings,
+            outlier_filter_info=outlier_filter_info,
+            outlier_debug=outlier_debug,
         )
 
     def close(self) -> None:

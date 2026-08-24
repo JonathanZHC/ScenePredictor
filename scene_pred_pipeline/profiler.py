@@ -16,14 +16,6 @@ class CycleProfiler:
     never adds a second synchronization to the tracker/SAM3 streams.
     """
 
-    _TOP_LEVEL = (
-        "cycle_total",
-        "tracker_total",
-        "instance_filter",
-        "difflow_total",
-        "velocity_recovery",
-        "cycle_other",
-    )
     _TRACKER = (
         "tracking_model",
         "postprocess",
@@ -31,18 +23,21 @@ class CycleProfiler:
         "adapter",
         "tracker_other",
     )
-    _DIFFLOW = (
-        "source_prepare",
-        "target_prepare",
-        "inference",
-        "output_extract",
-        "difflow_other",
+    _DIFFLOW_RUNNER = (
+        ("runner_voxel2", "voxel-2"),
+        ("runner_outlier_filter", "outlier filter"),
+        ("runner_final_selection", "final selection"),
+        ("runner_stage_scale", "stage + scale"),
+        ("runner_encode", "encode"),
+        ("runner_decode", "decode"),
     )
+    _DIFFLOW_DETAIL = _DIFFLOW_RUNNER + (("difflow_other", "other"),)
     _ASYNC = (
         "sam3_async",
         "sam3_filter",
         "sam3_slot_assoc",
     )
+    _POST_CYCLE_DEBUG = ("outlier_debug",)
 
     def __init__(
         self,
@@ -58,6 +53,10 @@ class CycleProfiler:
         self._samples: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=history_size)
         )
+        self._outlier_samples: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=history_size)
+        )
+        self._outlier_config: dict[str, object] = {}
 
     @contextmanager
     def stage(self, name: str, *, cuda: bool = True):
@@ -95,6 +94,49 @@ class CycleProfiler:
     def record(self, name: str, value_ms: float) -> None:
         self._recorded[str(name)] = float(value_ms)
 
+    def record_difflow_timings(
+        self,
+        values_ms: dict[str, float],
+        total_ms: float,
+    ) -> float:
+        """Record leaf runner timings and return unprofiled DifFlow overhead."""
+        for name, value in values_ms.items():
+            self._samples[str(name)].append(float(value))
+        other_ms = self._residual(
+            total_ms,
+            *(values_ms.get(name, 0.0) for name, _ in self._DIFFLOW_RUNNER),
+        )
+        self._samples["difflow_other"].append(other_ms)
+        return other_ms
+
+    def record_outlier_filter(self, info: dict[str, object]) -> None:
+        """Accumulate non-timing filter diagnostics for periodic summaries."""
+        self._outlier_config = {
+            key: info[key]
+            for key in (
+                "enabled",
+                "min_component_size_ratio",
+            )
+            if key in info
+        }
+        self._outlier_samples["applied_ratio"].append(
+            float(bool(info.get("applied", False)))
+        )
+        for source, target in (
+            ("input_voxels", "input_voxels"),
+            ("retained_voxels", "retained_voxels"),
+            ("dense_input_points", "dense_input_points"),
+            ("dense_removed_points", "dense_removed_points"),
+        ):
+            self._outlier_samples[target].append(float(info.get(source, 0)))
+
+        statistics = info.get("statistics")
+        if not isinstance(statistics, dict):
+            return
+        for name, value in statistics.items():
+            if value is not None:
+                self._outlier_samples[str(name)].append(float(value))
+
     @staticmethod
     def _residual(total: float, *parts: float) -> float:
         # Do not clamp. A materially negative residual is useful evidence that a
@@ -126,10 +168,6 @@ class CycleProfiler:
             "postprocess",
             "alignment",
             "adapter",
-            "source_prepare",
-            "target_prepare",
-            "inference",
-            "output_extract",
         ):
             timings.setdefault(name, 0.0)
 
@@ -139,13 +177,6 @@ class CycleProfiler:
             timings["postprocess"],
             timings["alignment"],
             timings["adapter"],
-        )
-        timings["difflow_other"] = self._residual(
-            timings["difflow_total"],
-            timings["source_prepare"],
-            timings["target_prepare"],
-            timings["inference"],
-            timings["output_extract"],
         )
         timings["cycle_other"] = self._residual(
             timings["cycle_total"],
@@ -159,25 +190,39 @@ class CycleProfiler:
             self._samples[name].append(float(value))
         return timings
 
-    def summary(self) -> dict[str, dict[str, float]]:
+    @staticmethod
+    def _summarize(
+        sample_groups: dict[str, deque[float]],
+        *,
+        include_sum: bool = False,
+    ) -> dict[str, dict[str, float]]:
         output: dict[str, dict[str, float]] = {}
-        for name, samples in self._samples.items():
+        for name, samples in sample_groups.items():
             if not samples:
                 continue
             tensor = torch.tensor(list(samples), dtype=torch.float64)
-            output[name] = {
+            values = {
                 "mean": float(tensor.mean()),
                 "median": float(tensor.median()),
                 "p95": float(torch.quantile(tensor, 0.95)),
                 "max": float(tensor.max()),
                 "count": float(tensor.numel()),
             }
+            if include_sum:
+                values["sum"] = float(tensor.sum())
+            output[name] = values
         return output
 
+    def summary(self) -> dict[str, dict[str, float]]:
+        return self._summarize(self._samples)
+
+    def outlier_summary(self) -> dict[str, dict[str, float]]:
+        return self._summarize(self._outlier_samples, include_sum=True)
+
     @staticmethod
-    def _format_row(name: str, values: dict[str, float], *, indent: int = 2) -> str:
+    def _format_row(label: str, values: dict[str, float], *, indent: int = 2) -> str:
         return (
-            f"{' ' * indent}{name:28s} "
+            f"{' ' * indent}{label:28s} "
             f"mean={values['mean']:7.3f} "
             f"median={values['median']:7.3f} "
             f"p95={values['p95']:7.3f} "
@@ -188,10 +233,10 @@ class CycleProfiler:
         values = self.summary()
         rows = ["End-to-end numerical cycle [ms]:"]
 
-        def add(name: str, indent: int = 2) -> None:
+        def add(name: str, indent: int = 2, label: str | None = None) -> None:
             item = values.get(name)
             if item is not None:
-                rows.append(self._format_row(name, item, indent=indent))
+                rows.append(self._format_row(label or name, item, indent=indent))
 
         add("cycle_total")
         rows.append("")
@@ -202,8 +247,8 @@ class CycleProfiler:
         add("instance_filter")
         rows.append("")
         add("difflow_total")
-        for name in self._DIFFLOW:
-            add(name, 4)
+        for name, label in self._DIFFLOW_DETAIL:
+            add(name, 4, label)
         rows.append("")
         add("velocity_recovery")
         add("cycle_other")
@@ -213,4 +258,52 @@ class CycleProfiler:
             rows.extend(("", "Async diagnostics [not part of cycle_total]:"))
             for name in self._ASYNC:
                 add(name)
+
+        debug_present = any(name in values for name in self._POST_CYCLE_DEBUG)
+        if debug_present:
+            rows.extend(("", "Post-cycle debug diagnostics [not part of cycle_total]:"))
+            for name in self._POST_CYCLE_DEBUG:
+                add(name)
+
+        outlier = self.outlier_summary()
+        if bool(self._outlier_config.get("enabled", False)) and outlier:
+            rows.extend(("", "Voxel outlier filter diagnostics:"))
+            rows.append(
+                "  config: "
+                "min_component_size_ratio="
+                f"{float(self._outlier_config.get('min_component_size_ratio', 0.05)):.4f}"
+            )
+
+            def add_outlier(name: str, label: str, *, show_sum: bool = False) -> None:
+                item = outlier.get(name)
+                if item is None:
+                    return
+                suffix = f" total={item['sum']:.0f}" if show_sum else ""
+                rows.append(
+                    f"  {label:32s} "
+                    f"mean={item['mean']:8.3f} "
+                    f"median={item['median']:8.3f} "
+                    f"p95={item['p95']:8.3f} "
+                    f"max={item['max']:8.3f}{suffix}"
+                )
+
+            add_outlier("applied_ratio", "filter applied ratio")
+            add_outlier("input_voxels", "voxel-2 input")
+            add_outlier("retained_voxels", "voxels retained")
+            add_outlier("dense_input_points", "dense input points")
+            add_outlier(
+                "dense_removed_points",
+                "dense points removed",
+                show_sum=True,
+            )
+            add_outlier("component_count", "blocks in scene")
+            add_outlier("instance_count", "instances in scene")
+            add_outlier("largest_component_voxels", "largest block [voxels]")
+            add_outlier(
+                "instances_with_removed_components",
+                "instances with removals",
+                show_sum=True,
+            )
+            add_outlier("removed_component_count", "removed blocks", show_sum=True)
+            add_outlier("removed_voxel_count", "removed voxels", show_sum=True)
         return "\n".join(rows)

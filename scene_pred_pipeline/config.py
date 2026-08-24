@@ -79,13 +79,32 @@ class DifFlowModelConfig:
 
 
 @dataclass(frozen=True)
+class DifFlowSpatialScaleConfig:
+    enable: bool = True
+    target_model_volume: float = 2.0
+    fixed_spatial_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class DifFlowOutlierFilterConfig:
+    enabled: bool = False
+    # Expensive, intentionally opt-in debugging: rebuild voxel-2 components and
+    # print every decision. RViz removed-point output has its own output flag.
+    detailed_output: bool = False
+    min_component_size_ratio: float = 0.05
+
+
+@dataclass(frozen=True)
 class DifFlowPreprocessingConfig:
     fps_points: int = 2048
     second_candidate_ratio: float = 1.1
     final_selection: str = "uniform"
-    auto_spatial_scale: bool = True
-    target_model_volume: float = 2.0
-    fixed_spatial_scale: float = 1.0
+    auto_spatial_scale: DifFlowSpatialScaleConfig = field(
+        default_factory=DifFlowSpatialScaleConfig
+    )
+    outlier_filter: DifFlowOutlierFilterConfig = field(
+        default_factory=DifFlowOutlierFilterConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -119,6 +138,8 @@ class OutputConfig:
     publish_tracked_masks: bool = True
     publish_annotated_rgb: bool = True
     publish_flow_anchors: bool = True
+    # Independent from DifFlow's expensive detailed per-block text output.
+    publish_removed_outlier_points: bool = False
     # Maximum update rate for visualization-only ROS topics. 0 = unthrottled.
     visualization_publish_hz: float = 10.0
     velocity_marker_stride: int = 32
@@ -294,9 +315,49 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         **model_values,
     )
 
-    preprocessing = _construct(
-        DifFlowPreprocessingConfig,
-        _mapping(raw.get("preprocessing"), name="difflow.preprocessing"),
+    preprocessing_values = _mapping(
+        raw.get("preprocessing"), name="difflow.preprocessing"
+    )
+    spatial_scale_value = preprocessing_values.pop("auto_spatial_scale", None)
+    if isinstance(spatial_scale_value, bool):
+        # Keep older ScenePredictor deployments readable while the canonical
+        # configuration uses the nested DifFlow3D structure.
+        spatial_scale = DifFlowSpatialScaleConfig(
+            enable=spatial_scale_value,
+            target_model_volume=float(
+                preprocessing_values.pop("target_model_volume", 2.0)
+            ),
+            fixed_spatial_scale=float(
+                preprocessing_values.pop("fixed_spatial_scale", 1.0)
+            ),
+        )
+    else:
+        spatial_scale = _construct(
+            DifFlowSpatialScaleConfig,
+            _mapping(
+                spatial_scale_value,
+                name="difflow.preprocessing.auto_spatial_scale",
+            ),
+        )
+        if "target_model_volume" in preprocessing_values or (
+            "fixed_spatial_scale" in preprocessing_values
+        ):
+            raise ValueError(
+                "Move target_model_volume and fixed_spatial_scale under "
+                "difflow.preprocessing.auto_spatial_scale."
+            )
+
+    outlier_filter = _construct(
+        DifFlowOutlierFilterConfig,
+        _mapping(
+            preprocessing_values.pop("outlier_filter", None),
+            name="difflow.preprocessing.outlier_filter",
+        ),
+    )
+    preprocessing = DifFlowPreprocessingConfig(
+        auto_spatial_scale=spatial_scale,
+        outlier_filter=outlier_filter,
+        **preprocessing_values,
     )
     recovery = _construct(
         DifFlowRecoveryConfig,
@@ -311,6 +372,26 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         raise ValueError("difflow.preprocessing.second_candidate_ratio must be > 1")
     if preprocessing.final_selection not in {"fps", "uniform"}:
         raise ValueError("difflow.preprocessing.final_selection must be fps or uniform")
+    if preprocessing.auto_spatial_scale.target_model_volume <= 0.0:
+        raise ValueError(
+            "difflow.preprocessing.auto_spatial_scale.target_model_volume "
+            "must be positive"
+        )
+    if preprocessing.auto_spatial_scale.fixed_spatial_scale <= 0.0:
+        raise ValueError(
+            "difflow.preprocessing.auto_spatial_scale.fixed_spatial_scale "
+            "must be positive"
+        )
+    if not isinstance(preprocessing.outlier_filter.detailed_output, bool):
+        raise ValueError(
+            "difflow.preprocessing.outlier_filter.detailed_output must be boolean"
+        )
+    ratio = preprocessing.outlier_filter.min_component_size_ratio
+    if not 0.0 <= ratio < 1.0:
+        raise ValueError(
+            "difflow.preprocessing.outlier_filter."
+            "min_component_size_ratio must be in [0, 1)"
+        )
     if recovery.softmax_sigma_m <= 0.0:
         raise ValueError("difflow.recovery.softmax_sigma_m must be positive")
 
