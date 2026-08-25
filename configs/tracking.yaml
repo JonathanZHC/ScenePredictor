@@ -22,7 +22,7 @@ detector:
   # tracked_prompts + excluded_prompts. Standalone users should define prompts
   # in this file as before.
 
-  score_threshold: 0.4
+  score_threshold: 0.3
   duplicate_iou_threshold: 0.7
   min_mask_pixels: 10
 
@@ -63,8 +63,18 @@ tracker:
 
 postprocess:
   mask_threshold: 0.0
-  tracking_erosion_pixels: 2 # 1 for ZedX, 2 for isaacsim
+  tracking_erosion_pixels: 1 # 1 for ZedX, 2 for isaacsim
   exclusion_dilation_pixels: 1
+  # CUDA depth-boundary flyer filter for tracked masks (A/B switch). Applied after the
+  # residual fixed erosion above: a w-pixel 4-connected core is eroded, a per-instance
+  # threshold T = median + k*1.4826*MAD of core depth differences is estimated, and the
+  # boundary band is grown back only where |dD| < T. Set tracking_erosion_pixels to 0/1
+  # when enabling so the filter (not the fixed erosion) decides the boundary.
+  depth_boundary_filter:
+    enabled: true
+    erosion_width_px: 3
+    mad_multiplier: 3.0
+    min_threshold_m: 0.0   # floor for T (guards MAD = 0 on quantised depth); 0 = off
   min_component_pixels: 30
   min_valid_depth_m: 0.10
   max_valid_depth_m: 6.0
