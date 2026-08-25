@@ -307,6 +307,11 @@ import difflow3d
 from difflow3d.model import PointConvBidirection
 from difflow3d.runtime import DifFlow3DStreamingCudaGraphRunner, SoftmaxAnchorMotionRecoverer
 from difflow3d.ops.pointnet2 import pointnet2_utils
+# NVRTC-JIT kernels (DifFlow fused KNN / cross block, tracker depth-boundary
+# filter) compile lazily on the GPU at runtime; here only verify that the
+# torch-bundled libnvrtc is discoverable so the JIT path cannot silently fall
+# back to the slower eager code in the container.
+from difflow3d.ops import fused_cross_block, fused_knn, nvrtc_jit
 
 required = (
     'gaussian_softmax_recovery_wrapper',
@@ -328,6 +333,7 @@ if not str(loaded).startswith('/opt/DifFlow3D/difflow3d/ops/pointnet2/'):
     raise RuntimeError(f'Unexpected PointNet2 extension: {loaded}')
 if missing:
     raise RuntimeError(f'Missing DifFlow recovery CUDA symbols: {missing}')
+print('libnvrtc:', nvrtc_jit._find_nvrtc())
 print('[OK] build-time inference dependencies')
 PY
 

@@ -20,7 +20,11 @@ model:
 
 preprocessing:
   # Voxel-2 & FPS
-  fps_points: 2048
+  # 1024 matches the checkpoint's level-1 point count exactly: the encoder takes
+  # its exact-reuse branch (no level-1 FPS, one shared 32-NN) and every fine-level
+  # KNN/topk over N^2 shrinks 4x versus 2048. ~256-340 anchors per instance at
+  # 3-4 tracked instances.
+  fps_points: 1024
   second_candidate_ratio: 1.1
   final_selection: uniform
 

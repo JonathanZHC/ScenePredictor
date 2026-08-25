@@ -14,6 +14,7 @@ from sam_rgbd_tracking.config import load_config as load_tracker_config
 from sam_rgbd_tracking.multiview_component import MultiViewEfficientTAMComponent
 
 from .config import PipelineConfig
+from .cuda_streams import bind_pipeline_stream
 from .data_types import MultiCameraFrame, TrackedInstance, TrackedInstanceFrame
 
 
@@ -45,6 +46,9 @@ class MultiViewTrackerAdapter:
             max_workers=1,
             thread_name_prefix="scene-predictor-tracker-owner",
         )
+        # The owner thread issues all tracker/postprocess/alignment CUDA work on
+        # the shared high-priority pipeline stream (same object as the GPU worker).
+        self._run_owner(bind_pipeline_stream, torch.device(config.runtime.device))
         self.component: MultiViewEfficientTAMComponent = self._run_owner(
             MultiViewEfficientTAMComponent,
             tracker_config,
@@ -59,6 +63,28 @@ class MultiViewTrackerAdapter:
 
     def _run_owner(self, function: Callable[..., Any], /, *args, **kwargs):
         return self._owner.submit(function, *args, **kwargs).result()
+
+    def _stage_ids_and_lengths(
+        self, track_ids: tuple[int, ...], lengths: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Upload per-instance ids/lengths via reusable pinned buffers (non-blocking)."""
+        n = len(lengths)
+        host_ids = getattr(self, "_ids_host", None)
+        if host_ids is None or host_ids.shape[0] < n:
+            capacity = max(16, 2 * n)
+            self._ids_host = torch.empty(capacity, dtype=torch.int32, pin_memory=True)
+            self._lengths_host = torch.empty(capacity, dtype=torch.long, pin_memory=True)
+            self._ids_dev = torch.empty(capacity, dtype=torch.int32, device=self.device)
+            self._lengths_dev = torch.empty(capacity, dtype=torch.long, device=self.device)
+        host_ids = self._ids_host[:n]
+        host_lengths = self._lengths_host[:n]
+        host_ids.numpy()[:] = track_ids
+        host_lengths.numpy()[:] = lengths
+        ids_dev = self._ids_dev[:n]
+        lengths_dev = self._lengths_dev[:n]
+        ids_dev.copy_(host_ids, non_blocking=True)
+        lengths_dev.copy_(host_lengths, non_blocking=True)
+        return ids_dev, lengths_dev
 
     @staticmethod
     def _resolve_checkpoint(value: str, checkpoint_root: Path) -> str:
@@ -178,16 +204,22 @@ class MultiViewTrackerAdapter:
     def _to_tracked_frame(self, results: list[Any]) -> TrackedInstanceFrame:
         adapter_started = time.perf_counter()
         groups_started = time.perf_counter()
-        groups = self._run_owner(self.component.get_last_multiview_instances)
+        # Plain attribute read; the owner future for process_arrays_batch has
+        # already completed, so no thread hop is needed (saves ~50-100 us + a GIL
+        # handoff per frame).
+        groups = self.component.get_last_multiview_instances()
         adapter_get_groups_ms = 1000.0 * (time.perf_counter() - groups_started)
+
+        def _count(group) -> int:
+            if group.points_world is not None:
+                return int(len(group.points_world))
+            return int(getattr(group, "point_count", 0))
 
         valid_groups = sorted(
             (
                 group
                 for group in groups
-                if group.global_track_id is not None
-                and group.points_world is not None
-                and len(group.points_world) > 0
+                if group.global_track_id is not None and _count(group) > 0
             ),
             key=lambda group: int(group.global_track_id),
         )
@@ -198,7 +230,7 @@ class MultiViewTrackerAdapter:
         adapter_prepare_started = time.perf_counter()
 
         if valid_groups:
-            lengths = [int(len(group.points_world)) for group in valid_groups]
+            lengths = [_count(group) for group in valid_groups]
 
             # CrossFrameAligner already uploads every fused cloud for Chamfer.
             # Reuse those exact CUDA-bank views; silently falling back to another
@@ -244,8 +276,10 @@ class MultiViewTrackerAdapter:
             # The CrossFrame bank is ping-pong workspace and will be overwritten.
             # One D2D cat creates frame-owned storage without another CPU round trip.
             packed_gpu = torch.cat(clouds_gpu, dim=0)
-            id_values = torch.tensor(track_ids, dtype=torch.int32, device=self.device)
-            repeats = torch.tensor(lengths, dtype=torch.long, device=self.device)
+            # Tiny per-frame H2D through a persistent pinned staging pair instead
+            # of two pageable torch.tensor(...) uploads (each of which stalls the
+            # host behind the in-flight stream).
+            id_values, repeats = self._stage_ids_and_lengths(track_ids, lengths)
             packed_ids_gpu = torch.repeat_interleave(
                 id_values, repeats, output_size=int(sum(lengths))
             )
@@ -341,10 +375,9 @@ class MultiViewTrackerAdapter:
                 fallback_masks_per_view=fallback_masks,
             )
             if submitted:
-                self._run_owner(
-                    self.component.mark_sam3_submitted,
-                    int(reference_frames[0].frame_index),
-                )
+                # Single int attribute write; consumed by the owner thread on the
+                # next process_arrays_batch, which is ordered after this call.
+                self.component.mark_sam3_submitted(int(reference_frames[0].frame_index))
 
         return self._to_tracked_frame(results)
 

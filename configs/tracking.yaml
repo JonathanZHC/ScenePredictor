@@ -9,7 +9,10 @@ runtime:
 
 pointcloud:
   stride: 1
-  max_points_per_instance: 8192
+  # Sizes the per-record GPU geometry segments (two stable sorts + compaction run
+  # over records x this). 4096 is ample for 640x360 objects; DifFlow samples
+  # fps_points anchors from the union anyway.
+  max_points_per_instance: 4096
   transform_to_world: true
 
 # SAM3 is now a sparse asynchronous B=num_views detector. The initial SAM3 call
@@ -63,7 +66,7 @@ tracker:
 
 postprocess:
   mask_threshold: 0.0
-  tracking_erosion_pixels: 1 # 1 for ZedX, 2 for isaacsim
+  tracking_erosion_pixels: 1
   exclusion_dilation_pixels: 1
   # CUDA depth-boundary flyer filter for tracked masks (A/B switch). Applied after the
   # residual fixed erosion above: a w-pixel 4-connected core is eroded, a per-instance
@@ -81,6 +84,11 @@ postprocess:
 
   # Frozen CUDA geometry path. Set false only for standalone CPU/debug fallback.
   gpu_geometry: true
+  # Keep cross-view fusion + Chamfer staging on CUDA (no voxel-cloud D2H, NumPy
+  # fusion, or re-upload). Requires gpu_geometry and enable_visualization: false;
+  # cross-view *matching* still runs on CPU keys when >= 2 cameras. Set false to
+  # reproduce the legacy host round trip.
+  gpu_alignment: true
 
   # Eroded masks and prefetched depth feed the fused Warp
   # geometry backend directly. Compact voxel D2H and lazy CPU masks are
@@ -110,8 +118,12 @@ shared_voxel_grid:
 # shared_voxel_grid lattice before Chamfer, removing overlapping view samples.
 cross_frame_alignment:
   centroid_gate_m: 0.20
-  chamfer_max_workspace_mb: 512
-  chamfer_preallocate_points: 8192
+  # Small tiles keep the [pairs, chunk, points] distance workspace L2-resident and
+  # avoid a 268+ MB transient whose cudaMalloc/cudaFree caused 20 ms stalls.
+  chamfer_max_workspace_mb: 24
+  # Cross-view fusion can union num_views x max_points_per_instance points; size
+  # the pinned bank for that so it never reallocates mid-frame.
+  chamfer_preallocate_points: 16384
 
 profiling:
   enabled: true

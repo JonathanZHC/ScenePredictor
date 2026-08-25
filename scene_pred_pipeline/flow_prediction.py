@@ -175,6 +175,14 @@ class DifFlowPredictor:
         self._debug_pending_current = None
 
     @property
+    def outlier_filter_enabled(self) -> bool:
+        return bool(self.config.difflow.preprocessing.outlier_filter.enabled)
+
+    @property
+    def detailed_outlier_output(self) -> bool:
+        return self._detailed_outlier_output
+
+    @property
     def _detailed_outlier_output(self) -> bool:
         config = self.config.difflow.preprocessing.outlier_filter
         return bool(config.enabled and config.detailed_output)

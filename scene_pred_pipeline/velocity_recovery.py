@@ -40,6 +40,9 @@ class VelocityRecovery:
         self,
         pair: InstancePair,
         flow_result: FlowResult,
+        *,
+        query_points: torch.Tensor | None = None,
+        query_track_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Recover every retained current-frame point in one CUDA call.
 
@@ -47,11 +50,19 @@ class VelocityRecovery:
         passed into DifFlow3D's local CUDA kernel. The kernel rejects anchors
         from other instances inside the hash-grid traversal, avoiding the old
         per-track boolean gathers, repeated hash builds, and repeated launches.
+
+        ``query_points`` / ``query_track_ids`` are the already-retained current
+        points (the caller resolves the keep mask once). When omitted they are
+        derived from ``flow_result.target_input_keep_mask`` (one host sync).
         """
-        keep_mask = flow_result.target_input_keep_mask
-        if keep_mask.shape != (pair.current_points.shape[0],):
-            raise RuntimeError("DifFlow target keep mask does not match the input cloud")
-        current = pair.current_points[keep_mask]
+        if query_points is None or query_track_ids is None:
+            keep_mask = flow_result.target_input_keep_mask
+            if keep_mask.shape != (pair.current_points.shape[0],):
+                raise RuntimeError("DifFlow target keep mask does not match the input cloud")
+            keep_index = keep_mask.nonzero(as_tuple=True)[0]
+            query_points = pair.current_points.index_select(0, keep_index)
+            query_track_ids = pair.current_track_ids.index_select(0, keep_index)
+        current = query_points
         if current.shape[0] == 0:
             return torch.empty_like(current)
 
@@ -63,7 +74,7 @@ class VelocityRecovery:
                     "for the fused track-aware CUDA recovery path"
                 )
             kwargs = {
-                "query_track_ids": pair.current_track_ids[keep_mask],
+                "query_track_ids": query_track_ids,
                 "anchor_track_ids": flow_result.source_anchor_track_ids,
             }
 

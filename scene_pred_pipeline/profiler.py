@@ -36,6 +36,9 @@ class CycleProfiler:
         "sam3_async",
         "sam3_filter",
         "sam3_slot_assoc",
+        # ROS message building runs on the publisher thread, off the numerical
+        # critical path; reported here so its cost stays visible.
+        "publish_total",
     )
     _POST_CYCLE_DEBUG = ("outlier_debug",)
 
@@ -46,6 +49,9 @@ class CycleProfiler:
     ) -> None:
         self.cuda_enabled = bool(enabled and torch.cuda.is_available())
         self._cpu_start = 0.0
+        # Event pairs are created once per stage name and reused every cycle
+        # (cudaEventCreate/Destroy per stage per frame is avoidable overhead).
+        self._event_pool: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
         self._cuda_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
         self._cpu_starts: dict[str, float] = {}
         self._cpu_values: dict[str, float] = {}
@@ -75,10 +81,15 @@ class CycleProfiler:
 
     def start(self, name: str, *, cuda: bool = True) -> None:
         if cuda and self.cuda_enabled:
-            begin = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            begin.record()
-            self._cuda_events[name] = (begin, end)
+            pair = self._event_pool.get(name)
+            if pair is None:
+                pair = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                self._event_pool[name] = pair
+            pair[0].record()
+            self._cuda_events[name] = pair
         else:
             self._cpu_starts[name] = time.perf_counter()
 
@@ -93,6 +104,24 @@ class CycleProfiler:
 
     def record(self, name: str, value_ms: float) -> None:
         self._recorded[str(name)] = float(value_ms)
+
+    def record_async(self, name: str, value_ms: float) -> None:
+        """Append a sample measured on another thread (not part of cycle_total).
+
+        ``deque.append`` is atomic under the GIL, so this is safe to call from
+        the publisher thread while the worker records its own stages.
+        """
+        self._samples[str(name)].append(float(value_ms))
+
+    def snapshot(self) -> dict[str, object]:
+        """Cheap copy of the sample history for off-thread summary formatting."""
+        return {
+            "samples": {name: list(values) for name, values in self._samples.items()},
+            "outlier_samples": {
+                name: list(values) for name, values in self._outlier_samples.items()
+            },
+            "outlier_config": dict(self._outlier_config),
+        }
 
     def record_difflow_timings(
         self,
@@ -213,11 +242,13 @@ class CycleProfiler:
             output[name] = values
         return output
 
-    def summary(self) -> dict[str, dict[str, float]]:
-        return self._summarize(self._samples)
+    def summary(self, snapshot: dict[str, object] | None = None) -> dict[str, dict[str, float]]:
+        samples = self._samples if snapshot is None else snapshot["samples"]
+        return self._summarize(samples)
 
-    def outlier_summary(self) -> dict[str, dict[str, float]]:
-        return self._summarize(self._outlier_samples, include_sum=True)
+    def outlier_summary(self, snapshot: dict[str, object] | None = None) -> dict[str, dict[str, float]]:
+        samples = self._outlier_samples if snapshot is None else snapshot["outlier_samples"]
+        return self._summarize(samples, include_sum=True)
 
     @staticmethod
     def _format_row(label: str, values: dict[str, float], *, indent: int = 2) -> str:
@@ -229,8 +260,12 @@ class CycleProfiler:
             f"max={values['max']:7.3f}"
         )
 
-    def format_summary(self) -> str:
-        values = self.summary()
+    def format_summary(self, snapshot: dict[str, object] | None = None) -> str:
+        """Format the rolling summary; pass ``snapshot()`` to run off-thread."""
+        values = self.summary(snapshot)
+        outlier_config = (
+            self._outlier_config if snapshot is None else snapshot["outlier_config"]
+        )
         rows = ["End-to-end numerical cycle [ms]:"]
 
         def add(name: str, indent: int = 2, label: str | None = None) -> None:
@@ -265,13 +300,13 @@ class CycleProfiler:
             for name in self._POST_CYCLE_DEBUG:
                 add(name)
 
-        outlier = self.outlier_summary()
-        if bool(self._outlier_config.get("enabled", False)) and outlier:
+        outlier = self.outlier_summary(snapshot)
+        if bool(outlier_config.get("enabled", False)) and outlier:
             rows.extend(("", "Voxel outlier filter diagnostics:"))
             rows.append(
                 "  config: "
                 "min_component_size_ratio="
-                f"{float(self._outlier_config.get('min_component_size_ratio', 0.05)):.4f}"
+                f"{float(outlier_config.get('min_component_size_ratio', 0.05)):.4f}"
             )
 
             def add_outlier(name: str, label: str, *, show_sum: bool = False) -> None:

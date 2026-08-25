@@ -312,22 +312,30 @@ See `DifFlow3D/README.md` for runtime tests and benchmarks.
 
 `configs/tracking.yaml` owns native tracker/model behavior, including EfficientTAM execution, postprocessing, voxel matching, alignment, and tracker profiling. ScenePredictor injects `tracked_prompts + excluded_prompts` into the native detector at startup.
 
-The production postprocess optimization bundle is intentionally frozen. `postprocess.gpu_geometry: true` enables the validated CUDA path; the former independent A/B switches for direct geometry, compact D2H, depth prefetch, and lazy masks were removed.
+The production postprocess optimization bundle is intentionally frozen. `postprocess.gpu_geometry: true` enables the validated CUDA path; the former independent A/B switches for direct geometry, compact D2H, depth prefetch, and lazy masks were removed. Two newer switches sit on top of it:
 
-`configs/difflow.yaml` owns all DifFlow numerical settings. The current deployment uses 2048 sampled anchors with the configured coarse/middle/fine iterations and local track-aware CUDA recovery.
+- `postprocess.depth_boundary_filter` (`enabled`, `erosion_width_px`, `mad_multiplier`, `min_threshold_m`): CUDA depth-boundary flyer filter for tracked masks. It runs after the residual `tracking_erosion_pixels` erosion, erodes a w-pixel 4-connected core, estimates a per-instance threshold `T = median + k * 1.4826 * MAD` from the core's local depth differences and grows the boundary band back only where `|dD| < T` (sharp boundaries lose their flyers, curved surfaces keep their points). Kernels are JIT-compiled with NVRTC from the torch-bundled `libnvrtc`; no `nvcc` is needed at runtime. When enabled, set `tracking_erosion_pixels` to 0 or 1 so the filter decides the boundary.
+- `postprocess.gpu_alignment` (default `true`): cross-view fusion and Chamfer bank staging stay on CUDA (no voxel-cloud D2H, NumPy fusion or re-upload). With one camera no CPU voxel data is copied at all; with several cameras cross-view *matching* still runs on CPU keys. Multi-camera groups are concatenated without cross-view voxel dedup (DifFlow's voxel-2 dedups on its own grid). `false` restores the legacy host round trip, which is also used automatically when `enable_visualization: true`.
+
+`configs/difflow.yaml` owns all DifFlow numerical settings. The current deployment uses 1024 sampled anchors (the checkpoint's native level-1 count, which lets the encoder reuse one KNN across levels 0/1) with the configured coarse/middle/fine iterations and local track-aware CUDA recovery. DifFlow's decode path uses two NVRTC-JIT kernels (`difflow3d/ops/fused_knn.py`, exact register-heap KNN; `difflow3d/ops/fused_cross_block.py`, fused gather+add+activation prologue) with pure-PyTorch fallbacks; `USE_FUSED_KNN` / `USE_FUSED_CROSS_BLOCK` in `difflow3d/model/pointconv.py` toggle them, and `IDENTITY_UPSAMPLE_L1_TO_L0` in `difflow3d/model/difflow.py` controls the identity shortcut for the level-1 -> level-0 upsample at 1024 points.
+
+Runtime plumbing worth knowing when editing: all tracker/DifFlow work runs on one shared highest-priority CUDA stream (`scene_pred_pipeline/cuda_streams.py`, bound on the tracker owner thread and the GPU worker) while SAM3 keeps its own default-priority stream; ROS message building runs on a latest-only publisher thread (`_PublishWorker` in `scripts/run_scene_pred_pipeline.py`) and is reported as `publish_total` under the async diagnostics of the periodic summary; Python GC is frozen and disabled after warm-up with an explicit collect on the publisher thread; the summary also prints input drop counters (`dropped_bundles`, `unmatched_rgbd`, `unmatched_multiview`).
 
 ## 12. Current performance reference
 
-On an RTX 5090, using rosbag RGB-D input without Isaac Sim rendering contention, one representative run produced:
+On an RTX 5090 with a live ZED stream, one camera and three tracked instances (human + 2 mice), a representative run produced:
 
 ```text
-tracker_total   median 13.144 ms   p95 21.437 ms
-DifFlow3D       median  9.981 ms   p95 20.696 ms
-adapter_total   median  0.442 ms   p95  1.136 ms
-cycle_total     median 23.363 ms   p95 56.517 ms
+cycle_total     median 20.4 ms   p95 33.9 ms   max 40 ms
+  tracker_total   median 11.3 ms   p95 20.3 ms   (tracking_model 6.4, postprocess 1.5, alignment 2.3)
+  difflow_total   median  5.6 ms   p95 10.5 ms   (decode 3.3, encode 1.1, voxel-2 1.1)
+  velocity_recovery, instance_filter, cycle_other: < 0.1 / < 0.1 / ~0.5 ms
+sam3_async (off the cycle)   ~130 ms per refresh
 ```
 
-The typical-frame latency is comfortably below the 33.33 ms budget for 30 Hz. Tail latency remains workload/GPU-scheduling dependent, so compare changes using the same rosbag and profiling window.
+With two cameras and three instances the same pipeline measured ~29 ms median / ~53 ms p95. For reference, the pre-optimization baseline for that two-camera case was 45 ms median / 73 ms p95 (see the profiler summary printed every `output.profile_interval_frames`).
+
+The remaining tail is dominated by frames that overlap the asynchronous SAM3 refresh on the same GPU (every GPU stage shows p95 ~2x median on those frames); stream priority helps only partially because that contention is memory-bandwidth bound. Compare changes using the same rosbag and profiling window.
 
 ## 13. Design invariants
 
@@ -336,11 +344,12 @@ These are intentional and should not be changed casually during cleanup:
 1. EfficientTAM state has one owner thread; SAM3 refresh is asynchronous.
 2. Scene flow uses only `t-1 -> t`.
 3. DifFlow inference is one combined call over all common persistent instances.
-4. CPU alignment consumes compact voxel data; do not reintroduce full raw-cloud D2H.
-5. Cross-frame Chamfer uploads each fused cloud once and retains the previous bank on GPU.
-6. ScenePredictor reuses the already-uploaded CrossFrame bank and never silently performs a second fused-cloud CPU->GPU copy.
-7. RViz/debug output must not move expensive materialization back into the numerical critical path.
-8. Runtime cleanup must not add per-frame allocations/synchronizations to the hot path without benchmark evidence.
+4. Alignment consumes compact per-record metadata (counts, centroids, and CPU voxel keys only when several cameras must be matched); fused clouds stay on CUDA and are never copied to the host on the production path. Do not reintroduce full raw-cloud D2H.
+5. Cross-frame Chamfer stages each fused cloud once (device-to-device from the geometry buffers) and retains the previous bank on GPU.
+6. ScenePredictor reuses the already-staged CrossFrame bank and never silently performs a second fused-cloud CPU->GPU copy.
+7. RViz/debug output must not move expensive materialization back into the numerical critical path; publishing runs on its own thread.
+8. Runtime cleanup must not add per-frame allocations/synchronizations to the hot path without benchmark evidence. In particular, avoid adding small GPU kernels followed by a host sync inside CPU stages: while SAM3 occupies the GPU each such kernel can wait milliseconds for SM slots.
+9. Tracker, postprocess, alignment and DifFlow share one high-priority CUDA stream; any new stream must synchronize with it through events, not `torch.cuda.synchronize()`.
 
 ## 14. Stop
 
@@ -349,6 +358,15 @@ These are intentional and should not be changed casually during cleanup:
 ```
 
 ## Development hygiene
+
+Unit tests run inside the container with the inference venv (GPU tests skip themselves without CUDA):
+
+```bash
+docker exec scenepredictor bash -lc 'cd /workspace && PYTHONPATH=/workspace:/workspace/MultiViewRGBDTracker:/opt/DifFlow3D \
+  /opt/tracking-venv/bin/python -m unittest discover -s tests -p "test_*.py"'
+```
+
+`tests/test_depth_boundary_filter.py`, `tests/test_gpu_alignment.py`, `tests/test_gpu_geometry_centroids.py`, `tests/test_difflow_fused_ops.py` and `tests/test_perf_fixes.py` check the CUDA paths above against NumPy/legacy references. Note that DifFlow runs from the image copy in `/opt/DifFlow3D`; after editing the `DifFlow3D` submodule either rebuild the image or copy the changed files there.
 
 Do not commit generated runtime/build data such as:
 

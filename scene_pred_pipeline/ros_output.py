@@ -639,37 +639,32 @@ class RosVisualizer:
         dt_s = float(output.flow_dt_s)
         factor = float(self.config.output.velocity_marker_scale_factor)
         scale = dt_s * factor
-        for index, (point, vector) in enumerate(zip(points, velocity)):
-            if not (np.isfinite(point).all() and np.isfinite(vector).all()):
-                continue
 
-            marker = Marker()
-            marker.header.stamp = _stamp_message(self.node, output.stamp_ns)
-            marker.header.frame_id = self.config.ros.world_frame
-            marker.ns = "predicted_velocity"
-            marker.id = index
-            marker.type = Marker.ARROW
-            marker.action = Marker.ADD
-            marker.pose.orientation.x = 0.0
-            marker.pose.orientation.y = 0.0
-            marker.pose.orientation.z = 0.0
-            marker.pose.orientation.w = 1.0
-            marker.scale.x = 0.003
-            marker.scale.y = 0.006
-            marker.scale.z = 0.008
-            marker.color.r = 1.0
-            marker.color.g = 0.25
-            marker.color.b = 0.05
-            marker.color.a = 1.0
-            marker.points = [
-                Point(x=float(point[0]), y=float(point[1]), z=float(point[2])),
-                Point(
-                    x=float(point[0] + scale * vector[0]),
-                    y=float(point[1] + scale * vector[1]),
-                    z=float(point[2] + scale * vector[2]),
-                ),
-            ]
-            array.markers.append(marker)
+        # One LINE_LIST marker (segment i = points[2i], points[2i+1]) instead of
+        # one ARROW marker per point: ~2000 Marker objects with headers/poses and
+        # a clock call each took 10-100 ms of Python per publish.
+        valid = np.isfinite(points).all(axis=1) & np.isfinite(velocity).all(axis=1)
+        starts = points[valid].astype(np.float64)
+        ends = starts + scale * velocity[valid].astype(np.float64)
+        segments = np.empty((2 * starts.shape[0], 3), dtype=np.float64)
+        segments[0::2] = starts
+        segments[1::2] = ends
+
+        marker = Marker()
+        marker.header.stamp = delete.header.stamp
+        marker.header.frame_id = self.config.ros.world_frame
+        marker.ns = "predicted_velocity"
+        marker.id = 0
+        marker.type = Marker.LINE_LIST
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.003  # line width
+        marker.color.r = 1.0
+        marker.color.g = 0.25
+        marker.color.b = 0.05
+        marker.color.a = 1.0
+        marker.points = [Point(x=x, y=y, z=z) for x, y, z in segments.tolist()]
+        array.markers.append(marker)
         self.marker_pub.publish(array)
 
     def publish(self, output: SceneVelocityOutput) -> None:

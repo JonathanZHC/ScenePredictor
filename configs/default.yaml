@@ -7,8 +7,11 @@ ros:
   camera_frame: "{camera}_color_optical_frame"
   queue_depth: 4
   # Orbbec RGB/depth stamps differ by ~0.15-0.20 ms in the current D2C stream.
-  # Pair each camera locally using RGB as the canonical view timestamp.
-  sync_slop_seconds: 0.001
+  # Pair each camera locally using RGB as the canonical view timestamp. 5 ms is
+  # still far below one frame period (33 ms) but tolerates stamp jitter that
+  # used to drop bundles (-> dt > flow.max_frame_gap_s -> DifFlow reset). The
+  # periodic summary reports unmatched_rgbd / unmatched_multiview counts.
+  sync_slop_seconds: 0.005
   # Only used when camera_names contains multiple cameras.
   multiview_sync_slop_seconds: 0.01
   tf_timeout_ms: 10.0
@@ -21,7 +24,7 @@ tracker:
   # semantics; tracking.yaml owns only tracker/model/postprocess behavior.
   tracked_prompts:
     - [human, 1]
-    # - [mouse, 2]
+    - [mouse, 2]
     # - [ball, 1]
     # - [red mug, 1]
     # - [mustard bottle, 1]
@@ -69,6 +72,7 @@ output:
   # Per-block text logs are controlled separately by detailed_output in
   # difflow.yaml.
   profile_interval_frames: 30
+
 
 runtime:
   device: cuda

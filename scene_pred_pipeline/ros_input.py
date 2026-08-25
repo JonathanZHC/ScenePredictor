@@ -135,6 +135,11 @@ class MultiCameraRosInput:
         self.last_emitted_stamp_ns: int | None = None
         self.subscriptions = []
         self._last_tf_warning_s: dict[str, float] = {}
+        # Diagnostics: images discarded because no partner arrived within the
+        # sync slop (per camera RGB<->depth) or across views. Non-zero counts
+        # mean sync_slop_seconds / multiview_sync_slop_seconds are too tight.
+        self.dropped_rgb_depth = 0
+        self.dropped_multiview = 0
 
         # The main ScenePredictor node is spun by rclpy.spin() in a single
         # executor thread. Use a dedicated TF node/thread so a timestamped
@@ -267,12 +272,14 @@ class MultiCameraRosInput:
         newest_depth = depths[-1][0]
         while rgbs and rgbs[0][0] < newest_depth - self.sync_slop_ns:
             rgbs.pop(0)
+            self.dropped_rgb_depth += 1
 
         if not rgbs or not depths:
             return
         newest_rgb = rgbs[-1][0]
         while depths and depths[0][0] < newest_rgb - self.sync_slop_ns:
             depths.pop(0)
+            self.dropped_rgb_depth += 1
 
     def _select_multiview_candidate_locked(
         self,
@@ -326,6 +333,7 @@ class MultiCameraRosInput:
             pairs = self.local_pairs[camera]
             while pairs and pairs[0].stamp_ns < cutoff:
                 pairs.pop(0)
+                self.dropped_multiview += 1
 
     def _candidate_is_current_locked(
         self,

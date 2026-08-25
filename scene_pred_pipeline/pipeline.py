@@ -59,10 +59,19 @@ class ScenePredictionPipeline:
         return torch.device(self.config.runtime.device)
 
     def _empty_points(self) -> torch.Tensor:
-        return torch.empty((0, 3), device=self.device, dtype=torch.float32)
+        # Immutable zero-length tensors: allocate once instead of 6-9 per frame.
+        cached = getattr(self, "_empty_points_cache", None)
+        if cached is None:
+            cached = torch.empty((0, 3), device=self.device, dtype=torch.float32)
+            self._empty_points_cache = cached
+        return cached
 
     def _empty_ids(self) -> torch.Tensor:
-        return torch.empty((0,), device=self.device, dtype=torch.int32)
+        cached = getattr(self, "_empty_ids_cache", None)
+        if cached is None:
+            cached = torch.empty((0,), device=self.device, dtype=torch.int32)
+            self._empty_ids_cache = cached
+        return cached
 
     def _all_tracked_points(
         self,
@@ -171,27 +180,41 @@ class ScenePredictionPipeline:
                 # DifFlow is always present. It owns adaptive voxel-2, exact-count
                 # selection, frozen world/model scaling, and CUDA-Graph inference.
                 with self.profiler.stage("difflow_total", cuda=True):
-                    flow_result = self.flow_predictor.predict(
-                        pair,
-                        track_labels={
+                    # track_labels feed only the detailed outlier debug report.
+                    track_labels = None
+                    if self.flow_predictor.detailed_outlier_output:
+                        track_labels = {
                             int(instance.global_track_id): instance.semantic_label
                             for instance in current.instances
-                        },
-                    )
+                        }
+                    flow_result = self.flow_predictor.predict(pair, track_labels=track_labels)
+
+                # Boolean-mask indexing on CUDA runs nonzero() and syncs the host
+                # to size the result. With the outlier filter disabled the keep
+                # mask is all-ones by construction, so alias the inputs (zero
+                # syncs, zero copies). When enabled, resolve the indices once and
+                # share them with recovery (1 sync instead of 5).
+                total_points = int(pair.current_points.shape[0])
+                if not self.flow_predictor.outlier_filter_enabled:
+                    flow_points = pair.current_points
+                    flow_track_ids = pair.current_track_ids
+                    dense_filter_counts = (total_points, total_points, 0)
+                    removed_outlier_points = self._empty_points()
+                else:
+                    target_keep = flow_result.target_input_keep_mask
+                    keep_index = target_keep.nonzero(as_tuple=True)[0]
+                    flow_points = pair.current_points.index_select(0, keep_index)
+                    flow_track_ids = pair.current_track_ids.index_select(0, keep_index)
+                    kept = int(keep_index.shape[0])
+                    dense_filter_counts = (total_points, kept, total_points - kept)
+                    if self.config.output.publish_removed_outlier_points:
+                        removed_index = (~target_keep).nonzero(as_tuple=True)[0]
+                        removed_outlier_points = pair.current_points.index_select(0, removed_index)
 
                 with self.profiler.stage("velocity_recovery", cuda=True):
-                    flow_velocity = self.recovery.recover(pair, flow_result)
-
-                target_keep = flow_result.target_input_keep_mask
-                flow_points = pair.current_points[target_keep]
-                flow_track_ids = pair.current_track_ids[target_keep]
-                dense_filter_counts = (
-                    int(pair.current_points.shape[0]),
-                    int(flow_points.shape[0]),
-                    int(pair.current_points.shape[0] - flow_points.shape[0]),
-                )
-                if self.config.output.publish_removed_outlier_points:
-                    removed_outlier_points = pair.current_points[~target_keep]
+                    flow_velocity = self.recovery.recover(
+                        pair, flow_result, query_points=flow_points, query_track_ids=flow_track_ids
+                    )
                 flow_dt_s = float(pair.dt_s)
                 source_anchors = flow_result.source_anchors
                 warped_anchors = flow_result.warped_anchors
