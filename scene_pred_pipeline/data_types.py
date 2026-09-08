@@ -103,3 +103,10 @@ class SceneVelocityOutput:
     # Populated only when outlier_filter.detailed_output is enabled. It is text
     # diagnostics only; removed-point visualization is independent of it.
     outlier_debug: dict[str, Any] = field(default_factory=dict)
+    # Merged full-scene cloud (see SceneCloudConfig / scene_assembly.py). CUDA
+    # tensors in the world frame; this is the in-process interface consumed by
+    # the safety filter. None when scene_cloud.enabled is false.
+    scene_points: torch.Tensor | None = None        # [N, 3] float32, meters
+    scene_velocity: torch.Tensor | None = None      # [N, 3] float32, m/s (0 for rest points)
+    scene_track_ids: torch.Tensor | None = None     # [N] int32 (0 for rest points)
+    scene_num_dynamic: int = 0                      # rows [0, n) carry recovered velocity

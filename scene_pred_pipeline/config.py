@@ -130,6 +130,25 @@ class DifFlowConfig:
 
 
 @dataclass(frozen=True)
+class SceneCloudConfig:
+    """Merged full-scene cloud built on the GPU at the end of every cycle.
+
+    rows [0, num_dynamic)  tracked-instance points with DifFlow/recovered velocity
+    rows [num_dynamic, N)  rest-scene points (dense depth minus tracked/excluded
+                           masks, voxel-deduplicated) with zero velocity, track id 0
+    This is the product consumed in-process by the safety filter.
+    """
+
+    enabled: bool = True
+    include_rest_points: bool = True
+    # Optional axis-aligned crop in the world frame (meters). None = no crop.
+    workspace_min: tuple[float, float, float] | None = None
+    workspace_max: tuple[float, float, float] | None = None
+    # Throttled ROS copy (/scene_predictor/scene_cloud) for RViz / recording. 0 disables.
+    publish_hz: float = 5.0
+
+
+@dataclass(frozen=True)
 class OutputConfig:
     publish_tracked_objects: bool = True
     publish_rest_scene: bool = True
@@ -164,6 +183,7 @@ class PipelineConfig:
     flow: FlowConfig = field(default_factory=FlowConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    scene_cloud: SceneCloudConfig = field(default_factory=SceneCloudConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     # Loaded from flow.config_path; it is intentionally not duplicated inside
     # the ScenePredictor default.yaml.
@@ -408,6 +428,34 @@ def load_config(path: str | Path) -> PipelineConfig:
     with config_path.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     raw = _mapping(raw, name=f"ScenePredictor config {config_path}")
+    return load_config_from_mapping(raw, base_dir=config_path.parent)
+
+
+def _scene_cloud_config(value: Any) -> SceneCloudConfig:
+    values = dict(_mapping(value, name="scene_cloud"))
+    for key in ("workspace_min", "workspace_max"):
+        if values.get(key) is not None:
+            bounds = tuple(float(v) for v in values[key])
+            if len(bounds) != 3:
+                raise ValueError(f"scene_cloud.{key} must have 3 entries")
+            values[key] = bounds
+    cfg = _construct(SceneCloudConfig, values)
+    if (cfg.workspace_min is None) != (cfg.workspace_max is None):
+        raise ValueError("scene_cloud.workspace_min and workspace_max must be set together")
+    if cfg.publish_hz < 0.0 or not math.isfinite(cfg.publish_hz):
+        raise ValueError("scene_cloud.publish_hz must be finite and >= 0")
+    return cfg
+
+
+def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> PipelineConfig:
+    """Build a PipelineConfig from an already-parsed mapping.
+
+    Relative paths (tracker/flow config_path, repo_path) resolve against
+    ``base_dir``. Used by load_config() and by embedding applications whose
+    own yaml carries the ScenePredictor settings as one section.
+    """
+    raw = _mapping(raw, name="ScenePredictor config")
+    base_dir = Path(base_dir)
 
     flow_values = _mapping(raw.get("flow"), name="flow")
     if "enabled" in flow_values:
@@ -422,7 +470,6 @@ def load_config(path: str | Path) -> PipelineConfig:
             "configuration."
         )
 
-    base_dir = config_path.parent
     if "config_path" in flow_values:
         flow_values["config_path"] = _resolve_from(
             base_dir, str(flow_values["config_path"])
@@ -471,6 +518,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
 
     tracker = _tracker_config(raw.get("tracker"), base_dir=base_dir)
+    scene_cloud = _scene_cloud_config(raw.get("scene_cloud"))
 
     return PipelineConfig(
         ros=ros,
@@ -478,6 +526,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         flow=flow,
         recovery=_construct(RecoveryConfig, raw.get("recovery")),
         output=output,
+        scene_cloud=scene_cloud,
         runtime=_construct(RuntimeConfig, raw.get("runtime")),
         difflow=difflow,
     )

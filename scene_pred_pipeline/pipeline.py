@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import torch
 
 from .config import PipelineConfig
@@ -11,6 +13,7 @@ from .data_types import (
 from .flow_prediction import DifFlowPredictor
 from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
+from .scene_assembly import SceneCloudAssembler
 from .tracker_adapter import MultiViewTrackerAdapter
 from .velocity_recovery import VelocityRecovery
 
@@ -50,6 +53,13 @@ class ScenePredictionPipeline:
         )
         self.instance_filter = CommonInstanceFilter()
         self.recovery = VelocityRecovery(config)
+        # Full-scene cloud (tracked points + velocity, rest points + zero velocity)
+        # for in-process consumers such as the safety filter.
+        self.scene_assembler = (
+            SceneCloudAssembler(config, tracker_config=self.tracker.tracker_config)
+            if config.scene_cloud.enabled
+            else None
+        )
         self.profiler = CycleProfiler(config.runtime.enable_cuda_timing)
         self.previous_tracked: TrackedInstanceFrame | None = None
         self.last_flow_gap_s: float | None = None
@@ -114,7 +124,7 @@ class ScenePredictionPipeline:
             tracked_points, tracked_ids = self._all_tracked_points(tracked)
             view_results = tracked.view_results
         timings = self.profiler.finish()
-        return SceneVelocityOutput(
+        output = SceneVelocityOutput(
             stamp_ns=int(frame.stamp_ns if tracked is None else tracked.stamp_ns),
             flow_dt_s=0.0,
             tracked_points=tracked_points,
@@ -130,6 +140,15 @@ class ScenePredictionPipeline:
             flow_valid=False,
             timings_ms=timings,
         )
+        self._assemble_scene(output)
+        return output
+
+    def _assemble_scene(self, output: SceneVelocityOutput) -> None:
+        if self.scene_assembler is None:
+            return
+        started = time.perf_counter()
+        self.scene_assembler.assemble(output)
+        self.profiler.record_async("scene_assembly", 1000.0 * (time.perf_counter() - started))
 
     def process(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
         self.profiler.start_cycle()
@@ -240,7 +259,7 @@ class ScenePredictionPipeline:
                 timings["difflow_total"],
             )
             self.profiler.record_outlier_filter(outlier_filter_info)
-        return SceneVelocityOutput(
+        output = SceneVelocityOutput(
             stamp_ns=int(current.stamp_ns),
             flow_dt_s=flow_dt_s,
             tracked_points=tracked_points,
@@ -258,6 +277,8 @@ class ScenePredictionPipeline:
             outlier_filter_info=outlier_filter_info,
             outlier_debug=outlier_debug,
         )
+        self._assemble_scene(output)
+        return output
 
     def close(self) -> None:
         self.tracker.close()
