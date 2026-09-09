@@ -23,12 +23,14 @@ from .data_types import SceneVelocityOutput
 _EXCLUDED_OVERLAY_COLOR = np.asarray([255, 70, 220], dtype=np.uint8)
 
 
+# Tracked-instance colors. Red is deliberately absent: downstream (safety filter)
+# reserves red for the critical CBF constraint points.
 _PALETTE = np.asarray(
     [
-        [230, 80, 80],
+        [245, 150, 40],
         [80, 210, 120],
         [80, 150, 240],
-        [235, 190, 70],
+        [235, 220, 70],
         [180, 90, 225],
         [70, 210, 215],
     ],
@@ -447,9 +449,10 @@ class RosVisualizer:
         marker.action = Marker.ADD
         marker.pose.orientation.w = 1.0
         marker.scale.x = 0.003  # line width
-        marker.color.r = 1.0
-        marker.color.g = 0.25
-        marker.color.b = 0.05
+        # Cyan velocity vectors (red is reserved for CBF critical points).
+        marker.color.r = 0.1
+        marker.color.g = 0.9
+        marker.color.b = 1.0
         marker.color.a = 1.0
         marker.points = [Point(x=x, y=y, z=z) for x, y, z in segments.tolist()]
         array.markers.append(marker)
@@ -537,7 +540,7 @@ class RosVisualizer:
                     output.removed_outlier_points,
                     output.stamp_ns,
                     frame,
-                    (255, 40, 40),
+                    (170, 70, 220),
                 )
             )
 
