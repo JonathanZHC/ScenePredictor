@@ -31,6 +31,17 @@ class TrackerConfig:
     tracked_prompts: tuple[tuple[str, int], ...] = (("human", 1),)
     excluded_prompts: tuple[tuple[str, int], ...] = ()
 
+    @property
+    def static_only(self) -> bool:
+        """No tracked classes: the pipeline skips SAM3/EfficientTAM/DifFlow and the merged
+        scene cloud is the dense static background with zero velocity (pure obstacle avoidance)."""
+        return len(self.tracked_prompts) == 0
+
+    @property
+    def max_tracked_instances(self) -> int:
+        """Upper bound on simultaneously tracked instances (sum of per-class capacities)."""
+        return int(sum(capacity for _, capacity in self.tracked_prompts))
+
 
 @dataclass(frozen=True)
 class FlowConfig:
@@ -141,6 +152,14 @@ class SceneCloudConfig:
 
     enabled: bool = True
     include_rest_points: bool = True
+    # Voxel size of the rest-scene lattice. None = reuse the tracker's
+    # shared_voxel_grid.voxel_size_m (5 mm by default); a larger value downsamples
+    # the cloud handed to the safety filter. Required in static-only mode.
+    voxel_size_m: float | None = None
+    # Depth validity range for the rest scene when no tracker config is available
+    # (static-only mode); with a tracker its postprocess limits are used.
+    depth_min_m: float = 0.15
+    depth_max_m: float = 5.0
     # Optional axis-aligned crop in the world frame (meters). None = no crop.
     workspace_min: tuple[float, float, float] | None = None
     workspace_max: tuple[float, float, float] | None = None
@@ -273,10 +292,13 @@ def _tracker_config(value: Any, *, base_dir: Path) -> TrackerConfig:
             "The same semantic class cannot be both tracked and excluded: "
             + ", ".join(sorted(overlap))
         )
-    if not tracked:
+    # An explicitly empty tracked_prompts list selects the static-only mode (no
+    # tracker, no DifFlow; see TrackerConfig.static_only). excluded_prompts are
+    # meaningless without a tracker.
+    if not tracked and excluded:
         raise ValueError(
-            "tracker.tracked_prompts must contain at least one class; the current "
-            "3-D alignment workspace is sized from tracked classes only"
+            "tracker.excluded_prompts requires at least one tracked class "
+            "(static-only mode has no tracker to apply exclusions)"
         )
 
     if "config_path" in values:
@@ -442,6 +464,10 @@ def _scene_cloud_config(value: Any) -> SceneCloudConfig:
     cfg = _construct(SceneCloudConfig, values)
     if (cfg.workspace_min is None) != (cfg.workspace_max is None):
         raise ValueError("scene_cloud.workspace_min and workspace_max must be set together")
+    if cfg.voxel_size_m is not None and not (math.isfinite(cfg.voxel_size_m) and cfg.voxel_size_m > 0.0):
+        raise ValueError("scene_cloud.voxel_size_m must be a positive number or null")
+    if not (0.0 <= cfg.depth_min_m < cfg.depth_max_m):
+        raise ValueError("scene_cloud.depth_min_m/depth_max_m must satisfy 0 <= min < max")
     if cfg.publish_hz < 0.0 or not math.isfinite(cfg.publish_hz):
         raise ValueError("scene_cloud.publish_hz must be finite and >= 0")
     return cfg
@@ -519,6 +545,11 @@ def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> Pi
 
     tracker = _tracker_config(raw.get("tracker"), base_dir=base_dir)
     scene_cloud = _scene_cloud_config(raw.get("scene_cloud"))
+    if tracker.static_only and scene_cloud.enabled and scene_cloud.voxel_size_m is None:
+        raise ValueError(
+            "static-only mode (empty tracker.tracked_prompts) needs scene_cloud.voxel_size_m, "
+            "since no tracker lattice is available to reuse"
+        )
 
     return PipelineConfig(
         ros=ros,

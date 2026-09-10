@@ -116,7 +116,7 @@ class ScenePredictorNode(Node):
         self.visualizer = RosVisualizer(
             self,
             self.config,
-            tracker_config=self.pipeline.tracker.tracker_config,
+            tracker_config=self.pipeline.tracker_config,
         )
 
         self._condition = threading.Condition()

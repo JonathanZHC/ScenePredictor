@@ -32,31 +32,40 @@ class ScenePredictionPipeline:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-        # Load/patch the upstream tracker configuration once. DifFlow needs the
-        # tracker output voxel resolution before any GPU model is constructed,
-        # while its CUDA graphs still need to be captured before tracker CUDA
-        # graphs/streams exist.
-        tracker_config = MultiViewTrackerAdapter.prepare_native_config(config)
-        upstream_voxel_size_m = MultiViewTrackerAdapter.output_voxel_size_m(
-            tracker_config
-        )
+        # Static-only mode (tracker.tracked_prompts == []): no SAM3/EfficientTAM, no
+        # DifFlow; every cycle emits the dense static background with zero velocity.
+        self.static_only = bool(config.tracker.static_only)
+        self.tracker = None
+        self.flow_predictor = None
+        self.instance_filter = None
+        self.recovery = None
+        tracker_config = None
+        if not self.static_only:
+            # Load/patch the upstream tracker configuration once. DifFlow needs the
+            # tracker output voxel resolution before any GPU model is constructed,
+            # while its CUDA graphs still need to be captured before tracker CUDA
+            # graphs/streams exist.
+            tracker_config = MultiViewTrackerAdapter.prepare_native_config(config)
+            upstream_voxel_size_m = MultiViewTrackerAdapter.output_voxel_size_m(
+                tracker_config
+            )
 
-        self.flow_predictor = DifFlowPredictor(
-            config,
-            upstream_voxel_size_m=upstream_voxel_size_m,
-        )
-        self.flow_predictor.prepare()
+            self.flow_predictor = DifFlowPredictor(
+                config,
+                upstream_voxel_size_m=upstream_voxel_size_m,
+            )
+            self.flow_predictor.prepare()
 
-        self.tracker = MultiViewTrackerAdapter(
-            config,
-            tracker_config=tracker_config,
-        )
-        self.instance_filter = CommonInstanceFilter()
-        self.recovery = VelocityRecovery(config)
+            self.tracker = MultiViewTrackerAdapter(
+                config,
+                tracker_config=tracker_config,
+            )
+            self.instance_filter = CommonInstanceFilter()
+            self.recovery = VelocityRecovery(config)
         # Full-scene cloud (tracked points + velocity, rest points + zero velocity)
         # for in-process consumers such as the safety filter.
         self.scene_assembler = (
-            SceneCloudAssembler(config, tracker_config=self.tracker.tracker_config)
+            SceneCloudAssembler(config, tracker_config=tracker_config)
             if config.scene_cloud.enabled
             else None
         )
@@ -67,6 +76,11 @@ class ScenePredictionPipeline:
     @property
     def device(self) -> torch.device:
         return torch.device(self.config.runtime.device)
+
+    @property
+    def tracker_config(self):
+        """Native tracker config, or None in static-only mode."""
+        return self.tracker.tracker_config if self.tracker is not None else None
 
     def _empty_points(self) -> torch.Tensor:
         # Immutable zero-length tensors: allocate once instead of 6-9 per frame.
@@ -140,19 +154,23 @@ class ScenePredictionPipeline:
             flow_valid=False,
             timings_ms=timings,
         )
-        self._assemble_scene(output)
+        self._assemble_scene(output, frame)
         return output
 
-    def _assemble_scene(self, output: SceneVelocityOutput) -> None:
+    def _assemble_scene(self, output: SceneVelocityOutput, frame: MultiCameraFrame) -> None:
         if self.scene_assembler is None:
             return
         started = time.perf_counter()
-        self.scene_assembler.assemble(output)
+        self.scene_assembler.assemble(output, frame)
         self.profiler.record_async("scene_assembly", 1000.0 * (time.perf_counter() - started))
 
     def process(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
         self.profiler.start_cycle()
         self.last_flow_gap_s = None
+
+        if self.static_only:
+            # Whole scene = static background with zero velocity (built in _assemble_scene).
+            return self._empty_output(frame, None)
 
         with self.profiler.stage("tracker_total", cuda=False):
             current = self.tracker.process(frame)
@@ -277,8 +295,9 @@ class ScenePredictionPipeline:
             outlier_filter_info=outlier_filter_info,
             outlier_debug=outlier_debug,
         )
-        self._assemble_scene(output)
+        self._assemble_scene(output, frame)
         return output
 
     def close(self) -> None:
-        self.tracker.close()
+        if self.tracker is not None:
+            self.tracker.close()
