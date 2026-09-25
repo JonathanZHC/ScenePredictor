@@ -110,3 +110,7 @@ class SceneVelocityOutput:
     scene_velocity: torch.Tensor | None = None      # [N, 3] float32, m/s (0 for rest points)
     scene_track_ids: torch.Tensor | None = None     # [N] int32 (0 for rest points)
     scene_num_dynamic: int = 0                      # rows [0, n) carry recovered velocity
+    # Points that entered the scene assembly this cycle: every dynamic point plus every valid,
+    # non-excluded depth pixel of every camera BEFORE the voxel dedup / workspace crop, i.e. the
+    # raw perception count that scene_points was downsampled from.
+    scene_num_input: int = 0

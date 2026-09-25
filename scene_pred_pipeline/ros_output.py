@@ -228,10 +228,15 @@ class RosVisualizer:
     ) -> None:
         self.node = node
         self.config = config
+        # RELIABLE + keep-last(1): a reliable publisher matches subscribers that ask for either
+        # reliability (a best-effort publisher is refused by reliable subscribers, e.g. an RViz
+        # display added by hand, which defaults to reliable: "requesting incompatible QoS ...
+        # No messages will be sent"). Depth 1 keeps it latest-only; on one host the transport is
+        # shared memory, so reliability costs nothing measurable.
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
         output = config.output
 

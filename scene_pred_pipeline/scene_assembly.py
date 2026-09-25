@@ -39,6 +39,7 @@ class SceneCloudAssembler:
         self._ray_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
         self._origin: torch.Tensor | None = None
         self._inv_voxel_size = 0.0
+        self.last_rest_input = 0   # valid depth pixels of all views in the last rest-scene build (before dedup)
         self._min_depth_m = 0.0
         self._max_depth_m = float("inf")
         if self.scene_cfg.include_rest_points:
@@ -58,6 +59,19 @@ class SceneCloudAssembler:
             dyn_points = output.flow_points
             dyn_velocity = output.flow_velocity
             dyn_ids = output.flow_track_ids
+            # Tracked instances without a flow estimate this cycle (an id seen for the first
+            # time, e.g. after a cross-view split or a new detection) must not vanish from the
+            # cloud: keep their points with zero velocity so the safety filter still sees them.
+            tracked_ids = output.tracked_track_ids
+            if tracked_ids.shape[0] > 0 and output.common_track_ids:
+                common = torch.as_tensor(list(output.common_track_ids), dtype=tracked_ids.dtype, device=tracked_ids.device)
+                missing = ~torch.isin(tracked_ids, common)
+                if bool(missing.any()):
+                    idx = missing.nonzero(as_tuple=True)[0]
+                    extra_points = output.tracked_points.index_select(0, idx)
+                    dyn_points = torch.cat((dyn_points.to(extra_points.device), extra_points), dim=0)
+                    dyn_velocity = torch.cat((dyn_velocity.to(extra_points.device), torch.zeros_like(extra_points)), dim=0)
+                    dyn_ids = torch.cat((dyn_ids.to(extra_points.device), tracked_ids.index_select(0, idx)), dim=0)
         else:
             dyn_points = output.tracked_points
             dyn_velocity = torch.zeros_like(dyn_points)
@@ -66,6 +80,7 @@ class SceneCloudAssembler:
         dyn_velocity = dyn_velocity.to(self.device, torch.float32)
         dyn_ids = dyn_ids.to(self.device, torch.int32)
 
+        self.last_rest_input = 0
         if self.scene_cfg.include_rest_points:
             if output.view_results:
                 rest = self.rest_scene_points(output)
@@ -75,6 +90,7 @@ class SceneCloudAssembler:
                 rest = torch.empty((0, 3), dtype=torch.float32, device=self.device)
         else:
             rest = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+        num_input = int(dyn_points.shape[0]) + int(self.last_rest_input)
 
         points = torch.cat((dyn_points, rest), dim=0)
         velocity = torch.cat((dyn_velocity, torch.zeros_like(rest)), dim=0)
@@ -95,6 +111,7 @@ class SceneCloudAssembler:
         output.scene_velocity = velocity.contiguous()
         output.scene_track_ids = track_ids.contiguous()
         output.scene_num_dynamic = num_dynamic
+        output.scene_num_input = num_input
 
     # ------------------------------------------------------------------ rest scene (moved from RosVisualizer)
     def _configure_rest_scene(self, tracker_config: Any | None) -> None:
@@ -205,6 +222,7 @@ class SceneCloudAssembler:
         views: iterable of (depth_m [H,W] float32 numpy, (fx, fy, cx, cy), world_from_camera 4x4/3x4, excluded mask [H,W] bool tensor or None)
         """
         empty = torch.empty((0, 3), dtype=torch.float32, device=self.device)
+        self.last_rest_input = 0
         if self._origin is None:
             return empty
         all_points: list[torch.Tensor] = []
@@ -236,6 +254,7 @@ class SceneCloudAssembler:
             valid.logical_and_(in_key_range)
             keys = (shifted[:, 0] << 42) | (shifted[:, 1] << 21) | shifted[:, 2]
             keys.masked_fill_(~valid, invalid_key)
+            self.last_rest_input += int(valid.sum().item())
             all_points.append(points_world)
             all_keys.append(keys)
         if not all_points:

@@ -102,27 +102,43 @@ postprocess:
   # Disable it to avoid a full HxW allocation/zero-fill per camera per frame.
   build_owner_map: false
 
-# Same-time, different-camera geometry alignment. World voxels are sparse keys;
-# no dense 3-D volume is allocated.
+# Same-time, different-camera association. Per-instance world AABBs come from the shared
+# voxel lattice (sparse keys, no dense volume).
 shared_voxel_grid:
-  voxel_size_m: 0.005
+  voxel_size_m: 0.01
   origin_world: [0.0, 0.0, 0.0]
+  # association: containment (default) | coverage (legacy).
+  #   containment: intersection volume of the two AABBs / smaller AABB volume >= min_containment_ratio.
+  #     View-invariant for solid objects: a human seen from the front and from the back has almost
+  #     identical boxes although the visible surfaces are ~25 cm apart; a partial view lies inside
+  #     the full one. Two people side by side have disjoint boxes (ratio 0).
+  #   coverage: bidirectional voxel-surface coverage within match_radius_voxels (fails for
+  #     non-overlapping surfaces, needs ~1 cm extrinsic accuracy).
+  association: containment
+  min_containment_ratio: 0.5
+  # Hysteresis on each (camera slot, camera slot) pair: merge after merge_confirm_frames
+  # consecutive passes, split after split_confirm_frames consecutive failures. EfficientTAM
+  # keeps a per-camera slot on the same object, so the pairing survives frames in which the
+  # geometric test flickers.
+  merge_confirm_frames: 2
+  split_confirm_frames: 5
+  # legacy coverage parameters
   match_radius_voxels: 1
   min_alignment_score: 0.15
   min_bidirectional_coverage: 0.20
   # Optional bounded per-object local occupancy acceleration; never a global grid.
   max_local_dense_voxels: 1000000
 
-# Different-time alignment: class+centroid hard gate -> batched GPU Chamfer ->
-# Hungarian. Cross-view output is voxel-deduplicated once more on the same
-# shared_voxel_grid lattice before Chamfer, removing overlapping view samples.
+# Different-time association (global ids): AABB containment between a track's last box and the
+# current observations, oldest track first; no motion model (a walking person moves ~5 cm per
+# frame, far less than its box). Unmatched tracks keep their id for max_age_s. Time-based
+# (frame stamps), no point-to-point distances.
 cross_frame_alignment:
-  centroid_gate_m: 0.20
-  # Small tiles keep the [pairs, chunk, points] distance workspace L2-resident and
-  # avoid a 268+ MB transient whose cudaMalloc/cudaFree caused 20 ms stalls.
+  min_containment_ratio: 0.5   # intersection volume / smaller box volume (same criterion as cross-view)
+  centre_margin_m: 0.15        # a box containing the other box's centre (expanded by this) always matches
+  max_age_s: 0.5               # keep an unobserved id for this long
+  # Fused clouds are still staged into a persistent CUDA bank for the ScenePredictor adapter:
   chamfer_max_workspace_mb: 24
-  # Cross-view fusion can union num_views x max_points_per_instance points; size
-  # the pinned bank for that so it never reallocates mid-frame.
   chamfer_preallocate_points: 16384
 
 profiling:

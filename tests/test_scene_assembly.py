@@ -121,3 +121,15 @@ def test_tracker_lattice_is_default_but_override_wins():
     asm_default = SceneCloudAssembler(PipelineConfig(scene_cloud=SceneCloudConfig()), tracker_config=tc)
     asm_override = SceneCloudAssembler(PipelineConfig(scene_cloud=SceneCloudConfig(voxel_size_m=0.03)), tracker_config=tc)
     assert asm_default.voxel_size_m == 0.005 and asm_override.voxel_size_m == 0.03
+
+
+def test_scene_num_input_counts_raw_points_before_dedup():
+    # 8x8 view, left half excluded -> 32 valid depth pixels enter the rest build; with a coarse
+    # lattice they collapse to a handful of voxels, but scene_num_input reports the raw count.
+    cfg = PipelineConfig(scene_cloud=SceneCloudConfig(include_rest_points=True, voxel_size_m=0.5))
+    asm = SceneCloudAssembler(cfg, tracker_config=_tracker_config(voxel=0.5))
+    out = _output(n_dyn=50, view_results={"cam": _fake_view()})
+    asm.assemble(out)
+    assert out.scene_num_input == 50 + 32
+    assert out.scene_points.shape[0] < out.scene_num_input
+    assert out.scene_num_dynamic == 50
