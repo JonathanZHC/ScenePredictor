@@ -105,7 +105,7 @@ postprocess:
 # Same-time, different-camera association. Per-instance world AABBs come from the shared
 # voxel lattice (sparse keys, no dense volume).
 shared_voxel_grid:
-  voxel_size_m: 0.01
+  voxel_size_m: 0.005
   origin_world: [0.0, 0.0, 0.0]
   # association: containment (default) | coverage (legacy).
   #   containment: intersection volume of the two AABBs / smaller AABB volume >= min_containment_ratio.
