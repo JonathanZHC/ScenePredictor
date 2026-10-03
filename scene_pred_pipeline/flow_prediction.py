@@ -112,6 +112,17 @@ class DifFlowPredictor:
         self.unexpected_keys = tuple(self.checkpoint_report.unexpected_keys)
 
         self.model = model.to(self.device).eval()
+        configure_dense = getattr(self.model, "configure_dense_points", None)
+        if configure_dense is not None:
+            configure_dense(
+                fast_top_level_min_points=int(difflow.model.fast_top_level_min_points),
+                hier_cosine_min_points=int(difflow.model.hier_cosine_min_points),
+            )
+        elif difflow.model.fast_top_level_min_points or difflow.model.hier_cosine_min_points:
+            raise RuntimeError(
+                "This DifFlow3D checkout has no configure_dense_points(); "
+                "disable the dense-input options or update flow.repo_path"
+            )
         if difflow.model.disable_bn_running_stats:
             for layer in self.model.modules():
                 if isinstance(layer, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
@@ -148,6 +159,12 @@ class DifFlowPredictor:
             ),
             enable_profiling=bool(self.config.runtime.enable_cuda_timing),
             validate_finite=bool(difflow.runtime.validate_finite),
+            point_buckets=(
+                tuple(int(value) for value in prep.point_buckets)
+                if prep.point_buckets is not None
+                else None
+            ),
+            sort_anchors_morton=bool(prep.sort_anchors_morton),
         )
 
     def prepare(self) -> None:

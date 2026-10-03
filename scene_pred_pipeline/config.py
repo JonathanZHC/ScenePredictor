@@ -87,6 +87,11 @@ class DifFlowModelConfig:
     uncertainty: float = 0.20
     strict_checkpoint: bool = True
     disable_bn_running_stats: bool = True
+    # Dense-input shortcuts (frames with at least this many anchors; 0 = off):
+    # level-1 selection by strided indices instead of FPS, and hierarchical
+    # feature-space KNN at the fine level. Weights are untouched.
+    fast_top_level_min_points: int = 0
+    hier_cosine_min_points: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,9 +112,17 @@ class DifFlowOutlierFilterConfig:
 
 @dataclass(frozen=True)
 class DifFlowPreprocessingConfig:
+    # Maximum anchor count (CUDA graphs are captured per bucket, see below).
     fps_points: int = 2048
     second_candidate_ratio: float = 1.1
     final_selection: str = "uniform"
+    # Exact anchor counts to run at. A frame uses the largest bucket <= its
+    # candidate count, so points are never duplicated unless the frame has
+    # fewer than the smallest bucket (1024, the network minimum). None = only
+    # fps_points (legacy repeat-padding behaviour).
+    point_buckets: tuple[int, ...] | None = None
+    # Morton-sort the anchors; required for model.fast_top_level_min_points.
+    sort_anchors_morton: bool = False
     auto_spatial_scale: DifFlowSpatialScaleConfig = field(
         default_factory=DifFlowSpatialScaleConfig
     )
@@ -414,6 +427,18 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         raise ValueError("difflow.preprocessing.second_candidate_ratio must be > 1")
     if preprocessing.final_selection not in {"fps", "uniform"}:
         raise ValueError("difflow.preprocessing.final_selection must be fps or uniform")
+    if preprocessing.point_buckets is not None:
+        buckets = [int(value) for value in preprocessing.point_buckets]
+        if not buckets or min(buckets) < 1024 or max(buckets) > preprocessing.fps_points:
+            raise ValueError(
+                "difflow.preprocessing.point_buckets must lie in "
+                "[1024, fps_points]"
+            )
+    if model.fast_top_level_min_points > 0 and not preprocessing.sort_anchors_morton:
+        raise ValueError(
+            "difflow.model.fast_top_level_min_points requires "
+            "difflow.preprocessing.sort_anchors_morton: true"
+        )
     if preprocessing.auto_spatial_scale.target_model_volume <= 0.0:
         raise ValueError(
             "difflow.preprocessing.auto_spatial_scale.target_model_volume "

@@ -17,16 +17,26 @@ model:
   uncertainty: 0.10
   strict_checkpoint: true
   disable_bn_running_stats: true
+  # Dense-input shortcuts for frames with at least this many anchors (0 = off).
+  # Measured on the recorded human (6144-8192 anchors): -1.9 ms (hierarchical
+  # cosine KNN) and -2.6 ms (strided level-1 selection) with unchanged accuracy.
+  # Below 4096 anchors neither pays off, so they stay off for small objects.
+  fast_top_level_min_points: 4096
+  hier_cosine_min_points: 4096
 
 preprocessing:
-  # Voxel-2 & FPS
-  # 1024 matches the checkpoint's level-1 point count exactly: the encoder takes
-  # its exact-reuse branch (no level-1 FPS, one shared 32-NN) and every fine-level
-  # KNN/topk over N^2 shrinks 4x versus 2048. ~256-340 anchors per instance at
-  # 3-4 tracked instances.
-  fps_points: 1024
+  # Exact anchor counts. fps_points is the maximum; a frame runs at the largest
+  # bucket <= its candidate count (1 cm voxel points of the tracked objects), so
+  # points are never duplicated unless there are fewer than 1024 (the network
+  # minimum). A person at ~1.5 m is 5-7k voxel points -> 5120/6144 anchors;
+  # error floor on static points 1.5 mm vs 5 mm at 1024 anchors. Voxel-2 only
+  # engages above second_candidate_ratio * fps_points points (several people).
+  fps_points: 8192
+  point_buckets: [1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
   second_candidate_ratio: 1.1
   final_selection: uniform
+  # Z-order sort of the anchors (needed by model.fast_top_level_min_points).
+  sort_anchors_morton: true
 
   # Runs after adaptive voxel-2 and before exact-count selection/FPS.
   outlier_filter:
