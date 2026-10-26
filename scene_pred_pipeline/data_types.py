@@ -73,6 +73,13 @@ class FlowResult:
     # Mask over InstancePair.current_points. Rejected dense points must not be
     # passed to motion recovery, otherwise they still receive velocities.
     target_input_keep_mask: torch.Tensor
+    # Only with the DifFlow uncertainty head, rows aligned with anchor_flow:
+    # covariance Sigma of each anchor's one-pair displacement [M, 3, 3] (m^2) and
+    # the scale s [M] of the configured calibration region at the configured level
+    # (ellipsoid: d^T Sigma^-1 d <= s^2; ball: |d| <= s det(Sigma)^(1/6); Mondrian
+    # bin of |anchor_flow| or the global value; see DifFlowUncertaintyCalibrationConfig).
+    anchor_flow_cov: torch.Tensor | None = None
+    anchor_flow_cov_scale: torch.Tensor | None = None
 
 
 @dataclass
@@ -114,3 +121,9 @@ class SceneVelocityOutput:
     # non-excluded depth pixel of every camera BEFORE the voxel dedup / workspace crop, i.e. the
     # raw perception count that scene_points was downsampled from.
     scene_num_input: int = 0
+    # Track id of every flow anchor (rows of source_anchors / warped_anchors).
+    anchor_track_ids: torch.Tensor | None = None
+    # Flow uncertainty, rows aligned with warped_anchors; None without the DifFlow
+    # uncertainty head or without a valid flow pair (see FlowResult).
+    anchor_flow_cov: torch.Tensor | None = None          # [M, 3, 3] float32, m^2
+    anchor_flow_cov_scale: torch.Tensor | None = None    # [M] calibration scale s (FlowResult)

@@ -199,6 +199,9 @@ class ScenePredictionPipeline:
         flow_dt_s = 0.0
         source_anchors = self._empty_points()
         warped_anchors = self._empty_points()
+        anchor_track_ids = self._empty_ids()
+        anchor_flow_cov = None
+        anchor_flow_cov_scale = None
         common_ids: tuple[int, ...] = ()
         flow_valid = False
         outlier_filter_info: dict[str, object] = {}
@@ -255,6 +258,9 @@ class ScenePredictionPipeline:
                 flow_dt_s = float(pair.dt_s)
                 source_anchors = flow_result.source_anchors
                 warped_anchors = flow_result.warped_anchors
+                anchor_track_ids = flow_result.source_anchor_track_ids
+                anchor_flow_cov = flow_result.anchor_flow_cov
+                anchor_flow_cov_scale = flow_result.anchor_flow_cov_scale
                 flow_valid = True
 
         # Visualization is deliberately absent from the numerical critical path.
@@ -294,6 +300,9 @@ class ScenePredictionPipeline:
             timings_ms=timings,
             outlier_filter_info=outlier_filter_info,
             outlier_debug=outlier_debug,
+            anchor_track_ids=anchor_track_ids,
+            anchor_flow_cov=anchor_flow_cov,
+            anchor_flow_cov_scale=anchor_flow_cov_scale,
         )
         self._assemble_scene(output, frame)
         return output

@@ -319,6 +319,20 @@ The production postprocess optimization bundle is intentionally frozen. `postpro
 
 `configs/difflow.yaml` owns all DifFlow numerical settings. The current deployment uses 1024 sampled anchors (the checkpoint's native level-1 count, which lets the encoder reuse one KNN across levels 0/1) with the configured coarse/middle/fine iterations and local track-aware CUDA recovery. DifFlow's decode path uses two NVRTC-JIT kernels (`difflow3d/ops/fused_knn.py`, exact register-heap KNN; `difflow3d/ops/fused_cross_block.py`, fused gather+add+activation prologue) with pure-PyTorch fallbacks; `USE_FUSED_KNN` / `USE_FUSED_CROSS_BLOCK` in `difflow3d/model/pointconv.py` toggle them, and `IDENTITY_UPSAMPLE_L1_TO_L0` in `difflow3d/model/difflow.py` controls the identity shortcut for the level-1 -> level-0 upsample at 1024 points.
 
+Optional flow uncertainty, off by default:
+
+- **Head.** `uncertainty_head` in the DifFlow config loads a per-anchor flow covariance head that runs inside the DifFlow decode CUDA graphs. Per anchor it gives `Sigma`, the covariance of the anchor's one-frame displacement.
+- **Calibration.** `uncertainty_head.calibration` holds conformal tables per region kind, under `tables.ellipsoid` and `tables.ball`, each with `global.scales` and `mondrian.edges_mm` + `mondrian.scales`. `region`, `mode` and `level` select the scale `s`:
+  - `region: ellipsoid` (default): the true displacement minus the predicted one, `d`, satisfies `d^T Sigma^-1 d <= s^2` with probability `level`.
+  - `region: ball`: `|d| <= s det(Sigma)^(1/6)` with probability `level`.
+  - `mode: mondrian` (default) uses one scale per bin of the predicted displacement; `mode: global` uses one scale.
+- **Where the tables are valid.** Only for the backbone, head and preprocessing they were fitted with. That includes `model.level1_points` (level-1 size, default 1024, upstream DifFlow3D 2048; every point bucket other than 1024 must be at least this large), `fps_points`, the point buckets and the dense shortcuts.
+- **Normalisation.** `preprocessing.canonical_normalization` replaces `auto_spatial_scale` for checkpoints fine-tuned on canonically normalised inputs. It is required when the head's checkpoint meta says `canonical: True`.
+- **Output.** `SceneVelocityOutput.anchor_flow_cov` and `anchor_flow_cov_scale` carry `Sigma` and `s`.
+- **Markers.** `output.publish_uncertainty_markers` (on by default; no topic without the head) draws the calibrated regions at the velocity-line tips on `/scene_predictor/flow_uncertainty_markers` (RViz display *Flow Uncertainty*). An ellipsoid is drawn with covariance `factor^2 s^2 Sigma` and a ball with radius `factor s det(Sigma)^(1/6)`, where `factor = velocity_marker_scale_factor`. The colour is the one-frame equal-volume radius `s det(Sigma)^(1/6)` on a log ramp from 2 to 30 mm. There are at most `uncertainty_marker_max` markers (default 150), published at most at `uncertainty_marker_publish_hz` (default 10, applied on top of `visualization_publish_hz`; a rate at or above `visualization_publish_hz` publishes them with every visualization update, on the same frames as the velocity lines). All rate gates are phase-locked, so frames faster than a rate give that average rate.
+
+The umbrella repository's `configs/difflow_zu.yaml` is a calibrated example. Its README section "Flow uncertainty" explains the meaning, the limits and how to recalibrate.
+
 Runtime plumbing worth knowing when editing: all tracker/DifFlow work runs on one shared highest-priority CUDA stream (`scene_pred_pipeline/cuda_streams.py`, bound on the tracker owner thread and the GPU worker) while SAM3 keeps its own default-priority stream; ROS message building runs on a latest-only publisher thread (`_PublishWorker` in `scripts/run_scene_pred_pipeline.py`) and is reported as `publish_total` under the async diagnostics of the periodic summary; Python GC is frozen and disabled after warm-up with an explicit collect on the publisher thread; the summary also prints input drop counters (`dropped_bundles`, `unmatched_rgbd`, `unmatched_multiview`).
 
 ## 12. Current performance reference

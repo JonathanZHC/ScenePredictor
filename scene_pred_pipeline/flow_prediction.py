@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from pathlib import Path
 import sys
 import time
@@ -8,7 +9,12 @@ import time
 import numpy as np
 import torch
 
-from .config import PipelineConfig
+from .config import (
+    DifFlowModelConfig,
+    DifFlowUncertaintyCalibrationConfig,
+    PipelineConfig,
+    check_uncertainty_head_meta,
+)
 from .data_types import FlowResult, InstancePair
 
 
@@ -21,12 +27,86 @@ _NEIGHBOR_OFFSETS = tuple(
 )
 
 
+class AnchorCalibrationScale:
+    """Per-anchor conformal scale of the configured region at the configured level.
+
+    The scale s of calibration.region: ellipsoid d^T Sigma^-1 d <= s^2, ball
+    |d| <= s det(Sigma)^(1/6). Mondrian: scale of the bin of |flow| in mm, bin i
+    holding edges_mm[i-1] <= |flow| < edges_mm[i] (np.digitize, as in the
+    calibration). Global: one scale. Device lookup tables, no host synchronization.
+    """
+
+    def __init__(
+        self,
+        calibration: DifFlowUncertaintyCalibrationConfig,
+        device: torch.device | str,
+    ) -> None:
+        self.region = str(calibration.region)
+        self.mode = str(calibration.mode)
+        if self.mode == "mondrian":
+            self._edges_mm = torch.tensor(
+                calibration.table().mondrian_edges_mm, dtype=torch.float32, device=device
+            )
+            scales = calibration.mondrian_bin_scales()
+        elif self.mode == "global":
+            self._edges_mm = None
+            scales = (calibration.global_scale(),)
+        else:
+            raise ValueError(f"Unknown calibration mode {self.mode!r}")
+        self._scales = torch.tensor(scales, dtype=torch.float32, device=device)
+
+    def __call__(self, flow_world: torch.Tensor) -> torch.Tensor:
+        """Scale [M] for the anchor displacements ``flow_world`` [M, 3] (m)."""
+        if self._edges_mm is None:
+            return self._scales.expand(flow_world.shape[0]).clone()
+        return self.for_displacement_mm(
+            torch.linalg.vector_norm(flow_world.float(), dim=-1) * 1000.0
+        )
+
+    def for_displacement_mm(self, displacement_mm: torch.Tensor) -> torch.Tensor:
+        """Scale for predicted displacement magnitudes in mm (any shape)."""
+        if self._edges_mm is None:
+            return self._scales.expand(displacement_mm.shape).clone()
+        bins = torch.bucketize(displacement_mm.float(), self._edges_mm, right=True)
+        return self._scales[bins]
+
+
+def _build_model(model_class, model_config: DifFlowModelConfig):
+    """DifFlow model with the configured recurrent iterations and level-1 size."""
+    iterations = model_config.iterations
+    kwargs: dict[str, int] = {
+        "iters": max(iterations.coarse, iterations.middle, iterations.fine),
+        "coarse_iters": iterations.coarse,
+        "middle_iters": iterations.middle,
+        "fine_iters": iterations.fine,
+    }
+    level1_points = int(model_config.level1_points)
+    if "level1_points" in inspect.signature(model_class).parameters:
+        kwargs["level1_points"] = level1_points
+    elif level1_points != 1024:
+        # Older DifFlow3D checkouts fix level 1 at 1024 points.
+        raise RuntimeError(
+            "This DifFlow3D checkout has no PointConvBidirection(level1_points=...); "
+            "set difflow.model.level1_points: 1024 or update flow.repo_path"
+        )
+    return model_class(**kwargs)
+
+
+def _resolve_checkpoint(repo_path: Path, value: str) -> Path:
+    """Absolute paths stay, relative ones resolve against flow.repo_path."""
+    checkpoint = Path(value).expanduser()
+    if not checkpoint.is_absolute():
+        checkpoint = repo_path / checkpoint
+    return checkpoint.resolve()
+
+
 class DifFlowPredictor:
     """Always-on adapter for DifFlow3D's production streaming runner.
 
     ScenePredictor passes the tracker's first-downsampled world cloud directly
     into DifFlow. DifFlow owns adaptive voxel-2 reduction, exact-count selection,
-    frozen spatial scaling, CUDA-Graph inference, and world-space anchor outputs.
+    frozen spatial scaling (or canonical normalisation), CUDA-Graph inference
+    (optionally with the flow covariance head), and world-space anchor outputs.
 
     Encoder reuse is valid only when the previous source is exactly the target
     buffered by the last pair. Both timestamp and common-ID signature are used
@@ -90,18 +170,9 @@ class DifFlowPredictor:
 
         difflow = config.difflow
         configure_fast(difflow.runtime.enable_tf32)
-        iterations = difflow.model.iterations
-        model = model_class(
-            iters=max(iterations.coarse, iterations.middle, iterations.fine),
-            coarse_iters=iterations.coarse,
-            middle_iters=iterations.middle,
-            fine_iters=iterations.fine,
-        )
+        model = _build_model(model_class, difflow.model)
 
-        checkpoint = Path(difflow.model.checkpoint).expanduser()
-        if not checkpoint.is_absolute():
-            checkpoint = repo_path / checkpoint
-        checkpoint = checkpoint.resolve()
+        checkpoint = _resolve_checkpoint(repo_path, difflow.model.checkpoint)
 
         self.checkpoint_report = load_checkpoint(
             model,
@@ -128,6 +199,28 @@ class DifFlowPredictor:
                 if isinstance(layer, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)):
                     layer.track_running_stats = False
 
+        # Optional flow covariance head, replayed inside the decode CUDA graphs.
+        self.uncertainty_head = None
+        self.uncertainty_head_meta: dict[str, object] | None = None
+        self.calibration_scale: AnchorCalibrationScale | None = None
+        head_config = difflow.uncertainty_head
+        if head_config.enable:
+            load_head = getattr(runtime_module, "load_flow_covariance_head", None)
+            if load_head is None:
+                raise RuntimeError(
+                    "This DifFlow3D checkout has no load_flow_covariance_head(); "
+                    "disable difflow uncertainty_head or update flow.repo_path"
+                )
+            head, meta = load_head(
+                _resolve_checkpoint(repo_path, head_config.checkpoint), self.device
+            )
+            check_uncertainty_head_meta(meta, difflow)
+            self.uncertainty_head = head
+            self.uncertainty_head_meta = dict(meta)
+            self.calibration_scale = AnchorCalibrationScale(
+                head_config.calibration, self.device
+            )
+
     def _ensure_runner(self) -> None:
         if self.runner is not None:
             return
@@ -136,6 +229,22 @@ class DifFlowPredictor:
         prep = difflow.preprocessing
         spatial_scale = prep.auto_spatial_scale
         outlier_filter = prep.outlier_filter
+        # Optional runner features are passed only when enabled, so older
+        # DifFlow3D checkouts keep working with the defaults.
+        optional: dict[str, object] = {}
+        canonical = prep.canonical_normalization
+        if canonical.enable:
+            normalization_module = importlib.import_module(
+                "difflow3d.runtime.normalization"
+            )
+            optional["normalization"] = normalization_module.AnchoredNormalization(
+                model_center=tuple(canonical.model_center),
+                model_radius=float(canonical.model_radius),
+                scale_ratio=float(canonical.scale_ratio),
+                center_shift=float(canonical.center_shift),
+            )
+        if self.uncertainty_head is not None:
+            optional["uncertainty_head"] = self.uncertainty_head
         self.runner = self.runner_class(
             self.model,
             batch_size=1,
@@ -165,7 +274,12 @@ class DifFlowPredictor:
                 else None
             ),
             sort_anchors_morton=bool(prep.sort_anchors_morton),
+            **optional,
         )
+        if self.uncertainty_head is not None and not getattr(
+            self.runner, "has_uncertainty", False
+        ):
+            raise RuntimeError("DifFlow3D runner did not accept the uncertainty head")
 
     def prepare(self) -> None:
         """Capture DifFlow CUDA graphs before tracker CUDA graphs are created."""
@@ -509,12 +623,21 @@ class DifFlowPredictor:
             if self.runner.replay_next() is None:
                 raise RuntimeError("DifFlow3D did not produce a pair output")
 
+            anchor_flow = self.runner.flow_world()[0]
+            anchor_flow_cov = None
+            anchor_flow_cov_scale = None
+            if self.uncertainty_head is not None:
+                assert self.calibration_scale is not None
+                anchor_flow_cov = self.runner.flow_cov_world()[0]
+                anchor_flow_cov_scale = self.calibration_scale(anchor_flow)
             result = FlowResult(
                 source_anchors=self.runner.source_points_world()[0],
                 warped_anchors=self.runner.warped_points_world()[0],
-                anchor_flow=self.runner.flow_world()[0],
+                anchor_flow=anchor_flow,
                 source_anchor_track_ids=self.runner.source_point_ids(),
                 target_input_keep_mask=self.runner.target_input_keep_mask(),
+                anchor_flow_cov=anchor_flow_cov,
+                anchor_flow_cov_scale=anchor_flow_cov_scale,
             )
             self._last_target_preprocess_info = (
                 self.runner.target_preprocess_info()

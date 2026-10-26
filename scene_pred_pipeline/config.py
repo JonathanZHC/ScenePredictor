@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection, Mapping
 
 import yaml
 
@@ -92,6 +92,10 @@ class DifFlowModelConfig:
     # feature-space KNN at the fine level. Weights are untouched.
     fast_top_level_min_points: int = 0
     hier_cosine_min_points: int = 0
+    # Pyramid level-1 size for inputs above 1024 anchors (a 1024-anchor input is
+    # level 1 itself). Upstream DifFlow3D samples 2048; every point bucket other
+    # than 1024 must be at least this large.
+    level1_points: int = 1024
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,24 @@ class DifFlowSpatialScaleConfig:
     enable: bool = True
     target_model_volume: float = 2.0
     fixed_spatial_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class DifFlowCanonicalNormalizationConfig:
+    """Piecewise-constant canonical normalisation (difflow3d.runtime.normalization).
+
+    x_model = k (x_world - c) + model_center with k = model_radius / anchor RMS
+    radius; one transform per pair, re-anchored only when the RMS radius drifts by
+    more than scale_ratio or the centroid by more than center_shift anchor radii.
+    Replaces auto_spatial_scale (enable at most one of them). Defaults are the
+    FT3D_s train medians the canonical checkpoints were fine-tuned with.
+    """
+
+    enable: bool = False
+    model_center: tuple[float, float, float] = (-0.52, -1.57, 21.36)
+    model_radius: float = 8.97
+    scale_ratio: float = 1.5
+    center_shift: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -126,6 +148,9 @@ class DifFlowPreprocessingConfig:
     auto_spatial_scale: DifFlowSpatialScaleConfig = field(
         default_factory=DifFlowSpatialScaleConfig
     )
+    canonical_normalization: DifFlowCanonicalNormalizationConfig = field(
+        default_factory=DifFlowCanonicalNormalizationConfig
+    )
     outlier_filter: DifFlowOutlierFilterConfig = field(
         default_factory=DifFlowOutlierFilterConfig
     )
@@ -141,6 +166,82 @@ class DifFlowRecoveryConfig:
     chunk_size: int = 4096
 
 
+CALIBRATION_REGIONS = ("ellipsoid", "ball")
+CALIBRATION_MODES = ("global", "mondrian")
+
+
+@dataclass(frozen=True)
+class DifFlowCalibrationTable:
+    """Conformal scales of one region kind.
+
+    ``global_scales`` maps level -> scale; ``mondrian_scales`` maps level -> one
+    scale per bin of the predicted displacement |flow| in mm, bin i holding
+    mondrian_edges_mm[i-1] <= |flow| < mondrian_edges_mm[i] (np.digitize).
+    """
+
+    global_scales: tuple[tuple[float, float], ...] = ()
+    mondrian_edges_mm: tuple[float, ...] = ()
+    mondrian_scales: tuple[tuple[float, tuple[float, ...]], ...] = ()
+
+
+@dataclass(frozen=True)
+class DifFlowUncertaintyCalibrationConfig:
+    """Conformal calibration of the flow covariance head.
+
+    Sigma is the covariance of an anchor's one-pair displacement. With the scale s
+    at coverage ``level`` and d = true minus predicted displacement, d lies in the
+    calibrated region with probability ``level``:
+
+    * ``region: ellipsoid``: d^T Sigma^-1 d <= s^2 (the ellipsoid s * chol(Sigma));
+    * ``region: ball``: |d| <= s * det(Sigma)^(1/6).
+
+    ``mode: global`` uses one scale per level, ``mondrian`` one per bin of the
+    predicted displacement. Each region kind has its own tables; they hold only
+    for the backbone, head and preprocessing they were fitted with (``source``).
+    """
+
+    region: str = "ellipsoid"
+    mode: str = "mondrian"
+    level: float = 0.95
+    # Free-text provenance of the tables (dataset, split, checkpoints, preprocessing).
+    source: str = ""
+    ellipsoid: DifFlowCalibrationTable = field(default_factory=DifFlowCalibrationTable)
+    ball: DifFlowCalibrationTable = field(default_factory=DifFlowCalibrationTable)
+
+    def table(self) -> DifFlowCalibrationTable:
+        """Tables of the configured region."""
+        if self.region not in CALIBRATION_REGIONS:
+            raise ValueError(
+                "difflow.uncertainty_head.calibration.region must be ellipsoid or ball, "
+                f"got {self.region!r}"
+            )
+        return getattr(self, self.region)
+
+    def global_scale(self) -> float:
+        """Global scale of the configured region at ``level``."""
+        return float(
+            _level_entry(self.table().global_scales, self.level, name=f"{self.region} global")
+        )
+
+    def mondrian_bin_scales(self) -> tuple[float, ...]:
+        """Per-bin scales of the configured region at ``level`` (len(edges_mm) + 1 entries)."""
+        return tuple(
+            _level_entry(self.table().mondrian_scales, self.level, name=f"{self.region} mondrian")
+        )
+
+
+@dataclass(frozen=True)
+class DifFlowUncertaintyHeadConfig:
+    """Optional per-anchor flow covariance head run inside the DifFlow CUDA graphs."""
+
+    enable: bool = False
+    # Resolved like model.checkpoint: relative to flow.repo_path when not absolute.
+    checkpoint: str = ""
+    calibration: DifFlowUncertaintyCalibrationConfig = field(
+        default_factory=DifFlowUncertaintyCalibrationConfig
+    )
+
+
 @dataclass(frozen=True)
 class DifFlowConfig:
     """Deployment settings loaded once from the standalone difflow.yaml."""
@@ -151,6 +252,9 @@ class DifFlowConfig:
         default_factory=DifFlowPreprocessingConfig
     )
     recovery: DifFlowRecoveryConfig = field(default_factory=DifFlowRecoveryConfig)
+    uncertainty_head: DifFlowUncertaintyHeadConfig = field(
+        default_factory=DifFlowUncertaintyHeadConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -196,6 +300,15 @@ class OutputConfig:
     velocity_marker_stride: int = 32
     # Marker endpoint = point + velocity * flow_dt_s * factor.
     velocity_marker_scale_factor: float = 2.0
+    # Flow-uncertainty regions at the velocity-line tips, on by default and drawn
+    # whenever the DifFlow uncertainty_head runs (no topic without it): at most
+    # uncertainty_marker_max, spread over the lines, at most uncertainty_marker_publish_hz
+    # (on top of visualization_publish_hz; a rate >= visualization_publish_hz publishes
+    # them with every visualization update, on the velocity-line frames).
+    publish_uncertainty_markers: bool = True
+    uncertainty_marker_max: int = 150
+    uncertainty_marker_alpha: float = 0.35
+    uncertainty_marker_publish_hz: float = 10.0
     profile_interval_frames: int = 30
 
 
@@ -353,6 +466,197 @@ def _iteration_config(value: Any) -> DifFlowIterationConfig:
     return iterations
 
 
+def _number(value: Any, *, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a number, got {value!r}") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _positive(value: Any, *, name: str) -> float:
+    number = _number(value, name=name)
+    if number <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return number
+
+
+def _level(value: Any, *, name: str) -> float:
+    level = _number(value, name=name)
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"{name} must be a coverage level in (0, 1), got {value!r}")
+    return level
+
+
+def _level_entry(table: tuple[tuple[float, Any], ...], level: float, *, name: str) -> Any:
+    for key, value in table:
+        if math.isclose(key, level, rel_tol=0.0, abs_tol=1.0e-9):
+            return value
+    raise ValueError(
+        f"difflow.uncertainty_head.calibration.level {level} is not a level of the "
+        f"{name} table (levels: {[key for key, _ in table]})"
+    )
+
+
+def _level_table(value: Any, *, name: str, row_length: int | None) -> tuple[tuple[float, Any], ...]:
+    """Parse ``{level: scale}`` (row_length None) or ``{level: [scale per bin]}``."""
+    rows: list[tuple[float, Any]] = []
+    for raw_level, raw_scale in _mapping(value, name=name).items():
+        level = _level(raw_level, name=f"{name} level")
+        if any(math.isclose(level, key, rel_tol=0.0, abs_tol=1.0e-9) for key, _ in rows):
+            raise ValueError(f"{name} defines level {level} twice")
+        if row_length is None:
+            scale: Any = _positive(raw_scale, name=f"{name}[{level}]")
+        else:
+            if not isinstance(raw_scale, (list, tuple)) or len(raw_scale) != row_length:
+                raise ValueError(
+                    f"{name}[{level}] must list {row_length} scales "
+                    "(one per displacement bin = len(edges_mm) + 1)"
+                )
+            scale = tuple(_positive(item, name=f"{name}[{level}]") for item in raw_scale)
+        rows.append((level, scale))
+    return tuple(sorted(rows, key=lambda row: row[0]))
+
+
+def _no_extra_keys(keys: Collection[str], *, name: str) -> None:
+    if keys:
+        raise ValueError(f"Unknown keys in {name}: {sorted(keys)}")
+
+
+def _known_keys(
+    dataclass_type,
+    values: dict[str, Any],
+    *,
+    name: str,
+    exclude: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Reject keys of ``values`` that are no field of ``dataclass_type`` (minus ``exclude``)."""
+    allowed = {item.name for item in fields(dataclass_type)} - set(exclude)
+    _no_extra_keys([key for key in values if key not in allowed], name=name)
+    return values
+
+
+def _calibration_table(value: Any, *, name: str) -> DifFlowCalibrationTable:
+    values = _mapping(value, name=name)
+
+    global_values = _mapping(values.pop("global", None), name=f"{name}.global")
+    global_scales = _level_table(
+        global_values.pop("scales", None), name=f"{name}.global.scales", row_length=None
+    )
+    _no_extra_keys(global_values, name=f"{name}.global")
+
+    mondrian_values = _mapping(values.pop("mondrian", None), name=f"{name}.mondrian")
+    raw_edges = mondrian_values.pop("edges_mm", None) or ()
+    if not isinstance(raw_edges, (list, tuple)):
+        raise ValueError(f"{name}.mondrian.edges_mm must be a list of displacements in mm")
+    edges = tuple(_number(edge, name=f"{name}.mondrian.edges_mm") for edge in raw_edges)
+    if any(edge < 0.0 for edge in edges) or any(b <= a for a, b in zip(edges, edges[1:])):
+        raise ValueError(f"{name}.mondrian.edges_mm must be non-negative and strictly increasing")
+    mondrian_scales = _level_table(
+        mondrian_values.pop("scales", None),
+        name=f"{name}.mondrian.scales",
+        row_length=len(edges) + 1,
+    )
+    _no_extra_keys(mondrian_values, name=f"{name}.mondrian")
+    _no_extra_keys(values, name=name)
+    return DifFlowCalibrationTable(
+        global_scales=global_scales,
+        mondrian_edges_mm=edges,
+        mondrian_scales=mondrian_scales,
+    )
+
+
+def _uncertainty_calibration_config(value: Any) -> DifFlowUncertaintyCalibrationConfig:
+    base = "difflow.uncertainty_head.calibration"
+    values = _mapping(value, name=base)
+
+    tables = _mapping(values.pop("tables", None), name=f"{base}.tables")
+    region_tables = {
+        region: _calibration_table(tables.pop(region, None), name=f"{base}.tables.{region}")
+        for region in CALIBRATION_REGIONS
+    }
+    _no_extra_keys(tables, name=f"{base}.tables")
+
+    _known_keys(
+        DifFlowUncertaintyCalibrationConfig, values, name=base, exclude=CALIBRATION_REGIONS
+    )
+    if "level" in values:
+        values["level"] = _level(values["level"], name=f"{base}.level")
+    if "source" in values:
+        values["source"] = str(values["source"] or "").strip()
+    calibration = DifFlowUncertaintyCalibrationConfig(**region_tables, **values)
+    if calibration.region not in CALIBRATION_REGIONS:
+        raise ValueError(f"{base}.region must be ellipsoid or ball, got {calibration.region!r}")
+    if calibration.mode not in CALIBRATION_MODES:
+        raise ValueError(f"{base}.mode must be global or mondrian, got {calibration.mode!r}")
+    return calibration
+
+
+def _uncertainty_head_config(value: Any) -> DifFlowUncertaintyHeadConfig:
+    name = "difflow.uncertainty_head"
+    values = _mapping(value, name=name)
+    calibration = _uncertainty_calibration_config(values.pop("calibration", None))
+    _known_keys(DifFlowUncertaintyHeadConfig, values, name=name, exclude=("calibration",))
+    head = DifFlowUncertaintyHeadConfig(calibration=calibration, **values)
+    if not isinstance(head.enable, bool):
+        raise ValueError(f"{name}.enable must be boolean")
+    if head.enable:
+        if not str(head.checkpoint).strip():
+            raise ValueError(f"{name}.checkpoint is required when enabled")
+        # The level must exist in the table of the configured region and mode.
+        if calibration.mode == "global":
+            calibration.global_scale()
+        else:
+            calibration.mondrian_bin_scales()
+    return head
+
+
+def check_uncertainty_head_meta(meta: Mapping[str, Any], difflow: DifFlowConfig) -> None:
+    """Reject a covariance head that does not fit the configured DifFlow backbone.
+
+    * The head reads the finest-level GRU state of the last iteration, which
+      depends on the coarse/middle/fine schedule: ``meta['iters']`` ("coarse,
+      middle,fine") must equal difflow.model.iterations.
+    * A head trained on canonically normalised inputs (``meta['canonical']``)
+      needs difflow.preprocessing.canonical_normalization.
+    """
+    _check_head_iterations(meta, difflow.model.iterations)
+    if meta.get("canonical", False) and not difflow.preprocessing.canonical_normalization.enable:
+        raise ValueError(
+            "DifFlow uncertainty head was trained on canonically normalised inputs "
+            "(checkpoint meta canonical: True); enable "
+            "difflow.preprocessing.canonical_normalization (and turn "
+            "auto_spatial_scale off)"
+        )
+
+
+def _check_head_iterations(meta: Mapping[str, Any], iterations: DifFlowIterationConfig) -> None:
+    raw = meta.get("iters")
+    if raw is None:
+        raise ValueError("DifFlow uncertainty head checkpoint does not record 'iters'")
+    if isinstance(raw, bool):
+        raise ValueError(f"Invalid uncertainty head 'iters' entry: {raw!r}")
+    try:
+        if isinstance(raw, int):
+            head_iterations = (raw, raw, raw)
+        else:
+            parts = raw.split(",") if isinstance(raw, str) else list(raw)
+            head_iterations = tuple(int(str(part).strip()) for part in parts)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid uncertainty head 'iters' entry: {raw!r}") from error
+    expected = (iterations.coarse, iterations.middle, iterations.fine)
+    if head_iterations != expected:
+        raise ValueError(
+            "DifFlow uncertainty head was trained with iterations "
+            f"(coarse, middle, fine) = {head_iterations}, but difflow.model.iterations "
+            f"is {expected}"
+        )
+
+
 def _load_difflow_config(path: Path) -> DifFlowConfig:
     with path.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
@@ -402,6 +706,32 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
                 "difflow.preprocessing.auto_spatial_scale."
             )
 
+    canonical_values = _known_keys(
+        DifFlowCanonicalNormalizationConfig,
+        _mapping(
+            preprocessing_values.pop("canonical_normalization", None),
+            name="difflow.preprocessing.canonical_normalization",
+        ),
+        name="difflow.preprocessing.canonical_normalization",
+    )
+    if "model_center" in canonical_values:
+        center = canonical_values["model_center"]
+        if not isinstance(center, (list, tuple)) or len(center) != 3:
+            raise ValueError(
+                "difflow.preprocessing.canonical_normalization.model_center "
+                "must have 3 entries"
+            )
+        canonical_values["model_center"] = tuple(
+            _number(
+                value,
+                name="difflow.preprocessing.canonical_normalization.model_center",
+            )
+            for value in center
+        )
+    canonical_normalization = _construct(
+        DifFlowCanonicalNormalizationConfig, canonical_values
+    )
+
     outlier_filter = _construct(
         DifFlowOutlierFilterConfig,
         _mapping(
@@ -411,6 +741,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
     )
     preprocessing = DifFlowPreprocessingConfig(
         auto_spatial_scale=spatial_scale,
+        canonical_normalization=canonical_normalization,
         outlier_filter=outlier_filter,
         **preprocessing_values,
     )
@@ -418,6 +749,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         DifFlowRecoveryConfig,
         _mapping(raw.get("recovery"), name="difflow.recovery"),
     )
+    uncertainty_head = _uncertainty_head_config(raw.get("uncertainty_head"))
 
     if runtime.cuda_graph_warmup < 1:
         raise ValueError("difflow.runtime.cuda_graph_warmup must be >= 1")
@@ -434,6 +766,24 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
                 "difflow.preprocessing.point_buckets must lie in "
                 "[1024, fps_points]"
             )
+    level1_points = model.level1_points
+    if (
+        isinstance(level1_points, bool)
+        or not isinstance(level1_points, int)
+        or level1_points < 1024
+    ):
+        raise ValueError(
+            f"difflow.model.level1_points must be an integer >= 1024, got {level1_points!r}"
+        )
+    # The runner's buckets default to (fps_points,); a 1024-anchor input skips level-1 sampling.
+    buckets = [int(value) for value in (preprocessing.point_buckets or (preprocessing.fps_points,))]
+    too_small = [bucket for bucket in buckets if bucket != 1024 and bucket < level1_points]
+    if too_small:
+        raise ValueError(
+            f"difflow.preprocessing point buckets {too_small} are smaller than "
+            f"difflow.model.level1_points={level1_points}; every bucket other than "
+            "1024 must be at least level1_points"
+        )
     if model.fast_top_level_min_points > 0 and not preprocessing.sort_anchors_morton:
         raise ValueError(
             "difflow.model.fast_top_level_min_points requires "
@@ -449,6 +799,31 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
             "difflow.preprocessing.auto_spatial_scale.fixed_spatial_scale "
             "must be positive"
         )
+    canonical = preprocessing.canonical_normalization
+    if not isinstance(canonical.enable, bool):
+        raise ValueError(
+            "difflow.preprocessing.canonical_normalization.enable must be boolean"
+        )
+    if canonical.enable and preprocessing.auto_spatial_scale.enable:
+        raise ValueError(
+            "difflow.preprocessing.canonical_normalization replaces auto_spatial_scale; "
+            "set preprocessing.auto_spatial_scale.enable: false"
+        )
+    _positive(
+        canonical.model_radius,
+        name="difflow.preprocessing.canonical_normalization.model_radius",
+    )
+    if _number(
+        canonical.scale_ratio,
+        name="difflow.preprocessing.canonical_normalization.scale_ratio",
+    ) <= 1.0:
+        raise ValueError(
+            "difflow.preprocessing.canonical_normalization.scale_ratio must be > 1"
+        )
+    _positive(
+        canonical.center_shift,
+        name="difflow.preprocessing.canonical_normalization.center_shift",
+    )
     if not isinstance(preprocessing.outlier_filter.detailed_output, bool):
         raise ValueError(
             "difflow.preprocessing.outlier_filter.detailed_output must be boolean"
@@ -467,6 +842,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         model=model,
         preprocessing=preprocessing,
         recovery=recovery,
+        uncertainty_head=uncertainty_head,
     )
 
 
@@ -567,6 +943,25 @@ def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> Pi
         raise ValueError(
             "output.velocity_marker_scale_factor must be finite and >= 0"
         )
+    if not isinstance(output.publish_uncertainty_markers, bool):
+        raise ValueError("output.publish_uncertainty_markers must be boolean")
+    uncertainty_marker_max = output.uncertainty_marker_max
+    if (
+        isinstance(uncertainty_marker_max, bool)
+        or not isinstance(uncertainty_marker_max, int)
+        or uncertainty_marker_max < 1
+    ):
+        raise ValueError("output.uncertainty_marker_max must be an integer >= 1")
+    uncertainty_marker_alpha = _number(
+        output.uncertainty_marker_alpha, name="output.uncertainty_marker_alpha"
+    )
+    if not 0.0 < uncertainty_marker_alpha <= 1.0:
+        raise ValueError(
+            f"output.uncertainty_marker_alpha must be in (0, 1], got {uncertainty_marker_alpha!r}"
+        )
+    _positive(
+        output.uncertainty_marker_publish_hz, name="output.uncertainty_marker_publish_hz"
+    )
 
     tracker = _tracker_config(raw.get("tracker"), base_dir=base_dir)
     scene_cloud = _scene_cloud_config(raw.get("scene_cloud"))
