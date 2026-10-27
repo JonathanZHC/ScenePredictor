@@ -55,10 +55,12 @@ class SceneCloudAssembler:
     def assemble(self, output: SceneVelocityOutput, frame: MultiCameraFrame | None = None) -> None:
         """Fill output.scene_* from the tracker results in `output.view_results`, or from
         `frame` (dense RGB-D) when there are no tracker results (static-only mode)."""
+        dyn_region = None                    # velocity regions of the dynamic rows (when computed)
         if output.flow_valid and output.flow_points.shape[0] > 0:
             dyn_points = output.flow_points
             dyn_velocity = output.flow_velocity
             dyn_ids = output.flow_track_ids
+            dyn_region = getattr(output, "flow_velocity_region", None)
             # Tracked instances without a flow estimate this cycle (an id seen for the first
             # time, e.g. after a cross-view split or a new detection) must not vanish from the
             # cloud: keep their points with zero velocity so the safety filter still sees them.
@@ -72,6 +74,8 @@ class SceneCloudAssembler:
                     dyn_points = torch.cat((dyn_points.to(extra_points.device), extra_points), dim=0)
                     dyn_velocity = torch.cat((dyn_velocity.to(extra_points.device), torch.zeros_like(extra_points)), dim=0)
                     dyn_ids = torch.cat((dyn_ids.to(extra_points.device), tracked_ids.index_select(0, idx)), dim=0)
+                    if dyn_region is not None:
+                        dyn_region = torch.cat((dyn_region.to(extra_points.device), extra_points.new_zeros((idx.shape[0], 3, 3))), dim=0)
         else:
             dyn_points = output.tracked_points
             dyn_velocity = torch.zeros_like(dyn_points)
@@ -79,6 +83,8 @@ class SceneCloudAssembler:
         dyn_points = dyn_points.to(self.device, torch.float32)
         dyn_velocity = dyn_velocity.to(self.device, torch.float32)
         dyn_ids = dyn_ids.to(self.device, torch.int32)
+        if dyn_region is not None:
+            dyn_region = dyn_region.to(self.device, torch.float32)
 
         self.last_rest_input = 0
         if self.scene_cfg.include_rest_points:
@@ -101,6 +107,8 @@ class SceneCloudAssembler:
             lo, hi = self._workspace
             keep = ((points >= lo) & (points <= hi)).all(dim=1)
             # Keep the dynamic-first ordering; count dynamic survivors.
+            if dyn_region is not None:
+                dyn_region = dyn_region.index_select(0, keep[:num_dynamic].nonzero(as_tuple=True)[0])
             num_dynamic = int(keep[:num_dynamic].sum().item())
             index = keep.nonzero(as_tuple=True)[0]
             points = points.index_select(0, index)
@@ -111,6 +119,7 @@ class SceneCloudAssembler:
         output.scene_velocity = velocity.contiguous()
         output.scene_track_ids = track_ids.contiguous()
         output.scene_num_dynamic = num_dynamic
+        output.scene_velocity_region = dyn_region.contiguous() if dyn_region is not None else None
         output.scene_num_input = num_input
 
     # ------------------------------------------------------------------ rest scene (moved from RosVisualizer)

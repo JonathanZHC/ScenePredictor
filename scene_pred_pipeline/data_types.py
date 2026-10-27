@@ -127,3 +127,10 @@ class SceneVelocityOutput:
     # uncertainty head or without a valid flow pair (see FlowResult).
     anchor_flow_cov: torch.Tensor | None = None          # [M, 3, 3] float32, m^2
     anchor_flow_cov_scale: torch.Tensor | None = None    # [M] calibration scale s (FlowResult)
+    # Calibrated velocity region of every flow point (rows of flow_points; only when
+    # ScenePredictionPipeline.compute_velocity_region is set): the true velocity lies in
+    # {flow_velocity + d : d^T R^-1 d <= 1} (velocity_recovery.anchor_velocity_region).
+    flow_velocity_region: torch.Tensor | None = None     # [Nf, 3, 3] float32, m^2/s^2
+    # The same for the first scene_velocity_region.shape[0] rows of scene_points (the moving
+    # points; the rest scene has no region).
+    scene_velocity_region: torch.Tensor | None = None    # [Nd, 3, 3] float32, m^2/s^2

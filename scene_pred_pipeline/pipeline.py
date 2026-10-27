@@ -15,7 +15,7 @@ from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
 from .scene_assembly import SceneCloudAssembler
 from .tracker_adapter import MultiViewTrackerAdapter
-from .velocity_recovery import VelocityRecovery
+from .velocity_recovery import VelocityRecovery, anchor_velocity_region
 
 
 class ScenePredictionPipeline:
@@ -25,6 +25,11 @@ class ScenePredictionPipeline:
     Raw tracker result references are carried to RosVisualizer, which lazily
     materializes overlays/masks/clouds only when a subscriber is connected.
     """
+
+    # Calibrated velocity regions of the flow points (SceneVelocityOutput.flow/scene_velocity_region),
+    # computed only for a consumer such as the safety filter's velocity-uncertainty tightening.
+    compute_velocity_region = False
+
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -202,6 +207,7 @@ class ScenePredictionPipeline:
         anchor_track_ids = self._empty_ids()
         anchor_flow_cov = None
         anchor_flow_cov_scale = None
+        flow_velocity_region = None
         common_ids: tuple[int, ...] = ()
         flow_valid = False
         outlier_filter_info: dict[str, object] = {}
@@ -255,6 +261,16 @@ class ScenePredictionPipeline:
                     flow_velocity = self.recovery.recover(
                         pair, flow_result, query_points=flow_points, query_track_ids=flow_track_ids
                     )
+                    if self.compute_velocity_region and flow_result.anchor_flow_cov is not None:
+                        # As calibrated (difflow_zu.yaml, dense points): Sigma carried to the dense
+                        # points first, then each point's own scale from its |displacement| bin.
+                        dense_cov = self.recovery.recover_region(
+                            flow_result, flow_result.anchor_flow_cov, query_points=flow_points, query_track_ids=flow_track_ids
+                        )
+                        dense_scale = self.flow_predictor.calibration_scale(flow_velocity * float(pair.dt_s))
+                        flow_velocity_region = anchor_velocity_region(
+                            dense_cov, dense_scale, float(pair.dt_s), self.config.difflow.uncertainty_head.calibration.region
+                        )
                 flow_dt_s = float(pair.dt_s)
                 source_anchors = flow_result.source_anchors
                 warped_anchors = flow_result.warped_anchors
@@ -303,6 +319,7 @@ class ScenePredictionPipeline:
             anchor_track_ids=anchor_track_ids,
             anchor_flow_cov=anchor_flow_cov,
             anchor_flow_cov_scale=anchor_flow_cov_scale,
+            flow_velocity_region=flow_velocity_region,
         )
         self._assemble_scene(output, frame)
         return output
