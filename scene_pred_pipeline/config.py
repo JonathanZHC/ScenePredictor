@@ -143,8 +143,9 @@ class DifFlowPreprocessingConfig:
     final_selection: str = "uniform"
     # Exact anchor counts to run at. A frame uses the largest bucket <= its
     # candidate count, so points are never duplicated unless the frame has
-    # fewer than the smallest bucket (1024, the network minimum). None = only
-    # fps_points (legacy repeat-padding behaviour).
+    # fewer than the smallest bucket (>= 256; below 1024 the DifFlow3D pyramid is
+    # scaled down instead of repeating points). None = only fps_points (legacy
+    # repeat-padding behaviour).
     point_buckets: tuple[int, ...] | None = None
     # Morton-sort the anchors; required for model.fast_top_level_min_points.
     sort_anchors_morton: bool = False
@@ -800,10 +801,11 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         raise ValueError("difflow.preprocessing.final_selection must be fps or uniform")
     if preprocessing.point_buckets is not None:
         buckets = [int(value) for value in preprocessing.point_buckets]
-        if not buckets or min(buckets) < 1024 or max(buckets) > preprocessing.fps_points:
+        # DifFlow3D's smallest input (difflow3d.model.encoder.MIN_INPUT_POINTS): below 1024 the pyramid is scaled.
+        if not buckets or min(buckets) < 256 or max(buckets) > preprocessing.fps_points or any(b % 16 for b in buckets):
             raise ValueError(
                 "difflow.preprocessing.point_buckets must lie in "
-                "[1024, fps_points]"
+                "[256, fps_points] and be multiples of 16"
             )
     level1_points = model.level1_points
     if (
@@ -814,13 +816,14 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         raise ValueError(
             f"difflow.model.level1_points must be an integer >= 1024, got {level1_points!r}"
         )
-    # The runner's buckets default to (fps_points,); a 1024-anchor input skips level-1 sampling.
+    # The runner's buckets default to (fps_points,). An input of at most 1024 anchors is its own level 1
+    # (scaled pyramid below 1024); larger inputs sample level 1 and must hold at least level1_points.
     buckets = [int(value) for value in (preprocessing.point_buckets or (preprocessing.fps_points,))]
-    too_small = [bucket for bucket in buckets if bucket != 1024 and bucket < level1_points]
+    too_small = [bucket for bucket in buckets if 1024 < bucket < level1_points]
     if too_small:
         raise ValueError(
             f"difflow.preprocessing point buckets {too_small} are smaller than "
-            f"difflow.model.level1_points={level1_points}; every bucket other than "
+            f"difflow.model.level1_points={level1_points}; every bucket above "
             "1024 must be at least level1_points"
         )
     if model.fast_top_level_min_points > 0 and not preprocessing.sort_anchors_morton:
