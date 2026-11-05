@@ -413,14 +413,14 @@ def test_rate_gate_keeps_the_configured_average_rate():
     # 27 Hz frames through a 10 Hz gate for 10 s: 100 publishes (now + period scheduling: 90).
     next_ns, period_ns, due_count = 0, 100_000_000, 0
     for frame in range(270):
-        due, next_ns = ros_output._rate_gate(next_ns, period_ns, 1_000_000_000 + frame * 37_037_037)
+        due, next_ns = ros_output.rate_gate(next_ns, period_ns, 1_000_000_000 + frame * 37_037_037)
         due_count += int(due)
     assert due_count == 100
     # After a pause longer than one period: one publish, then the rate again (no burst).
     now = 1_000_000_000 + 270 * 37_037_037 + 2_000_000_000
     dues = []
     for frame in range(6):
-        due, next_ns = ros_output._rate_gate(next_ns, period_ns, now + frame * 37_037_037)
+        due, next_ns = ros_output.rate_gate(next_ns, period_ns, now + frame * 37_037_037)
         dues.append(due)
     assert dues == [True, False, False, True, False, False]
 

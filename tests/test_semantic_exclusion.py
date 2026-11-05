@@ -177,14 +177,9 @@ class ProfilerTests(unittest.TestCase):
         with profiler.stage("instance_filter", cuda=False):
             pass
         with profiler.stage("difflow_total", cuda=False):
-            with profiler.stage("source_prepare", cuda=False):
-                pass
-            with profiler.stage("target_prepare", cuda=False):
-                pass
-            with profiler.stage("inference", cuda=False):
-                time.sleep(0.001)
-            with profiler.stage("output_extract", cuda=False):
-                pass
+            time.sleep(0.001)
+        with profiler.stage("flow_guard", cuda=False):
+            pass
         with profiler.stage("velocity_recovery", cuda=False):
             pass
 
@@ -198,20 +193,27 @@ class ProfilerTests(unittest.TestCase):
             + values["tracker_other"],
             places=9,
         )
+        # DifFlow leaf timings come from the runner after the cycle fence;
+        # the profiler returns the unprofiled remainder as difflow_other.
+        difflow_total = values["difflow_total"]
+        runner = {
+            "runner_voxel2": difflow_total * 0.10,
+            "runner_outlier_filter": difflow_total * 0.05,
+            "runner_final_selection": difflow_total * 0.05,
+            "runner_stage_scale": difflow_total * 0.10,
+            "runner_encode": difflow_total * 0.40,
+            "runner_decode": difflow_total * 0.20,
+        }
+        difflow_other = profiler.record_difflow_timings(runner, difflow_total)
         self.assertAlmostEqual(
-            values["difflow_total"],
-            values["source_prepare"]
-            + values["target_prepare"]
-            + values["inference"]
-            + values["output_extract"]
-            + values["difflow_other"],
-            places=9,
+            difflow_total, sum(runner.values()) + difflow_other, places=9
         )
         self.assertAlmostEqual(
             values["cycle_total"],
             values["tracker_total"]
             + values["instance_filter"]
             + values["difflow_total"]
+            + values["flow_guard"]
             + values["velocity_recovery"]
             + values["cycle_other"],
             places=9,

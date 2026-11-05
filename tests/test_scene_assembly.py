@@ -133,3 +133,56 @@ def test_scene_num_input_counts_raw_points_before_dedup():
     assert out.scene_num_input == 50 + 32
     assert out.scene_points.shape[0] < out.scene_num_input
     assert out.scene_num_dynamic == 50
+
+
+def test_reused_upload_buffers_match_a_fresh_assembler():
+    # The depth/transform/mask uploads go through pinned buffers reused across cycles: a long-lived
+    # assembler must give exactly what a fresh one gives for every frame of a changing sequence.
+    cfg = PipelineConfig(scene_cloud=SceneCloudConfig(include_rest_points=True, voxel_size_m=0.01))
+    reused = SceneCloudAssembler(cfg, tracker_config=None)
+    rng = np.random.default_rng(3)
+    for step in range(6):
+        frame = _rgbd_frame(24, 32)
+        cam = frame.cameras["camera_0"]
+        cam.depth[...] = rng.uniform(0.5, 3.0, cam.depth.shape).astype(np.float32)
+        cam.T_world_camera[:3, 3] = rng.uniform(-1.0, 1.0, 3).astype(np.float32)
+        got = reused.rest_points_from_frame(frame)
+        want = SceneCloudAssembler(cfg, tracker_config=None).rest_points_from_frame(frame)
+        assert torch.equal(got, want), f"cycle {step}"
+        assert int(reused.last_rest_input) == int(np.isfinite(cam.depth).sum())
+
+
+def test_fused_rest_scene_matches_float64_reference():
+    # The fused Triton backprojection (rest_scene_kernel.py): fp32 world points within 1e-5 m of a float64 reference
+    # (the former GEMM ran in TF32: up to 1.4 mm off), voxel dedup on the same lattice, excluded pixels dropped.
+    from scene_pred_pipeline import rest_scene_kernel
+
+    if not rest_scene_kernel.available(DEV):
+        pytest.skip("Triton not available")
+    cfg = PipelineConfig(scene_cloud=SceneCloudConfig(include_rest_points=True, voxel_size_m=0.005))
+    asm = SceneCloudAssembler(cfg, tracker_config=None)
+    rng = np.random.default_rng(5)
+    h, w = 40, 60
+    depth = rng.uniform(0.3, 3.0, (h, w)).astype(np.float32)
+    depth[0, :5] = np.nan
+    depth[1, :5] = 0.05                     # below min depth
+    angle = 0.7
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]], np.float32)
+    T[:3, 3] = (0.4, -1.2, 0.8)
+    excluded = torch.zeros((h, w), dtype=torch.bool, device=DEV)
+    excluded[20:30, 30:50] = True
+    views = [(depth, (80.0, 80.0, w / 2, h / 2), T, excluded)]
+    fused = asm._rest_points_from_views(views)
+    # float64 reference of every valid, non-excluded pixel
+    v, u = np.mgrid[0:h, 0:w]
+    z = depth.astype(np.float64)
+    ok = np.isfinite(z) & (z >= asm._min_depth_m) & (z <= asm._max_depth_m) & ~excluded.cpu().numpy()
+    pc = np.stack([(u - w / 2) / 80.0 * z, (v - h / 2) / 80.0 * z, z], -1)[ok]
+    ref = pc @ T[:3, :3].astype(np.float64).T + T[:3, 3]
+    keys = {tuple(k) for k in np.floor(ref / 0.005).astype(np.int64)}
+    got = fused.cpu().numpy().astype(np.float64)
+    assert int(asm.last_rest_input) == int(ok.sum())
+    assert abs(len(got) - len(keys)) <= 2          # voxel boundaries may round differently in fp32
+    dist = np.abs(got[:, None, :] - ref[None, :, :]).max(-1).min(1)      # <= 2400 x 2400
+    assert dist.max() < 1e-5

@@ -119,8 +119,12 @@ class SceneVelocityOutput:
     scene_num_dynamic: int = 0                      # rows [0, n) carry recovered velocity
     # Points that entered the scene assembly this cycle: every dynamic point plus every valid,
     # non-excluded depth pixel of every camera BEFORE the voxel dedup / workspace crop, i.e. the
-    # raw perception count that scene_points was downsampled from.
+    # raw perception count that scene_points was downsampled from. A 0-d CUDA tensor when the
+    # rest scene was built (kept on the device to avoid a host sync; int() it after the cycle fence).
     scene_num_input: int = 0
+    # Host copy of the global track ids of the tracked instances this cycle (lets the scene
+    # assembly skip a device check when every tracked instance has a flow estimate).
+    tracked_instance_ids: tuple[int, ...] = ()
     # Track id of every flow anchor (rows of source_anchors / warped_anchors).
     anchor_track_ids: torch.Tensor | None = None
     # Flow uncertainty, rows aligned with warped_anchors; None without the DifFlow

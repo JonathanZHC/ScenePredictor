@@ -23,7 +23,32 @@ def anchor_velocity_region(cov: torch.Tensor, scale: torch.Tensor, dt_s: float, 
     return (factor * radius2)[:, None, None] * eye
 
 
-_UPPER = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
+# Unique entries of a symmetric 3x3 matrix, row-major flat indices: (0,0) (1,1) (2,2) (0,1) (0,2) (1,2).
+_UPPER_FLAT = (0, 4, 8, 1, 2, 5)
+# The full matrix from those six entries (flat row-major order).
+_FROM_UPPER = (0, 3, 4, 3, 1, 5, 4, 5, 2)
+
+
+_INDEX_CACHE: dict[tuple[tuple[int, ...], torch.device], torch.Tensor] = {}
+
+
+def _cached_index(values: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """Device index tensor built once per device (a per-call host->device copy would sync the stream)."""
+    key = (values, device)
+    index = _INDEX_CACHE.get(key)
+    if index is None:
+        index = _INDEX_CACHE[key] = torch.tensor(values, dtype=torch.long, device=device)
+    return index
+
+
+def pack_symmetric_upper(matrices: torch.Tensor) -> torch.Tensor:
+    """[M, 3, 3] symmetric -> [M, 6] float32 (diagonal, then the upper off-diagonal), one gather."""
+    return matrices.reshape(-1, 9).index_select(1, _cached_index(_UPPER_FLAT, matrices.device)).float()
+
+
+def unpack_symmetric_upper(values: torch.Tensor) -> torch.Tensor:
+    """[N, 6] -> [N, 3, 3] symmetric (inverse of pack_symmetric_upper), one gather."""
+    return values.index_select(1, _cached_index(_FROM_UPPER, values.device)).reshape(-1, 3, 3)
 
 
 class VelocityRecovery:
@@ -103,7 +128,7 @@ class VelocityRecovery:
         entries. A convex combination of symmetric positive semi-definite matrices stays one."""
         if query_points.shape[0] == 0:
             return query_points.new_zeros((0, 3, 3))
-        upper = torch.stack([anchor_region[:, i, j] for i, j in _UPPER], dim=1).float()
+        upper = pack_symmetric_upper(anchor_region)
         kwargs = self._track_kwargs(flow_result, query_track_ids)
         parts = [
             self.recoverer.recover(
@@ -115,12 +140,7 @@ class VelocityRecovery:
             ).flow
             for k in (0, 3)
         ]
-        values = torch.cat(parts, dim=1)
-        region = query_points.new_empty((query_points.shape[0], 3, 3))
-        for k, (i, j) in enumerate(_UPPER):
-            region[:, i, j] = values[:, k]
-            region[:, j, i] = values[:, k]
-        return region
+        return unpack_symmetric_upper(torch.cat(parts, dim=1))
 
     def _track_kwargs(self, flow_result: FlowResult, query_track_ids: torch.Tensor) -> dict:
         if not self.config.recovery.restrict_same_track:

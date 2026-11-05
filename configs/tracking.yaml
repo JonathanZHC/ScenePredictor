@@ -1,7 +1,5 @@
 runtime:
   target_hz: 30.0
-  queue_size: 1
-  drop_when_busy: true
   serialize_gpu: false
   use_bf16: true
   enable_visualization: false
@@ -10,10 +8,9 @@ runtime:
 pointcloud:
   stride: 1
   # Sizes the per-record GPU geometry segments (two stable sorts + compaction run
-  # over records x this). 4096 is ample for 640x360 objects; DifFlow samples
-  # fps_points anchors from the union anyway.
+  # over records x this). 4096 is ample for objects in the 960x600 ZED views (with
+  # adaptive_geometry_sampling); DifFlow samples fps_points anchors from the union anyway.
   max_points_per_instance: 4096
-  transform_to_world: true
 
 # SAM3 is now a sparse asynchronous B=num_views detector. The initial SAM3 call
 # is blocking only because no tracker state exists yet. Later refreshes never
@@ -21,9 +18,9 @@ pointcloud:
 detector:
   checkpoint: checkpoints/sam3.pt
 
-  # ScenePredictor injects detector.prompts from default.yaml as
-  # tracked_prompts + excluded_prompts. Standalone users should define prompts
-  # in this file as before.
+  # detector.prompts is injected by ScenePredictor from scene_predictor.tracker
+  # (tracked_prompts + excluded_prompts of default.yaml); a standalone
+  # MultiViewRGBDTracker run defines them here.
 
   score_threshold: 0.3
   duplicate_iou_threshold: 0.7
@@ -55,8 +52,8 @@ tracker:
     execution_mode: fixed_batch
 
     # Slot count is derived directly from the capacities in detector.prompts.
-    # Compile optimization defaults to torch.compile(mode="default").
-    # Set true only when explicitly benchmarking max-autotune.
+    # torch.compile mode of the EfficientTAM components: true = "max-autotune",
+    # false = "default" (shorter cold start).
     use_max_autotune: true
     feature_history_frames: 32
     prewarm_enabled: true
@@ -153,5 +150,3 @@ profiling:
   # Buffer profiler CSV rows to avoid per-frame filesystem open/write/close.
   csv_flush_interval_frames: 100
   rate_diagnostics: true
-  camera_diagnostics: true
-  rate_summary_interval_seconds: 5.0

@@ -15,6 +15,7 @@ from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
 from .scene_assembly import SceneCloudAssembler
 from .tracker_adapter import MultiViewTrackerAdapter
+from .flow_guard import FlowGuard
 from .velocity_recovery import VelocityRecovery, anchor_velocity_region
 
 
@@ -44,6 +45,9 @@ class ScenePredictionPipeline:
         self.flow_predictor = None
         self.instance_filter = None
         self.recovery = None
+        self.flow_guard = None
+        # True: the caller marks the GPU idle itself after the cycle (see process()).
+        self.defer_gpu_idle = False
         tracker_config = None
         if not self.static_only:
             # Load/patch the upstream tracker configuration once. DifFlow needs the
@@ -67,6 +71,14 @@ class ScenePredictionPipeline:
             )
             self.instance_filter = CommonInstanceFilter()
             self.recovery = VelocityRecovery(config)
+            guard = config.difflow.flow_guard
+            if guard.enabled:
+                self.flow_guard = FlowGuard(
+                    self.recovery.recoverer,
+                    min_displacement_m=guard.min_displacement_m,
+                    support_radius_m=guard.support_radius_m,
+                    calibration_scale=self.flow_predictor.calibration_scale,
+                )
         # Full-scene cloud (tracked points + velocity, rest points + zero velocity)
         # for in-process consumers such as the safety filter.
         self.scene_assembler = (
@@ -169,7 +181,33 @@ class ScenePredictionPipeline:
         self.scene_assembler.assemble(output, frame)
         self.profiler.record_async("scene_assembly", 1000.0 * (time.perf_counter() - started))
 
+    def mark_gpu_busy(self) -> None:
+        """A latency-critical cycle starts: a cooperative async SAM3 job pauses at its next module boundary."""
+        worker = getattr(self.tracker, "sam3_worker", None)     # None in static-only mode
+        if worker is not None:
+            worker.set_busy()
+
+    def mark_gpu_idle(self) -> None:
+        """The latency-critical work of this cycle is done: a cooperative async SAM3 job may use the GPU."""
+        worker = getattr(self.tracker, "sam3_worker", None)
+        if worker is not None:
+            worker.set_idle()
+
     def process(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
+        """One cycle. Marks the GPU busy for its duration (cooperative SAM3, tracking.yaml
+        detector.cooperative_scheduling) and idle at the end, unless defer_gpu_idle is set: then the caller
+        calls mark_gpu_idle() after its own latency-critical work (the safety filter in the umbrella node)."""
+        self.mark_gpu_busy()
+        try:
+            return self._process_cycle(frame)
+        finally:
+            if not self.defer_gpu_idle:
+                self.mark_gpu_idle()
+
+    # No autograd anywhere in a cycle: outside grad mode the kNN of the flow guard takes the fused kernel
+    # (exact, unaffected by TF32) instead of a dense TF32 distance matrix + topk, and no op records a graph.
+    @torch.no_grad()
+    def _process_cycle(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
         self.profiler.start_cycle()
         self.last_flow_gap_s = None
 
@@ -234,6 +272,11 @@ class ScenePredictionPipeline:
                             for instance in current.instances
                         }
                     flow_result = self.flow_predictor.predict(pair, track_labels=track_labels)
+                if self.flow_guard is not None:
+                    # Segmentation-bleed guard: large displacements without current-frame support get the
+                    # neighbours' softmax displacement and covariance (scene_pred_pipeline/flow_guard.py).
+                    with self.profiler.stage("flow_guard", cuda=True):
+                        flow_result = self.flow_guard(flow_result, pair.current_points)
 
                 # Boolean-mask indexing on CUDA runs nonzero() and syncs the host
                 # to size the result. With the outlier filter disabled the keep
@@ -320,6 +363,7 @@ class ScenePredictionPipeline:
             anchor_flow_cov=anchor_flow_cov,
             anchor_flow_cov_scale=anchor_flow_cov_scale,
             flow_velocity_region=flow_velocity_region,
+            tracked_instance_ids=current.track_ids,
         )
         self._assemble_scene(output, frame)
         return output

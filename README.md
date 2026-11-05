@@ -333,7 +333,7 @@ Optional flow uncertainty, off by default:
 
 The umbrella repository's `configs/difflow_zu.yaml` is a calibrated example. Its README section "Flow uncertainty" explains the meaning, the limits and how to recalibrate.
 
-Runtime plumbing worth knowing when editing: all tracker/DifFlow work runs on one shared highest-priority CUDA stream (`scene_pred_pipeline/cuda_streams.py`, bound on the tracker owner thread and the GPU worker) while SAM3 keeps its own default-priority stream; ROS message building runs on a latest-only publisher thread (`_PublishWorker` in `scripts/run_scene_pred_pipeline.py`) and is reported as `publish_total` under the async diagnostics of the periodic summary; Python GC is frozen and disabled after warm-up with an explicit collect on the publisher thread; the summary also prints input drop counters (`dropped_bundles`, `unmatched_rgbd`, `unmatched_multiview`).
+Runtime plumbing worth knowing when editing: all tracker/DifFlow work runs on one shared highest-priority CUDA stream (`scene_pred_pipeline/cuda_streams.py`, bound on the tracker owner thread and the GPU worker) while SAM3 keeps its own default-priority stream; ROS message building runs on a latest-only publisher thread (`scene_pred_pipeline/ros_loop.py`, shared with the umbrella node) and is reported as `publish_total` under the async diagnostics of the periodic summary; Python GC is frozen and disabled after warm-up with an explicit collect on the publisher thread; the summary also prints input drop counters (`dropped_bundles`, `unmatched_rgbd`, `unmatched_multiview`).
 
 ## 12. Current performance reference
 

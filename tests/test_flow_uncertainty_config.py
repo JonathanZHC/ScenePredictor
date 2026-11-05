@@ -6,6 +6,7 @@ uncertainty-capable DifFlow3D runtime, checkpoints or a GPU.
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from scene_pred_pipeline import flow_prediction
 from scene_pred_pipeline.config import (
     DifFlowModelConfig,
     check_uncertainty_head_meta,
+    chi2_3_quantile,
     load_config,
     load_config_from_mapping,
 )
@@ -76,6 +78,7 @@ def _uncertainty_raw(region="ellipsoid", mode="mondrian", level=0.95) -> dict:
         "enable": True,
         "checkpoint": "/weights/head.pt",
         "calibration": {
+            "enable": True,
             "region": region,
             "mode": mode,
             "level": level,
@@ -131,6 +134,7 @@ def test_old_difflow_yaml_loads_with_feature_off(tmp_path):
     # Deployment defaults of the calibration selection (used once a head is enabled).
     calibration = config.difflow.uncertainty_head.calibration
     assert (calibration.region, calibration.mode, calibration.level) == ("ellipsoid", "mondrian", 0.95)
+    assert not calibration.enable
 
 
 def test_markers_on_without_head_load(tmp_path):
@@ -282,6 +286,36 @@ def test_enabled_head_needs_checkpoint(tmp_path):
     raw = _zu_raw()
     raw["uncertainty_head"]["checkpoint"] = ""
     with pytest.raises(ValueError, match="checkpoint"):
+        _load(tmp_path, raw)
+
+
+@pytest.mark.parametrize("level, chi2", [(0.5, 2.365974), (0.8, 4.641628), (0.95, 7.814728), (0.99, 11.344867)])
+def test_chi2_3_quantile(level, chi2):
+    assert chi2_3_quantile(level) == pytest.approx(chi2, abs=1e-5)
+
+
+@pytest.mark.parametrize("region", ["ellipsoid", "ball"])
+def test_uncalibrated_uses_gaussian_scale_and_ignores_tables(tmp_path, region):
+    raw = _zu_raw()
+    calibration_raw = raw["uncertainty_head"]["calibration"]
+    # No table holds level 0.9 and the tables are gone: both are fine without calibration.
+    calibration_raw.update(enable=False, region=region, level=0.9)
+    del calibration_raw["tables"]
+    calibration = _load(tmp_path, raw).difflow.uncertainty_head.calibration
+    assert not calibration.enable
+    assert calibration.gaussian_scale() == pytest.approx(math.sqrt(chi2_3_quantile(0.9)))
+    scale = AnchorCalibrationScale(calibration, "cpu")
+    assert scale.mode == "uncalibrated"
+    flow = torch.tensor([[0.0, 0.0, 0.0], [0.005, 0.0, 0.0], [0.08, 0.0, 0.0]])
+    assert torch.allclose(scale(flow), torch.full((3,), calibration.gaussian_scale()))
+    assert torch.allclose(scale.for_displacement_mm(torch.tensor([[1.0, 50.0]])),
+                          torch.full((1, 2), calibration.gaussian_scale()))
+
+
+def test_calibration_enable_must_be_boolean(tmp_path):
+    raw = _zu_raw()
+    raw["uncertainty_head"]["calibration"]["enable"] = "yes"
+    with pytest.raises(ValueError, match="calibration.enable must be boolean"):
         _load(tmp_path, raw)
 
 
@@ -688,6 +722,8 @@ def test_pipeline_carries_uncertainty_to_output(tmp_path):
         recover=lambda pair, result, query_points, query_track_ids: torch.zeros_like(query_points)
     )
     pipeline.scene_assembler = None
+    pipeline.flow_guard = None
+    pipeline.defer_gpu_idle = False
     pipeline.profiler = CycleProfiler(False)
     pipeline.previous_tracked = None
     pipeline.last_flow_gap_s = None
@@ -696,3 +732,13 @@ def test_pipeline_carries_uncertainty_to_output(tmp_path):
     assert output.flow_valid
     assert output.anchor_flow_cov is cov and output.anchor_flow_cov_scale is cov_scale
     assert output.anchor_track_ids is anchor_ids
+
+
+def test_runtime_compile_mode(tmp_path):
+    raw = _difflow_raw()
+    assert _load(tmp_path, raw).difflow.runtime.compile_mode == "none"
+    raw.setdefault("runtime", {})["compile_mode"] = "max-autotune"
+    assert _load(tmp_path, raw).difflow.runtime.compile_mode == "max-autotune"
+    raw["runtime"]["compile_mode"] = "reduce-overhead"
+    with pytest.raises(ValueError, match="compile_mode must be none, default or max-autotune"):
+        _load(tmp_path, raw)

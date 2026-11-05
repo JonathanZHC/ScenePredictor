@@ -33,7 +33,9 @@ class AnchorCalibrationScale:
     The scale s of calibration.region: ellipsoid d^T Sigma^-1 d <= s^2, ball
     |d| <= s det(Sigma)^(1/6). Mondrian: scale of the bin of |flow| in mm, bin i
     holding edges_mm[i-1] <= |flow| < edges_mm[i] (np.digitize, as in the
-    calibration). Global: one scale. Device lookup tables, no host synchronization.
+    calibration). Global: one scale. calibration.enable false: one uncalibrated
+    Gaussian scale sqrt(chi2_3 quantile at level), tables unused. Device lookup
+    tables, no host synchronization.
     """
 
     def __init__(
@@ -42,15 +44,17 @@ class AnchorCalibrationScale:
         device: torch.device | str,
     ) -> None:
         self.region = str(calibration.region)
-        self.mode = str(calibration.mode)
-        if self.mode == "mondrian":
+        self.mode = str(calibration.mode) if calibration.enable else "uncalibrated"
+        self._edges_mm = None          # one scale for every anchor unless mondrian
+        if self.mode == "uncalibrated":
+            scales = (calibration.gaussian_scale(),)
+        elif self.mode == "global":
+            scales = (calibration.global_scale(),)
+        elif self.mode == "mondrian":
             self._edges_mm = torch.tensor(
                 calibration.table().mondrian_edges_mm, dtype=torch.float32, device=device
             )
             scales = calibration.mondrian_bin_scales()
-        elif self.mode == "global":
-            self._edges_mm = None
-            scales = (calibration.global_scale(),)
         else:
             raise ValueError(f"Unknown calibration mode {self.mode!r}")
         self._scales = torch.tensor(scales, dtype=torch.float32, device=device)
@@ -170,6 +174,10 @@ class DifFlowPredictor:
 
         difflow = config.difflow
         configure_fast(difflow.runtime.enable_tf32)
+        if difflow.runtime.compile_mode != "none":
+            # Before the model runs: the runner's warm-up compiles, then its CUDA graphs record the compiled kernels.
+            compile_module = importlib.import_module("difflow3d.runtime.compile")
+            compile_module.enable_inductor(difflow.runtime.compile_mode)
         model = _build_model(model_class, difflow.model)
 
         checkpoint = _resolve_checkpoint(repo_path, difflow.model.checkpoint)

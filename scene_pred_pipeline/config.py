@@ -71,6 +71,9 @@ class DifFlowRuntimeConfig:
     enable_tf32: bool = True
     cuda_graph_warmup: int = 10
     validate_finite: bool = False
+    # Inductor fusion of the inference hot spots (difflow3d/runtime/compile.py): none | default | max-autotune.
+    # Faster predict() (real2: 7.7 -> 6.5 ms with max-autotune) at the cost of start-up compilation.
+    compile_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -162,12 +165,28 @@ class DifFlowRecoveryConfig:
     backend: str = "local"
     local_radius_sigma: float = 4.0
     local_hash_size_factor: float = 4.0
-    report_local_stats: bool = False
     chunk_size: int = 4096
 
 
 CALIBRATION_REGIONS = ("ellipsoid", "ball")
 CALIBRATION_MODES = ("global", "mondrian")
+
+
+def chi2_3_quantile(level: float) -> float:
+    """Quantile of the chi-square distribution with 3 degrees of freedom (bisection on the closed-form CDF)."""
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"chi-square quantile needs a level in (0, 1), got {level!r}")
+
+    def cdf(x: float) -> float:
+        return math.erf(math.sqrt(x / 2.0)) - math.sqrt(2.0 * x / math.pi) * math.exp(-x / 2.0)
+
+    lo, hi = 0.0, 1.0
+    while cdf(hi) < level:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if cdf(mid) < level else (lo, mid)
+    return 0.5 * (lo + hi)
 
 
 @dataclass(frozen=True)
@@ -198,8 +217,15 @@ class DifFlowUncertaintyCalibrationConfig:
     ``mode: global`` uses one scale per level, ``mondrian`` one per bin of the
     predicted displacement. Each region kind has its own tables; they hold only
     for the backbone, head and preprocessing they were fitted with (``source``).
+
+    ``enable: false`` ignores the tables (mode and source too): the region is the
+    head's own Gaussian at ``level``, s = sqrt(chi2_3 quantile at ``level``) for
+    every point (exact for the ellipsoid; for the ball exact only for isotropic
+    Sigma). The tables are kept in the file for when calibration is re-enabled.
     """
 
+    # Conformal tables on (true) or the uncalibrated Gaussian scale (false).
+    enable: bool = False
     region: str = "ellipsoid"
     mode: str = "mondrian"
     level: float = 0.95
@@ -216,6 +242,10 @@ class DifFlowUncertaintyCalibrationConfig:
                 f"got {self.region!r}"
             )
         return getattr(self, self.region)
+
+    def gaussian_scale(self) -> float:
+        """Uncalibrated scale at ``level``: sqrt of the chi-square (3 dof) quantile."""
+        return math.sqrt(chi2_3_quantile(self.level))
 
     def global_scale(self) -> float:
         """Global scale of the configured region at ``level``."""
@@ -243,6 +273,17 @@ class DifFlowUncertaintyHeadConfig:
 
 
 @dataclass(frozen=True)
+class DifFlowFlowGuardConfig:
+    """Segmentation-bleed guard (scene_pred_pipeline/flow_guard.py): an anchor whose displacement exceeds
+    min_displacement_m and whose warped position has no current-frame point within support_radius_m gets the
+    softmax displacement and covariance of its unflagged neighbours (deployed recovery kernel)."""
+
+    enabled: bool = False
+    min_displacement_m: float = 0.05
+    support_radius_m: float = 0.015
+
+
+@dataclass(frozen=True)
 class DifFlowConfig:
     """Deployment settings loaded once from the standalone difflow.yaml."""
 
@@ -255,6 +296,7 @@ class DifFlowConfig:
     uncertainty_head: DifFlowUncertaintyHeadConfig = field(
         default_factory=DifFlowUncertaintyHeadConfig
     )
+    flow_guard: DifFlowFlowGuardConfig = field(default_factory=DifFlowFlowGuardConfig)
 
 
 @dataclass(frozen=True)
@@ -588,6 +630,8 @@ def _uncertainty_calibration_config(value: Any) -> DifFlowUncertaintyCalibration
         values["level"] = _level(values["level"], name=f"{base}.level")
     if "source" in values:
         values["source"] = str(values["source"] or "").strip()
+    if not isinstance(values.get("enable", False), bool):
+        raise ValueError(f"{base}.enable must be boolean")
     calibration = DifFlowUncertaintyCalibrationConfig(**region_tables, **values)
     if calibration.region not in CALIBRATION_REGIONS:
         raise ValueError(f"{base}.region must be ellipsoid or ball, got {calibration.region!r}")
@@ -607,11 +651,12 @@ def _uncertainty_head_config(value: Any) -> DifFlowUncertaintyHeadConfig:
     if head.enable:
         if not str(head.checkpoint).strip():
             raise ValueError(f"{name}.checkpoint is required when enabled")
-        # The level must exist in the table of the configured region and mode.
-        if calibration.mode == "global":
-            calibration.global_scale()
-        else:
-            calibration.mondrian_bin_scales()
+        # Calibrated: the level must exist in the table of the configured region and mode.
+        if calibration.enable:
+            if calibration.mode == "global":
+                calibration.global_scale()
+            else:
+                calibration.mondrian_bin_scales()
     return head
 
 
@@ -677,34 +722,13 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
     preprocessing_values = _mapping(
         raw.get("preprocessing"), name="difflow.preprocessing"
     )
-    spatial_scale_value = preprocessing_values.pop("auto_spatial_scale", None)
-    if isinstance(spatial_scale_value, bool):
-        # Keep older ScenePredictor deployments readable while the canonical
-        # configuration uses the nested DifFlow3D structure.
-        spatial_scale = DifFlowSpatialScaleConfig(
-            enable=spatial_scale_value,
-            target_model_volume=float(
-                preprocessing_values.pop("target_model_volume", 2.0)
-            ),
-            fixed_spatial_scale=float(
-                preprocessing_values.pop("fixed_spatial_scale", 1.0)
-            ),
-        )
-    else:
-        spatial_scale = _construct(
-            DifFlowSpatialScaleConfig,
-            _mapping(
-                spatial_scale_value,
-                name="difflow.preprocessing.auto_spatial_scale",
-            ),
-        )
-        if "target_model_volume" in preprocessing_values or (
-            "fixed_spatial_scale" in preprocessing_values
-        ):
-            raise ValueError(
-                "Move target_model_volume and fixed_spatial_scale under "
-                "difflow.preprocessing.auto_spatial_scale."
-            )
+    spatial_scale = _construct(
+        DifFlowSpatialScaleConfig,
+        _mapping(
+            preprocessing_values.pop("auto_spatial_scale", None),
+            name="difflow.preprocessing.auto_spatial_scale",
+        ),
+    )
 
     canonical_values = _known_keys(
         DifFlowCanonicalNormalizationConfig,
@@ -750,9 +774,24 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         _mapping(raw.get("recovery"), name="difflow.recovery"),
     )
     uncertainty_head = _uncertainty_head_config(raw.get("uncertainty_head"))
+    flow_guard_values = _known_keys(
+        DifFlowFlowGuardConfig,
+        _mapping(raw.get("flow_guard"), name="difflow.flow_guard"),
+        name="difflow.flow_guard",
+    )
+    if not isinstance(flow_guard_values.get("enabled", False), bool):
+        raise ValueError("difflow.flow_guard.enabled must be boolean")
+    for key in ("min_displacement_m", "support_radius_m"):
+        if key in flow_guard_values:
+            flow_guard_values[key] = _positive(flow_guard_values[key], name=f"difflow.flow_guard.{key}")
+    flow_guard = DifFlowFlowGuardConfig(**flow_guard_values)
 
     if runtime.cuda_graph_warmup < 1:
         raise ValueError("difflow.runtime.cuda_graph_warmup must be >= 1")
+    if runtime.compile_mode not in ("none", "default", "max-autotune"):
+        raise ValueError(
+            f"difflow.runtime.compile_mode must be none, default or max-autotune, got {runtime.compile_mode!r}"
+        )
     if preprocessing.fps_points < 1024:
         raise ValueError("difflow.preprocessing.fps_points must be >= 1024")
     if preprocessing.second_candidate_ratio <= 1.0:
@@ -824,6 +863,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         canonical.center_shift,
         name="difflow.preprocessing.canonical_normalization.center_shift",
     )
+
     if not isinstance(preprocessing.outlier_filter.detailed_output, bool):
         raise ValueError(
             "difflow.preprocessing.outlier_filter.detailed_output must be boolean"
@@ -843,6 +883,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         preprocessing=preprocessing,
         recovery=recovery,
         uncertainty_head=uncertainty_head,
+        flow_guard=flow_guard,
     )
 
 

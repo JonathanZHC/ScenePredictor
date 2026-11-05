@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from . import rest_scene_kernel
 from .config import PipelineConfig
 from .data_types import MultiCameraFrame, SceneVelocityOutput
 
@@ -37,6 +38,11 @@ class SceneCloudAssembler:
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self._ray_cache: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
+        # Pinned host staging + device buffer per upload slot (depth, mask, transform of each view): a pageable
+        # host->device copy synchronizes the stream (the CPU waits for all queued DifFlow work); a pinned
+        # non_blocking copy does not. The event guards the host buffer until its previous copy completed.
+        self._uploads: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]] = {}
+        self._fused_buffers: tuple[torch.Tensor, torch.Tensor] | None = None   # points, keys of the fused path
         self._origin: torch.Tensor | None = None
         self._inv_voxel_size = 0.0
         self.last_rest_input = 0   # valid depth pixels of all views in the last rest-scene build (before dedup)
@@ -65,7 +71,12 @@ class SceneCloudAssembler:
             # time, e.g. after a cross-view split or a new detection) must not vanish from the
             # cloud: keep their points with zero velocity so the safety filter still sees them.
             tracked_ids = output.tracked_track_ids
-            if tracked_ids.shape[0] > 0 and output.common_track_ids:
+            # Host check first: the device path below syncs (nonzero) and is needed only when some tracked
+            # instance has no flow estimate (or the instance ids are unknown).
+            maybe_missing = not output.tracked_instance_ids or bool(
+                set(output.tracked_instance_ids) - set(output.common_track_ids)
+            )
+            if tracked_ids.shape[0] > 0 and output.common_track_ids and maybe_missing:
                 common = torch.as_tensor(list(output.common_track_ids), dtype=tracked_ids.dtype, device=tracked_ids.device)
                 missing = ~torch.isin(tracked_ids, common)
                 if bool(missing.any()):
@@ -96,7 +107,7 @@ class SceneCloudAssembler:
                 rest = torch.empty((0, 3), dtype=torch.float32, device=self.device)
         else:
             rest = torch.empty((0, 3), dtype=torch.float32, device=self.device)
-        num_input = int(dyn_points.shape[0]) + int(self.last_rest_input)
+        num_input = self.last_rest_input + int(dyn_points.shape[0])
 
         points = torch.cat((dyn_points, rest), dim=0)
         velocity = torch.cat((dyn_velocity, torch.zeros_like(rest)), dim=0)
@@ -151,8 +162,32 @@ class SceneCloudAssembler:
         self.voxel_size_m = voxel_size_m
         self._inv_voxel_size = 1.0 / voxel_size_m
         self._origin = torch.as_tensor(origin_world, dtype=torch.float32, device=self.device).contiguous()
+        self._origin_host = tuple(float(v) for v in np.asarray(origin_world, dtype=np.float32).reshape(3))
         self._min_depth_m = min_depth_m
         self._max_depth_m = max_depth_m
+
+    def _upload(self, slot: tuple[Any, ...], array: np.ndarray) -> torch.Tensor:
+        """Device copy of a host array through a reused pinned buffer, without a stream sync.
+
+        The returned device tensor is reused by the next upload to the same slot; every reader runs on the
+        current stream before that upload is enqueued, so stream order protects it. Callers that keep the
+        result beyond the cycle must clone it."""
+        array = np.ascontiguousarray(array)
+        if self.device.type != "cuda":
+            return torch.as_tensor(array, device=self.device)
+        key = (slot, array.shape, array.dtype.str)
+        entry = self._uploads.get(key)
+        if entry is None:
+            host = torch.empty(array.shape, dtype=torch.from_numpy(array).dtype, pin_memory=True)
+            entry = (host, torch.empty(array.shape, dtype=host.dtype, device=self.device), torch.cuda.Event())
+            self._uploads[key] = entry
+        else:
+            entry[2].synchronize()                  # the previous copy out of `host` finished (one cycle ago)
+        host, dev, done = entry
+        host.numpy()[...] = array
+        dev.copy_(host, non_blocking=True)
+        done.record(torch.cuda.current_stream(self.device))
+        return dev
 
     def _rays(self, height: int, width: int, fx: float, fy: float, cx: float, cy: float) -> tuple[torch.Tensor, torch.Tensor]:
         key = (int(height), int(width), float(fx), float(fy), float(cx), float(cy), str(self.device))
@@ -165,15 +200,20 @@ class SceneCloudAssembler:
         self._ray_cache[key] = cached
         return cached
 
-    def _exclusion_mask_gpu(self, result: Any, shape: tuple[int, int]) -> torch.Tensor:
-        """Union of tracked final masks + the tracker-provided exclusion-only mask."""
-        excluded_cpu = np.zeros(shape, dtype=bool)
+    def _exclusion_mask_gpu(self, result: Any, shape: tuple[int, int], view: int) -> torch.Tensor | None:
+        """Union of tracked final masks + the tracker-provided exclusion-only mask (None: nothing excluded).
+
+        Host masks (rare) are OR-ed on the CPU and uploaded once; device masks are OR-ed on the GPU without a
+        zero host array (the tracker's masks are device tensors)."""
+        excluded_cpu: np.ndarray | None = None
         gpu_masks: list[torch.Tensor] = []
         for instance in getattr(result, "instances", ()):
             mask = getattr(instance, "mask", None)
             if mask is not None and not torch.is_tensor(mask):
                 value = np.asarray(mask)
                 if value.shape == shape:
+                    if excluded_cpu is None:
+                        excluded_cpu = np.zeros(shape, dtype=bool)
                     np.logical_or(excluded_cpu, value, out=excluded_cpu)
                     continue
             elif torch.is_tensor(mask) and tuple(mask.shape) == shape:
@@ -189,9 +229,16 @@ class SceneCloudAssembler:
         elif semantic_exclusion is not None:
             value = np.asarray(semantic_exclusion)
             if value.shape == shape:
+                if excluded_cpu is None:
+                    excluded_cpu = np.zeros(shape, dtype=bool)
                 np.logical_or(excluded_cpu, value, out=excluded_cpu)
 
-        excluded = torch.as_tensor(excluded_cpu, dtype=torch.bool, device=self.device)
+        if excluded_cpu is not None:
+            excluded = self._upload(("excluded", view), excluded_cpu).clone()
+        elif gpu_masks:
+            excluded = gpu_masks.pop(0).to(self.device) != 0       # a new bool tensor (also for bool masks)
+        else:
+            return None
         for mask_gpu in gpu_masks:
             if mask_gpu.device != self.device:
                 mask_gpu = mask_gpu.to(self.device)
@@ -210,7 +257,7 @@ class SceneCloudAssembler:
             if world_from_camera is None:
                 continue
             intr = frame.intrinsics
-            excluded = self._exclusion_mask_gpu(result, tuple(depth_cpu.shape))
+            excluded = self._exclusion_mask_gpu(result, tuple(depth_cpu.shape), len(views))
             views.append((depth_cpu, (float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)), np.asarray(world_from_camera, dtype=np.float32), excluded))
         return self._rest_points_from_views(views)
 
@@ -225,6 +272,42 @@ class SceneCloudAssembler:
             views.append((depth_cpu, (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])), np.asarray(cam.T_world_camera, dtype=np.float32), None))
         return self._rest_points_from_views(views)
 
+    def _rest_points_fused(self, views) -> torch.Tensor:
+        """All views through the fused Triton kernel (rest_scene_kernel.py) into one buffer, then the voxel dedup."""
+        sizes = [int(depth_cpu.size) for depth_cpu, *_ in views]
+        total = sum(sizes)
+        buffers = self._fused_buffers
+        if buffers is None or buffers[0].shape[0] != total:
+            buffers = (torch.empty((total, 3), dtype=torch.float32, device=self.device),
+                       torch.empty((total,), dtype=torch.int64, device=self.device))
+            self._fused_buffers = buffers
+        points, keys = buffers
+        start = 0
+        for view, ((depth_cpu, (fx, fy, cx, cy), transform_cpu, excluded), size) in enumerate(zip(views, sizes)):
+            depth = self._upload(("depth", view), depth_cpu).reshape(-1)
+            excl = excluded.reshape(-1).to(self.device) if excluded is not None else None
+            rest_scene_kernel.backproject_view(
+                depth, excl, (fx, fy, cx, cy, int(depth_cpu.shape[1])), np.asarray(transform_cpu, dtype=np.float64).tolist(),
+                self._origin_host, self._inv_voxel_size, (self._min_depth_m, self._max_depth_m),
+                points[start:start + size], keys[start:start + size],
+            )
+            start += size
+        return self._dedup(points, keys)
+
+    def _dedup(self, points: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """One point per voxel key (the first in sort order); INVALID_KEY marks dropped pixels.
+
+        Sets last_rest_input to the number of valid pixels; it is read after the boolean index, which already
+        synchronised the stream, so the count costs no extra stall."""
+        invalid_key = rest_scene_kernel.INVALID_KEY
+        sorted_keys, order = torch.sort(keys)
+        valid = sorted_keys != invalid_key
+        keep = valid.clone()
+        keep[1:] &= sorted_keys[1:] != sorted_keys[:-1]
+        rest = points[order[keep]]
+        self.last_rest_input = int(valid.sum())
+        return rest
+
     def _rest_points_from_views(self, views) -> torch.Tensor:
         """Dense backprojection of every view, world transform, voxel dedup on one lattice; all on CUDA.
 
@@ -234,16 +317,19 @@ class SceneCloudAssembler:
         self.last_rest_input = 0
         if self._origin is None:
             return empty
+        views = [v for v in views if v[2].shape in {(4, 4), (3, 4)}]
+        if not views:
+            return empty
+        if rest_scene_kernel.available(self.device):
+            return self._rest_points_fused(views)
+        # Reference path (no Triton): same arithmetic in plain torch ops.
         all_points: list[torch.Tensor] = []
         all_keys: list[torch.Tensor] = []
         bias = 1 << 20
         key_mask = (1 << 21) - 1
-        invalid_key = torch.iinfo(torch.int64).max
-        for depth_cpu, (fx, fy, cx, cy), transform_cpu, excluded in views:
-            if transform_cpu.shape not in {(4, 4), (3, 4)}:
-                continue
+        for view, (depth_cpu, (fx, fy, cx, cy), transform_cpu, excluded) in enumerate(views):
             height, width = map(int, depth_cpu.shape)
-            depth = torch.as_tensor(depth_cpu, dtype=torch.float32, device=self.device).reshape(-1)
+            depth = self._upload(("depth", view), depth_cpu).reshape(-1)
             valid = torch.isfinite(depth) & (depth >= self._min_depth_m) & (depth <= self._max_depth_m)
             if excluded is not None:
                 valid &= ~excluded.reshape(-1).to(self.device)
@@ -254,7 +340,7 @@ class SceneCloudAssembler:
             points_camera[:, 0] = ray_x * z
             points_camera[:, 1] = ray_y * z
             points_camera[:, 2] = z
-            transform = torch.as_tensor(transform_cpu, dtype=torch.float32, device=self.device)
+            transform = self._upload(("transform", view), transform_cpu)
             points_world = points_camera @ transform[:3, :3].T
             points_world.add_(transform[:3, 3])
             voxel_coords = torch.floor((points_world - self._origin) * self._inv_voxel_size).to(torch.int64)
@@ -262,17 +348,7 @@ class SceneCloudAssembler:
             in_key_range = (shifted >= 0).all(dim=1) & (shifted <= key_mask).all(dim=1)
             valid.logical_and_(in_key_range)
             keys = (shifted[:, 0] << 42) | (shifted[:, 1] << 21) | shifted[:, 2]
-            keys.masked_fill_(~valid, invalid_key)
-            self.last_rest_input += int(valid.sum().item())
+            keys.masked_fill_(~valid, rest_scene_kernel.INVALID_KEY)
             all_points.append(points_world)
             all_keys.append(keys)
-        if not all_points:
-            return empty
-        points = all_points[0] if len(all_points) == 1 else torch.cat(all_points, dim=0)
-        keys = all_keys[0] if len(all_keys) == 1 else torch.cat(all_keys, dim=0)
-        sorted_keys, order = torch.sort(keys)
-        keep = torch.empty_like(sorted_keys, dtype=torch.bool)
-        keep[0] = sorted_keys[0] != invalid_key
-        if sorted_keys.numel() > 1:
-            keep[1:] = (sorted_keys[1:] != sorted_keys[:-1]) & (sorted_keys[1:] != invalid_key)
-        return points[order[keep]]
+        return self._dedup(torch.cat(all_points, dim=0), torch.cat(all_keys, dim=0))

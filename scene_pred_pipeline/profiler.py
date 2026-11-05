@@ -192,6 +192,7 @@ class CycleProfiler:
             "tracker_total",
             "instance_filter",
             "difflow_total",
+            "flow_guard",
             "velocity_recovery",
             "tracking_model",
             "postprocess",
@@ -212,6 +213,7 @@ class CycleProfiler:
             timings["tracker_total"],
             timings["instance_filter"],
             timings["difflow_total"],
+            timings["flow_guard"],
             timings["velocity_recovery"],
         )
 
@@ -285,6 +287,7 @@ class CycleProfiler:
         for name, label in self._DIFFLOW_DETAIL:
             add(name, 4, label)
         rows.append("")
+        add("flow_guard")
         add("velocity_recovery")
         add("cycle_other")
 

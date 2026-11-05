@@ -38,29 +38,15 @@ preprocessing:
   # Z-order sort of the anchors (needed by model.fast_top_level_min_points).
   sort_anchors_morton: true
 
-  # Runs after adaptive voxel-2 and before exact-count selection/FPS.
-  outlier_filter:
-    enabled: false
-    min_component_size_ratio: 0.02
-
   # Runs after FPS
   auto_spatial_scale:
     enable: true
     target_model_volume: 5.0
     fixed_spatial_scale: 1.0
 
-motion_estimation:
-  kalman:
-    enabled: false
-    process_velocity_std_mps: 0.15
-    measurement_noise_std_mps: 0.10
-    initial_velocity_std_mps: 0.30
-    min_innovation_variance: 1.0e-6
-
 recovery:
   softmax_sigma_m: 0.025  # Real/world metric bandwidth in metres.
   backend: local  # auto | global | local | torch
   local_radius_sigma: 4.0
   local_hash_size_factor: 4.0
-  report_local_stats: false
   chunk_size: 4096  # Used only by the PyTorch fallback backend.

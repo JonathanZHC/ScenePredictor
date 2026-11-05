@@ -174,7 +174,7 @@ def uncertainty_colors(radius_m: np.ndarray) -> np.ndarray:
     return (1.0 - weight) * _UNCERTAINTY_RAMP[index] + weight * _UNCERTAINTY_RAMP[index + 1]
 
 
-def _rate_gate(next_ns: int, period_ns: int, now_ns: int) -> tuple[bool, int]:
+def rate_gate(next_ns: int, period_ns: int, now_ns: int) -> tuple[bool, int]:
     """Phase-locked rate gate: (due, next deadline). Due at the first call of every period, so
     frames faster than the rate give the configured average rate; scheduling ``now + period``
     instead loses up to one frame interval per publish (10 Hz -> 9 Hz with 27 Hz frames).
@@ -421,6 +421,7 @@ class RosVisualizer:
         # Reused Marker objects of the uncertainty markers (publisher thread only; rclpy
         # serialises on publish): ns/id/type/action/alpha are set once per pool entry.
         self._uncertainty_marker_pool: list[Marker] = []
+        self._line_point_pool: list[Point] = []
         # Real publishes per topic since the last rate_summary() (profiler summary line).
         self._publish_counts: dict[str, int] = {}
         self._rate_since = time.monotonic()
@@ -512,7 +513,7 @@ class RosVisualizer:
         if period_ns <= 0:
             return True
 
-        due, self._next_visualization_ns = _rate_gate(
+        due, self._next_visualization_ns = rate_gate(
             self._next_visualization_ns, period_ns, time.monotonic_ns()
         )
         return due
@@ -523,7 +524,7 @@ class RosVisualizer:
             return False
         if self._uncertainty_with_every_publish:
             return True
-        due, self._next_uncertainty_ns = _rate_gate(
+        due, self._next_uncertainty_ns = rate_gate(
             self._next_uncertainty_ns, self._uncertainty_period_ns, time.monotonic_ns()
         )
         return due
@@ -680,7 +681,16 @@ class RosVisualizer:
         marker.color.g = 0.9
         marker.color.b = 1.0
         marker.color.a = 1.0
-        marker.points = [Point(x=x, y=y, z=z) for x, y, z in segments.tolist()]
+        # Pooled Point objects (publish() serializes synchronously, so reuse is safe): updating
+        # attributes is ~2.5x cheaper than constructing 2 x lines Points per publish.
+        pool = self._line_point_pool
+        while len(pool) < segments.shape[0]:
+            pool.append(Point())
+        for point, (x, y, z) in zip(pool, segments.tolist()):
+            point.x = x
+            point.y = y
+            point.z = z
+        marker.points = pool[: segments.shape[0]]
         array.markers.append(marker)
         self.marker_pub.publish(array)
         self._count_publish("velocity_markers")
@@ -817,7 +827,7 @@ class RosVisualizer:
     def _scene_cloud_due(self) -> bool:
         if self._scene_cloud_period_ns <= 0:
             return False
-        due, self._next_scene_cloud_ns = _rate_gate(
+        due, self._next_scene_cloud_ns = rate_gate(
             self._next_scene_cloud_ns, self._scene_cloud_period_ns, time.monotonic_ns()
         )
         return due
