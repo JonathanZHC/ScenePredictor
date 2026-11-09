@@ -124,6 +124,15 @@ class DifFlowCanonicalNormalizationConfig:
     model_radius: float = 8.97
     scale_ratio: float = 1.5
     center_shift: float = 0.3
+    # mode 'density': k from the median nearest-neighbour spacing (target_spacing model units), cloud diameter clamped to
+    # [extent_min, extent_max]; 'canonical' = RMS radius -> model_radius. k_max caps k in both modes (null = no cap).
+    # min_points > 0: a tracked cloud with fewer points raises instead of producing a meaningless flow.
+    mode: str = "canonical"
+    target_spacing: float = 0.1
+    extent_min: float = 0.6
+    extent_max: float = 10.0
+    k_max: float | None = None
+    min_points: int = 0
 
 
 @dataclass(frozen=True)

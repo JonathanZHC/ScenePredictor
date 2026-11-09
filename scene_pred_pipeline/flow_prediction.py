@@ -245,11 +245,18 @@ class DifFlowPredictor:
             normalization_module = importlib.import_module(
                 "difflow3d.runtime.normalization"
             )
+            extra = {}
+            if str(getattr(canonical, "mode", "canonical")) != "canonical" or getattr(canonical, "k_max", None) is not None \
+                    or int(getattr(canonical, "min_points", 0)) > 0:
+                extra = dict(mode=str(canonical.mode), target_spacing=float(canonical.target_spacing), extent_min=float(canonical.extent_min),
+                             extent_max=float(canonical.extent_max), k_max=(None if canonical.k_max is None else float(canonical.k_max)),
+                             min_points=int(canonical.min_points))
             optional["normalization"] = normalization_module.AnchoredNormalization(
                 model_center=tuple(canonical.model_center),
                 model_radius=float(canonical.model_radius),
                 scale_ratio=float(canonical.scale_ratio),
                 center_shift=float(canonical.center_shift),
+                **extra,
             )
         if self.uncertainty_head is not None:
             optional["uncertainty_head"] = self.uncertainty_head
