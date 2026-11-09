@@ -78,6 +78,9 @@ class ScenePredictionPipeline:
                     min_displacement_m=guard.min_displacement_m,
                     support_radius_m=guard.support_radius_m,
                     calibration_scale=self.flow_predictor.calibration_scale,
+                    support_spacing_factor=guard.support_spacing_factor,
+                    majority_fraction=guard.majority_fraction,
+                    report_period_s=guard.report_period_s,
                 )
         # Full-scene cloud (tracked points + velocity, rest points + zero velocity)
         # for in-process consumers such as the safety filter.
@@ -276,7 +279,9 @@ class ScenePredictionPipeline:
                     # Segmentation-bleed guard: large displacements without current-frame support get the
                     # neighbours' softmax displacement and covariance (scene_pred_pipeline/flow_guard.py).
                     with self.profiler.stage("flow_guard", cuda=True):
-                        flow_result = self.flow_guard(flow_result, pair.current_points)
+                        flow_result = self.flow_guard(flow_result, pair.current_points, pair.current_track_ids)
+                    if self.flow_guard.report_period_s > 0:
+                        self.flow_guard.report()
 
                 # Boolean-mask indexing on CUDA runs nonzero() and syncs the host
                 # to size the result. With the outlier filter disabled the keep

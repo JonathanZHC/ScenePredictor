@@ -291,6 +291,12 @@ class DifFlowFlowGuardConfig:
     enabled: bool = False
     min_displacement_m: float = 0.05
     support_radius_m: float = 0.015
+    # support radius = max(support_radius_m, support_spacing_factor x median NN spacing of the current cloud); a track with
+    # more than majority_fraction of its anchors flagged keeps its flow (fast object, not bleed); report_period_s rate-limits
+    # the terminal report of what the guard changed (0 = never print)
+    support_spacing_factor: float = 2.5
+    majority_fraction: float = 0.5
+    report_period_s: float = 1.0
 
 
 @dataclass(frozen=True)

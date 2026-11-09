@@ -88,11 +88,48 @@ def test_replacement_is_neighbour_softmax_and_others_untouched():
     assert bool((torch.linalg.eigvalsh(out.anchor_flow_cov[bad].double()) > 0).all())
 
 
-def test_isolated_flagged_anchor_gets_zero_displacement_and_keeps_covariance():
+def test_isolated_flagged_anchor_falls_back_to_the_track_centroid_displacement_never_zero():
     result, current, bad = _scene()
-    out = _guard()(result, current)
-    torch.testing.assert_close(out.anchor_flow[100], torch.zeros(3, device=DEV))
+    out = _guard()(result, current)                                       # no current track ids: keeps its own displacement
+    torch.testing.assert_close(out.anchor_flow[100], result.anchor_flow[100])
     torch.testing.assert_close(out.anchor_flow_cov[100], result.anchor_flow_cov[100])
+    ids = torch.ones(current.shape[0], dtype=torch.int32, device=DEV)
+    out = _guard()(result, current, ids)                                  # track centroid moved +2 cm x (100 of 101 points)
+    torch.testing.assert_close(out.anchor_flow[100], torch.tensor([0.02 * 100 / 101, 0.0, 0.0], device=DEV), atol=1e-5, rtol=0)
+    torch.testing.assert_close(out.anchor_flow_cov[100], result.anchor_flow_cov[100])
+    assert out.anchor_flow[100].abs().sum() > 0
+
+
+def test_majority_flagged_track_keeps_its_flow():
+    """A fast object: all anchors of a track jump 20 cm and none has support -> not bleed, flow kept, reported."""
+    result, current, bad = _scene()
+    anchors2 = result.source_anchors + torch.tensor([2.0, 0.0, 0.0], device=DEV)
+    flow2 = torch.zeros_like(anchors2); flow2[:, 0] = 0.20
+    ids2 = torch.full((101,), 7, dtype=torch.int32, device=DEV)
+    merged = FlowResult(source_anchors=torch.cat([result.source_anchors, anchors2]), warped_anchors=torch.cat([result.warped_anchors, anchors2 + flow2]),
+                        anchor_flow=torch.cat([result.anchor_flow, flow2]), source_anchor_track_ids=torch.cat([result.source_anchor_track_ids, ids2]),
+                        target_input_keep_mask=torch.ones(202, dtype=torch.bool, device=DEV), anchor_flow_cov=None, anchor_flow_cov_scale=None)
+    out = _guard()(merged, current)                                       # no current points of track 7 at all
+    torch.testing.assert_close(out.anchor_flow[101:], flow2)
+    n, flagged, kept, repl, cen, ntr = _guard_stats(_guard(), merged, current)
+    assert n == 202 and flagged >= 101 + 2 and kept == 101 and ntr == 1
+
+
+def _guard_stats(guard, result, current):
+    guard(result, current)
+    return guard.stats_list()
+
+
+def test_support_radius_follows_the_cloud_spacing():
+    """Current points 2 cm apart: support radius = 2.5 x 2 cm = 5 cm, so a 4 cm gap after warping is still supported."""
+    result, current, bad = _scene()
+    sparse = current[::2]                                                 # 2 cm spacing along one axis
+    anchors = result.source_anchors[:50]
+    flow = torch.zeros_like(anchors); flow[:, 0] = 0.06                   # big displacement, lands 4 cm off the sparse cloud
+    r = FlowResult(source_anchors=anchors, warped_anchors=anchors + flow, anchor_flow=flow, source_anchor_track_ids=torch.ones(50, dtype=torch.int32, device=DEV),
+                   target_input_keep_mask=torch.ones(50, dtype=torch.bool, device=DEV), anchor_flow_cov=None, anchor_flow_cov_scale=None)
+    g = _guard(); g(r, sparse)
+    assert g.stats_list()[1] == 0
 
 
 def test_calibration_scale_follows_corrected_displacement():
@@ -121,11 +158,12 @@ def test_real_recoverer_matches_reference():
     result, current, bad = _scene()
     out = FlowGuard(real, min_displacement_m=0.05, support_radius_m=0.015)(result, current)
     torch.testing.assert_close(out.anchor_flow[bad], torch.tensor([0.02, 0.0, 0.0], device=DEV), atol=1e-5, rtol=0)
-    torch.testing.assert_close(out.anchor_flow[100], torch.zeros(3, device=DEV))
+    torch.testing.assert_close(out.anchor_flow[100], result.anchor_flow[100])     # isolated, no track info: kept, not zeroed
 
 
 def test_config_defaults_and_validation(tmp_path):
-    assert DifFlowFlowGuardConfig() == DifFlowFlowGuardConfig(enabled=False, min_displacement_m=0.05, support_radius_m=0.015)
+    assert DifFlowFlowGuardConfig() == DifFlowFlowGuardConfig(enabled=False, min_displacement_m=0.05, support_radius_m=0.015,
+                                                             support_spacing_factor=2.5, majority_fraction=0.5, report_period_s=1.0)
     base = "model:\n  checkpoint: x.pth\n"
     for text, message in (("flow_guard:\n  enabled: 1\n", "enabled must be boolean"),
                           ("flow_guard:\n  support_radius_m: -0.01\n", "must be positive"),
