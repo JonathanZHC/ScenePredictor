@@ -53,6 +53,7 @@ preprocessing:
 # with a stick, 3 x 60 s, uncertainty tightening on): joint cloud 3 items placed (the robot stalls), per object 12
 # items and 9 of 27 strikes hit. Cost (RTX 5090): about 3.6 ms + 0.67 ms per 1000 points + 0.9 ms per further
 # object, the forwards overlap; the context points are computed twice (person + stick: flow step 9.0 ms).
+# Each further object costs about 15 s of start-up and 1.2 GiB of GPU memory (its own CUDA graphs).
 # A single tracked instance is the plain joint forward. enabled: false = one joint cloud for all objects.
 per_object:
   enabled: true
