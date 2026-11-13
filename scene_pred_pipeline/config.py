@@ -299,22 +299,41 @@ class DifFlowFlowGuardConfig:
     report_period_s: float = 1.0
 
 
-@dataclass(frozen=True)
-class DifFlowPerObjectConfig:
-    """Per-object inference (scene_pred_pipeline/object_flow.py): every tracked object gets a DifFlow3D forward of
-    its own - all its points plus, as context, the other objects' points in the grid cells (edge context_cell_m)
-    it occupies or touches - on its own CUDA stream; only its own anchors are returned. One joint cloud starves a
-    thin or small object next to a large one of coarse pyramid points and its extremity gets a biased flow and a
-    large uncertainty."""
+FLOW_MODES = ("joint", "per_object", "scheduled")
 
-    enabled: bool = True
-    # Forwards (runners, each with its own CUDA graphs) kept ready: min(max_objects, number of tracked instances).
-    # More objects than that, and objects below min_points, ride in the largest object's cloud.
-    max_objects: int = 4
-    # Edge of the context grid (m): context = other objects' points within about 1-2 cells. Too small loses the
-    # motion cue of objects in contact (fast-motion error up), too large crowds the small object out again.
+
+@dataclass(frozen=True)
+class DifFlowScheduleConfig:
+    """Settings of object_flow.mode scheduled (scene_pred_pipeline/scheduled_flow.py)."""
+
+    # Forwards with context kept for the objects in contact that moved fastest recently; every other object is a row.
+    own_forwards: int = 2
+    # The budget controller keeps the median time of the pipeline's cycle below this.
+    target_cycle_ms: float = 31.0
+    budget_control: bool = True
+    # Rows of slow objects are re-estimated every 2-3 cycles over the frames since their last estimate.
+    multi_rate: bool = True
+
+
+@dataclass(frozen=True)
+class DifFlowObjectFlowConfig:
+    """How the tracked objects are distributed over DifFlow3D forwards (scene_pred_pipeline/object_flow.py).
+
+    joint       one forward for the joint cloud of all objects (the cheapest; a thin or small object next to a large one
+                keeps few coarse pyramid points, its extremity gets a biased flow and a large uncertainty)
+    per_object  every object a forward of its own, with the other objects' points in the grid cells it occupies or
+                touches as context, side by side on separate CUDA streams (max_objects forwards; further objects and
+                objects below min_points ride in the largest object's cloud)
+    scheduled   forwards of their own only for the objects in contact that move; every other object is a row of a batched
+                forward, re-estimated at a rate that follows its motion; a budget controller holds the cycle time
+    """
+
+    mode: str = "joint"
+    # Edge of the context grid (m): context = other objects' points within about 1-2 cells (per_object, scheduled).
     context_cell_m: float = 0.15
+    max_objects: int = 4
     min_points: int = 256
+    scheduled: DifFlowScheduleConfig = field(default_factory=DifFlowScheduleConfig)
 
 
 @dataclass(frozen=True)
@@ -331,7 +350,7 @@ class DifFlowConfig:
         default_factory=DifFlowUncertaintyHeadConfig
     )
     flow_guard: DifFlowFlowGuardConfig = field(default_factory=DifFlowFlowGuardConfig)
-    per_object: DifFlowPerObjectConfig = field(default_factory=DifFlowPerObjectConfig)
+    object_flow: DifFlowObjectFlowConfig = field(default_factory=DifFlowObjectFlowConfig)
 
 
 @dataclass(frozen=True)
@@ -737,6 +756,29 @@ def _check_head_iterations(meta: Mapping[str, Any], iterations: DifFlowIteration
         )
 
 
+def _object_flow_config(value: Any) -> DifFlowObjectFlowConfig:
+    name = "difflow.object_flow"
+    values = _known_keys(DifFlowObjectFlowConfig, _mapping(value, name=name), name=name)
+    schedule = _known_keys(
+        DifFlowScheduleConfig, _mapping(values.pop("scheduled", None), name=f"{name}.scheduled"), name=f"{name}.scheduled"
+    )
+    if values.get("mode", "joint") not in FLOW_MODES:
+        raise ValueError(f"{name}.mode must be one of {FLOW_MODES}, got {values['mode']!r}")
+    for key, holder, prefix in (
+        ("max_objects", values, name), ("min_points", values, name), ("own_forwards", schedule, f"{name}.scheduled")
+    ):
+        if key in holder and (isinstance(holder[key], bool) or not isinstance(holder[key], int) or holder[key] < 1):
+            raise ValueError(f"{prefix}.{key} must be an integer >= 1")
+    for key in ("budget_control", "multi_rate"):
+        if key in schedule and not isinstance(schedule[key], bool):
+            raise ValueError(f"{name}.scheduled.{key} must be boolean")
+    if "context_cell_m" in values:
+        values["context_cell_m"] = _positive(values["context_cell_m"], name=f"{name}.context_cell_m")
+    if "target_cycle_ms" in schedule:
+        schedule["target_cycle_ms"] = _positive(schedule["target_cycle_ms"], name=f"{name}.scheduled.target_cycle_ms")
+    return DifFlowObjectFlowConfig(scheduled=DifFlowScheduleConfig(**schedule), **values)
+
+
 def _load_difflow_config(path: Path) -> DifFlowConfig:
     with path.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
@@ -820,23 +862,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         if key in flow_guard_values:
             flow_guard_values[key] = _positive(flow_guard_values[key], name=f"difflow.flow_guard.{key}")
     flow_guard = DifFlowFlowGuardConfig(**flow_guard_values)
-    per_object_values = _known_keys(
-        DifFlowPerObjectConfig,
-        _mapping(raw.get("per_object"), name="difflow.per_object"),
-        name="difflow.per_object",
-    )
-    if not isinstance(per_object_values.get("enabled", True), bool):
-        raise ValueError("difflow.per_object.enabled must be boolean")
-    for key in ("max_objects", "min_points"):
-        if key in per_object_values:
-            value = per_object_values[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"difflow.per_object.{key} must be an integer >= 1")
-    if "context_cell_m" in per_object_values:
-        per_object_values["context_cell_m"] = _positive(
-            per_object_values["context_cell_m"], name="difflow.per_object.context_cell_m"
-        )
-    per_object = DifFlowPerObjectConfig(**per_object_values)
+    object_flow = _object_flow_config(raw.get("object_flow"))
 
     if runtime.cuda_graph_warmup < 1:
         raise ValueError("difflow.runtime.cuda_graph_warmup must be >= 1")
@@ -931,6 +957,10 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
     if recovery.softmax_sigma_m <= 0.0:
         raise ValueError("difflow.recovery.softmax_sigma_m must be positive")
 
+    if object_flow.mode == "scheduled" and not preprocessing.canonical_normalization.enable:
+        # the rows of the batched forward are normalised per object, which is the canonical normalisation
+        raise ValueError("difflow.object_flow.mode scheduled needs preprocessing.canonical_normalization.enable: true")
+
     return DifFlowConfig(
         runtime=runtime,
         model=model,
@@ -938,7 +968,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         recovery=recovery,
         uncertainty_head=uncertainty_head,
         flow_guard=flow_guard,
-        per_object=per_object,
+        object_flow=object_flow,
     )
 
 

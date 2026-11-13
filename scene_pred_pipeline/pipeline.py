@@ -10,8 +10,7 @@ from .data_types import (
     SceneVelocityOutput,
     TrackedInstanceFrame,
 )
-from .flow_prediction import DifFlowPredictor
-from .object_flow import PerObjectFlowPredictor
+from .object_flow import build_flow_predictor
 from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
 from .scene_assembly import SceneCloudAssembler
@@ -60,21 +59,11 @@ class ScenePredictionPipeline:
                 tracker_config
             )
 
-            # One forward per tracked object, side by side (object_flow.py), when several instances can be
-            # tracked; a single instance is the plain joint forward.
-            per_object = config.difflow.per_object
-            flow_objects = min(int(per_object.max_objects), config.tracker.max_tracked_instances)
-            if per_object.enabled and flow_objects > 1:
-                self.flow_predictor = PerObjectFlowPredictor(
-                    config,
-                    upstream_voxel_size_m=upstream_voxel_size_m,
-                    max_objects=flow_objects,
-                )
-            else:
-                self.flow_predictor = DifFlowPredictor(
-                    config,
-                    upstream_voxel_size_m=upstream_voxel_size_m,
-                )
+            # joint | per_object | scheduled (difflow object_flow.mode, object_flow.py)
+            self.flow_predictor = build_flow_predictor(
+                config,
+                upstream_voxel_size_m=upstream_voxel_size_m,
+            )
             self.flow_predictor.prepare()
 
             self.tracker = MultiViewTrackerAdapter(
@@ -207,6 +196,12 @@ class ScenePredictionPipeline:
         worker = getattr(self.tracker, "sam3_worker", None)
         if worker is not None:
             worker.set_idle()
+
+    def _report_cycle_time(self, timings: dict[str, float]) -> None:
+        """object_flow.mode scheduled holds the cycle time with what it measures here (scheduled_flow.py)."""
+        observe = getattr(self.flow_predictor, "observe_cycle_ms", None)
+        if observe is not None:
+            observe(timings["cycle_total"])
 
     def process(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
         """One cycle. Marks the GPU busy for its duration (cooperative SAM3, tracking.yaml
@@ -343,6 +338,7 @@ class ScenePredictionPipeline:
         # RosVisualizer checks subscription counts before any D2H conversion,
         # overlay construction, mask merge, PointCloud2 packing, or marker build.
         timings = self.profiler.finish()
+        self._report_cycle_time(timings)
         if flow_valid:
             runner_timings, outlier_filter_info, outlier_debug = (
                 self.flow_predictor.resolve_after_cycle_fence()

@@ -44,22 +44,33 @@ preprocessing:
     target_model_volume: 5.0
     fixed_spatial_scale: 1.0
 
-# Per-object inference (scene_pred_pipeline/object_flow.py), the default: every tracked object gets a DifFlow3D
-# forward of its own - all its points plus, as context, the other objects' points in the grid cells (edge
-# context_cell_m) it occupies or touches - each on its own CUDA stream; only its own anchors are used (dense
-# recovery stays same-track). In one joint cloud the coarse pyramid levels are sampled by spatial extent: a thin or
-# small object next to a large one keeps a handful of coarse points (a 0.6 m stick held by a person: 21 of 256,
-# 6 of 64), its extremity gets a biased flow and a large uncertainty. SafetyFilterBench scene E (person striking
-# with a stick, 3 x 60 s, uncertainty tightening on): joint cloud 3 items placed (the robot stalls), per object 12
-# items and 9 of 27 strikes hit. Cost (RTX 5090): about 3.6 ms + 0.67 ms per 1000 points + 0.9 ms per further
-# object, the forwards overlap; the context points are computed twice (person + stick: flow step 9.0 ms).
-# Each further object costs about 15 s of start-up and 1.2 GiB of GPU memory (its own CUDA graphs).
-# A single tracked instance is the plain joint forward. enabled: false = one joint cloud for all objects.
-per_object:
-  enabled: true
-  max_objects: 4         # runners kept ready = min(max_objects, tracked instances); further objects ride with the largest
+# How the tracked objects are distributed over DifFlow3D forwards (scene_pred_pipeline/object_flow.py).
+#   joint       one forward for the joint cloud of all objects. The cheapest. The pyramid's coarse levels are sampled
+#               by spatial extent, so a thin or small object next to a large one keeps a handful of coarse points (a
+#               0.6 m stick held by a person: 21 of 256, 6 of 64): its extremity gets a biased flow and a large
+#               uncertainty.
+#   per_object  every object a forward of its own - all its points plus, as context, the other objects' points in the
+#               grid cells (edge context_cell_m) it occupies or touches - side by side on separate CUDA streams; only
+#               its own anchors are used. Best for a few objects in contact; the cost grows with every object.
+#   scheduled   forwards of their own (with context) only for the objects in contact that move; every other object is
+#               a row of a batched forward, re-estimated at a rate that follows its motion; a budget controller holds
+#               the cycle time (scene_pred_pipeline/scheduled_flow.py). For many objects.
+# Whole perception cycle, SafetyFilterBench, RTX 5090, fixed 30 Hz, median (joint / per_object / scheduled):
+# person + stick 17.7 / 20.7 / 21.4 ms; person + stick + 8 balls 28.4 / 38.9 / 32.8 ms.
+# per_object and scheduled keep further runners ready: about 15 s of start-up and 1.2 GiB of GPU memory each.
+# A single tracked instance is always the joint forward.
+object_flow:
+  mode: joint            # joint | per_object | scheduled
   context_cell_m: 0.15   # hyper-parameter: context = the other objects' points within about 1-2 cells of the object
+  # mode per_object
+  max_objects: 4         # runners kept ready = min(max_objects, tracked instances); further objects ride with the largest
   min_points: 256        # smaller objects ride in the largest object's cloud
+  # mode scheduled (needs preprocessing.canonical_normalization)
+  scheduled:
+    own_forwards: 2        # forwards with context, for the objects in contact that moved fastest recently
+    target_cycle_ms: 31.0  # the budget controller keeps the median of the pipeline's cycle below this
+    budget_control: true
+    multi_rate: true       # rows of slow objects are re-estimated every 2-3 cycles over a longer baseline
 
 recovery:
   softmax_sigma_m: 0.025  # Real/world metric bandwidth in metres.
