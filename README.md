@@ -30,7 +30,8 @@ RGB-D cameras / rosbag / Isaac Sim
                 common global_track_id(t-1, t)
                                 │
                                 ▼
-                     one DifFlow3D inference
+          one DifFlow3D inference per tracked object
+          (own points + nearby context, side by side)
                                 │
                                 ▼
                  same-track dense velocity recovery
@@ -318,6 +319,15 @@ The production postprocess optimization bundle is intentionally frozen. `postpro
 - `postprocess.gpu_alignment` (default `true`): cross-view fusion and Chamfer bank staging stay on CUDA (no voxel-cloud D2H, NumPy fusion or re-upload). With one camera no CPU voxel data is copied at all; with several cameras cross-view *matching* still runs on CPU keys. Multi-camera groups are concatenated without cross-view voxel dedup (DifFlow's voxel-2 dedups on its own grid). `false` restores the legacy host round trip, which is also used automatically when `enable_visualization: true`.
 
 `configs/difflow.yaml` owns all DifFlow numerical settings. The current deployment uses 1024 sampled anchors (the checkpoint's native level-1 count, which lets the encoder reuse one KNN across levels 0/1) with the configured coarse/middle/fine iterations and local track-aware CUDA recovery. DifFlow's decode path uses two NVRTC-JIT kernels (`difflow3d/ops/fused_knn.py`, exact register-heap KNN; `difflow3d/ops/fused_cross_block.py`, fused gather+add+activation prologue) with pure-PyTorch fallbacks; `USE_FUSED_KNN` / `USE_FUSED_CROSS_BLOCK` in `difflow3d/model/pointconv.py` toggle them, and `IDENTITY_UPSAMPLE_L1_TO_L0` in `difflow3d/model/difflow.py` controls the identity shortcut for the level-1 -> level-0 upsample at 1024 points.
+
+Per-object inference, on by default (`per_object` in the DifFlow config, `scene_pred_pipeline/object_flow.py`):
+
+- **What.** Every tracked object gets a DifFlow3D forward of its own: all its points plus, as context, the other objects' points in the grid cells (edge `context_cell_m`, default 0.15 m) that the object occupies or that touch one it occupies. Each object has its own runner (CUDA graphs, point buckets, normalisation, encoding reuse) and its own CUDA stream; the forwards overlap on the GPU. Only an object's own anchors are returned, so dense recovery stays same-track.
+- **Why.** In one joint cloud the pyramid's coarse levels are sampled by spatial extent. A thin or small object next to a large one keeps a handful of coarse points (a 0.6 m stick held by a person: 21 of 256, 6 of 64); the coarse flow at its extremity is biased, the fine levels recover it only partly and the uncertainty head reports a large region there. Restricting the neighbour searches to the object does not help; giving the object its own pyramid does.
+- **Context.** Objects in contact need each other: a stick inferred completely alone loses the hand's motion cue and its fast-motion error doubles at the 90th percentile. Too much context crowds the small object out again. `context_cell_m` is the one hyper-parameter; the context is found with one scatter, one 3x3x3 max-pool and one gather per object (0.15 ms for 6k points and 2 objects, 0.28 ms for 50k points and 8 objects).
+- **Cost.** RTX 5090: about 3.6 ms + 0.67 ms per 1000 points + 0.9 ms per further object for full forwards, instead of the sum. Context points are computed twice. Person + stick in the pipeline: flow step 9.0 ms, perception 19.5 ms against 16.4 ms with one joint cloud. Start-up: one more set of CUDA graphs per further object (about 17 s each).
+- **Slots.** `min(max_objects, tracked instances)` runners are kept ready; a single tracked instance is the plain joint forward. Objects beyond the slots and objects below `min_points` ride in the largest object's cloud. `enabled: false` restores one joint cloud for all objects.
+- **Not refitted.** Uncertainty calibration tables fitted on joint clouds are not refitted for per-object clouds.
 
 Optional flow uncertainty, off by default:
 

@@ -11,6 +11,7 @@ from .data_types import (
     TrackedInstanceFrame,
 )
 from .flow_prediction import DifFlowPredictor
+from .object_flow import PerObjectFlowPredictor
 from .instance_filter import CommonInstanceFilter
 from .profiler import CycleProfiler
 from .scene_assembly import SceneCloudAssembler
@@ -59,10 +60,21 @@ class ScenePredictionPipeline:
                 tracker_config
             )
 
-            self.flow_predictor = DifFlowPredictor(
-                config,
-                upstream_voxel_size_m=upstream_voxel_size_m,
-            )
+            # One forward per tracked object, side by side (object_flow.py), when several instances can be
+            # tracked; a single instance is the plain joint forward.
+            per_object = config.difflow.per_object
+            flow_objects = min(int(per_object.max_objects), config.tracker.max_tracked_instances)
+            if per_object.enabled and flow_objects > 1:
+                self.flow_predictor = PerObjectFlowPredictor(
+                    config,
+                    upstream_voxel_size_m=upstream_voxel_size_m,
+                    max_objects=flow_objects,
+                )
+            else:
+                self.flow_predictor = DifFlowPredictor(
+                    config,
+                    upstream_voxel_size_m=upstream_voxel_size_m,
+                )
             self.flow_predictor.prepare()
 
             self.tracker = MultiViewTrackerAdapter(

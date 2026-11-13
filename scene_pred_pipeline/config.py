@@ -300,6 +300,24 @@ class DifFlowFlowGuardConfig:
 
 
 @dataclass(frozen=True)
+class DifFlowPerObjectConfig:
+    """Per-object inference (scene_pred_pipeline/object_flow.py): every tracked object gets a DifFlow3D forward of
+    its own - all its points plus, as context, the other objects' points in the grid cells (edge context_cell_m)
+    it occupies or touches - on its own CUDA stream; only its own anchors are returned. One joint cloud starves a
+    thin or small object next to a large one of coarse pyramid points and its extremity gets a biased flow and a
+    large uncertainty."""
+
+    enabled: bool = True
+    # Forwards (runners, each with its own CUDA graphs) kept ready: min(max_objects, number of tracked instances).
+    # More objects than that, and objects below min_points, ride in the largest object's cloud.
+    max_objects: int = 4
+    # Edge of the context grid (m): context = other objects' points within about 1-2 cells. Too small loses the
+    # motion cue of objects in contact (fast-motion error up), too large crowds the small object out again.
+    context_cell_m: float = 0.15
+    min_points: int = 256
+
+
+@dataclass(frozen=True)
 class DifFlowConfig:
     """Deployment settings loaded once from the standalone difflow.yaml."""
 
@@ -313,6 +331,7 @@ class DifFlowConfig:
         default_factory=DifFlowUncertaintyHeadConfig
     )
     flow_guard: DifFlowFlowGuardConfig = field(default_factory=DifFlowFlowGuardConfig)
+    per_object: DifFlowPerObjectConfig = field(default_factory=DifFlowPerObjectConfig)
 
 
 @dataclass(frozen=True)
@@ -801,6 +820,23 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         if key in flow_guard_values:
             flow_guard_values[key] = _positive(flow_guard_values[key], name=f"difflow.flow_guard.{key}")
     flow_guard = DifFlowFlowGuardConfig(**flow_guard_values)
+    per_object_values = _known_keys(
+        DifFlowPerObjectConfig,
+        _mapping(raw.get("per_object"), name="difflow.per_object"),
+        name="difflow.per_object",
+    )
+    if not isinstance(per_object_values.get("enabled", True), bool):
+        raise ValueError("difflow.per_object.enabled must be boolean")
+    for key in ("max_objects", "min_points"):
+        if key in per_object_values:
+            value = per_object_values[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"difflow.per_object.{key} must be an integer >= 1")
+    if "context_cell_m" in per_object_values:
+        per_object_values["context_cell_m"] = _positive(
+            per_object_values["context_cell_m"], name="difflow.per_object.context_cell_m"
+        )
+    per_object = DifFlowPerObjectConfig(**per_object_values)
 
     if runtime.cuda_graph_warmup < 1:
         raise ValueError("difflow.runtime.cuda_graph_warmup must be >= 1")
@@ -902,6 +938,7 @@ def _load_difflow_config(path: Path) -> DifFlowConfig:
         recovery=recovery,
         uncertainty_head=uncertainty_head,
         flow_guard=flow_guard,
+        per_object=per_object,
     )
 
 

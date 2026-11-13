@@ -44,6 +44,22 @@ preprocessing:
     target_model_volume: 5.0
     fixed_spatial_scale: 1.0
 
+# Per-object inference (scene_pred_pipeline/object_flow.py), the default: every tracked object gets a DifFlow3D
+# forward of its own - all its points plus, as context, the other objects' points in the grid cells (edge
+# context_cell_m) it occupies or touches - each on its own CUDA stream; only its own anchors are used (dense
+# recovery stays same-track). In one joint cloud the coarse pyramid levels are sampled by spatial extent: a thin or
+# small object next to a large one keeps a handful of coarse points (a 0.6 m stick held by a person: 21 of 256,
+# 6 of 64), its extremity gets a biased flow and a large uncertainty. SafetyFilterBench scene E (person striking
+# with a stick, 3 x 60 s, uncertainty tightening on): joint cloud 3 items placed (the robot stalls), per object 12
+# items and 9 of 27 strikes hit. Cost (RTX 5090): about 3.6 ms + 0.67 ms per 1000 points + 0.9 ms per further
+# object, the forwards overlap; the context points are computed twice (person + stick: flow step 9.0 ms).
+# A single tracked instance is the plain joint forward. enabled: false = one joint cloud for all objects.
+per_object:
+  enabled: true
+  max_objects: 4         # runners kept ready = min(max_objects, tracked instances); further objects ride with the largest
+  context_cell_m: 0.15   # hyper-parameter: context = the other objects' points within about 1-2 cells of the object
+  min_points: 256        # smaller objects ride in the largest object's cloud
+
 recovery:
   softmax_sigma_m: 0.025  # Real/world metric bandwidth in metres.
   backend: local  # auto | global | local | torch
