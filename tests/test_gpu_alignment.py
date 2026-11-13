@@ -27,14 +27,8 @@ def _config(gpu_alignment: bool) -> Config:
             "runtime": {"device": "cuda:0", "enable_visualization": False, "camera_names": ["cam0", "cam1"]},
             "detector": {"prompts": [["ball", 1], ["mug", 1], ["bottle", 1]]},
             "postprocess": {"gpu_geometry": True, "gpu_alignment": gpu_alignment},
-            # The legacy path is coverage-based and merges on the first passing frame;
-            # pin both explicitly (tracker defaults: containment, merge_confirm_frames=2).
-            "shared_voxel_grid": {"association": "coverage", "merge_confirm_frames": 1,
-                                  "voxel_size_m": 0.005, "origin_world": [0, 0, 0], "match_radius_voxels": 1,
-                                  "min_alignment_score": 0.15, "min_bidirectional_coverage": 0.2,
-                                  "max_local_dense_voxels": 1_000_000},
-            "cross_frame_alignment": {"centroid_gate_m": 0.2, "chamfer_max_workspace_mb": 24,
-                                      "chamfer_preallocate_points": 8192},
+            "shared_voxel_grid": {"voxel_size_m": 0.005, "origin_world": [0, 0, 0]},
+            "cross_frame_alignment": {"bank_preallocate_points": 8192},
         }
     )
 
@@ -130,7 +124,7 @@ class GpuAlignmentEquivalenceTests(unittest.TestCase):
             gpu_cf.align(gpu_groups)
             torch.cuda.synchronize()
             self.assertEqual([g.global_track_id for g in legacy_groups], [g.global_track_id for g in gpu_groups])
-            gw = gpu_cf.workspace
+            gw = gpu_cf.bank
             for g, count in zip(gpu_groups, gw.current_counts_np):
                 self.assertEqual(int(count), g.point_count)
                 self.assertIsNotNone(g.points_world_gpu)

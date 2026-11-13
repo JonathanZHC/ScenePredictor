@@ -99,30 +99,16 @@ postprocess:
   # Disable it to avoid a full HxW allocation/zero-fill per camera per frame.
   build_owner_map: false
 
-# Same-time, different-camera association. Per-instance world AABBs come from the shared
-# voxel lattice (sparse keys, no dense volume).
+# Same time, different cameras: which instances are one object (sam_rgbd_tracking/cross_view_gap.py). Per semantic
+# class the observations of every two cameras are matched one to one with the least total surface gap - the distance
+# within which 5 % of one cloud's voxels find the other cloud. A gap below gap.merge_m merges on its own; a class
+# left with more instances than its prompt capacity gets the nearest ones merged, up to gap.forced_max_m. Two views
+# of one object merge although their boxes do not overlap (small objects seen from two sides, each camera seeing
+# another part); an object seen by one camera only stays an instance of its own.
+# MultiViewRGBDTracker scripts/benchmark_association.py: 20 scenes with known identities, 2 - 4 cameras.
 shared_voxel_grid:
   voxel_size_m: 0.005
   origin_world: [0.0, 0.0, 0.0]
-  # association: gap | containment | coverage (legacy).
-  #   gap (sam_rgbd_tracking/cross_view_gap.py): the surface gap of the two clouds - the distance within which 5 % of
-  #     one cloud's voxels find the other - under the per-class instance count (the prompt capacities). Per pair of
-  #     cameras the observations of a class are matched one to one with the least total gap; a gap below gap.merge_m
-  #     merges on its own, and when a class is left with more instances than its capacity the threshold is raised
-  #     just far enough for the count to fit (never beyond gap.forced_max_m). Two views of one object merge although
-  #     their boxes do not overlap (small objects seen from two sides, each camera seeing another part); an object
-  #     seen by one camera only stays an instance of its own.
-  #   containment: intersection volume of the two AABBs / smaller AABB volume >= min_containment_ratio.
-  #     View-invariant for large solid objects: a human seen from the front and from the back has almost
-  #     identical boxes although the visible surfaces are ~25 cm apart; a partial view lies inside
-  #     the full one. Fails for small objects (a can or a ball seen from two sides gives two shells whose boxes
-  #     overlap by 10 - 20 %) and for partial views that do not overlap.
-  #   coverage: bidirectional voxel-surface coverage within match_radius_voxels (fails for
-  #     non-overlapping surfaces, needs ~1 cm extrinsic accuracy).
-  # MultiViewRGBDTracker scripts/benchmark_association.py (20 scenes with known identities, 2 - 4 cameras): frames
-  # with every pair right gap 100 %, containment 59 %. Real pipeline in SafetyFilterBench, two cameras, ten objects:
-  # cycles with exactly one track per object 99.5 % against 0.2 %, alignment step 1.5 ms against 1.3 ms.
-  association: gap
   gap:
     merge_m: 0.15        # two views of one object: 1 - 3 cm, up to 12 cm for cameras opposite each other
     split_m: 0.20        # a merged pair stays merged up to this gap
@@ -131,41 +117,20 @@ shared_voxel_grid:
     memory_s: 0.3        # a forced merge outlives the count by this (another object of the class hidden for a moment)
     samples: 96          # voxels per cloud a gap is measured on
     measure_every: 3     # frames between two measurements of a pair whose boxes keep their offset
-  # containment / coverage only:
-  min_containment_ratio: 0.5
-  # Hysteresis on each (camera slot, camera slot) pair: merge after merge_confirm_frames
-  # consecutive passes, split after split_confirm_frames consecutive failures. EfficientTAM
-  # keeps a per-camera slot on the same object, so the pairing survives frames in which the
-  # geometric test flickers.
-  merge_confirm_frames: 2
-  split_confirm_frames: 5
-  # legacy coverage parameters
-  match_radius_voxels: 1
-  min_alignment_score: 0.15
-  min_bidirectional_coverage: 0.20
-  # Optional bounded per-object local occupancy acceleration; never a global grid.
-  max_local_dense_voxels: 1000000
 
-# Different-time association (global ids): a track is its last observed world box, no motion model (a walking
-# person moves ~5 cm per frame, far less than its box). A track and an observation of its class can be matched when
-# their boxes' containment reaches min_containment_ratio or one box holds the other's centre (expanded by
-# centre_margin_m). Unmatched tracks keep their id for max_age_s. Time-based (frame stamps).
+# Different times: persistent global ids. A track is its last observed world box, no motion model. A track and an
+# instance of its class can be matched when their boxes' containment reaches min_containment_ratio or one box holds
+# the other's centre, expanded by a margin: centre_margin_m after one frame at 30 Hz, growing with the time since
+# the track was seen (a speed limit of 4.5 m/s), so a lower frame rate or an object hidden for a moment does not
+# cost the id. Among the possible matches: as many as possible with the least total distance between the box
+# centres; of two tracks at the same distance the older one wins. Unmatched tracks keep their id for max_age_s.
 cross_frame_alignment:
   min_containment_ratio: 0.5   # intersection volume / smaller box volume
-  centre_margin_m: 0.15        # a box containing the other box's centre (expanded by this) always matches
+  centre_margin_m: 0.15
   max_age_s: 0.5               # keep an unobserved id for this long
-  # assignment: nearest | oldest_first.
-  #   nearest: as many matches as possible with the least total distance between the box centres; of two tracks at
-  #     the same distance the older one wins. centre_margin_m is then the margin after one frame at 30 Hz and grows
-  #     with the time since the track was seen (a speed limit of 4.5 m/s), so a lower frame rate or an object hidden
-  #     for a moment does not cost the id.
-  #   oldest_first: oldest track first, each takes the free observation with the highest affinity. Objects of a
-  #     class closer than centre_margin_m all have affinity 1 for each other and exchange their ids at random
-  #     (benchmark: 239 id changes over the 20 scenes, nearest 2).
-  assignment: nearest
-  # Fused clouds are still staged into a persistent CUDA bank for the ScenePredictor adapter:
-  chamfer_max_workspace_mb: 24
-  chamfer_preallocate_points: 16384
+  # The fused clouds of the current and the previous frame live in a CUDA bank that the scene-flow stage reads;
+  # rows of this many points are allocated at start (the bank grows when a cloud is larger).
+  bank_preallocate_points: 16384
 
 profiling:
   enabled: true
