@@ -118,14 +118,13 @@ shared_voxel_grid:
     samples: 96          # voxels per cloud a gap is measured on
     measure_every: 3     # frames between two measurements of a pair whose boxes keep their offset
 
-# Different times: persistent global ids. A track is its last observed world box, no motion model. A track and an
-# instance of its class can be matched when their boxes' containment reaches min_containment_ratio or one box holds
-# the other's centre, expanded by a margin: centre_margin_m after one frame at 30 Hz, growing with the time since
-# the track was seen (a speed limit of 4.5 m/s), so a lower frame rate or an object hidden for a moment does not
-# cost the id. Among the possible matches: as many as possible with the least total distance between the box
-# centres; of two tracks at the same distance the older one wins. Unmatched tracks keep their id for max_age_s.
+# Different times: persistent global ids. A track is its last observed world box, no motion model. Tracks and
+# instances of a class are matched with the least total distance between their box centres; of two tracks at the
+# same distance the older one wins. A match needs one box to hold the other's centre, expanded by a margin:
+# centre_margin_m after one frame at 30 Hz, growing with the time since the track was seen (a speed limit of
+# 4.5 m/s), so a lower frame rate or an object hidden for a moment does not cost the id, while the id of an object
+# that disappears does not pass to another one appearing elsewhere. Unmatched tracks keep their id for max_age_s.
 cross_frame_alignment:
-  min_containment_ratio: 0.5   # intersection volume / smaller box volume
   centre_margin_m: 0.15
   max_age_s: 0.5               # keep an unobserved id for this long
   # The fused clouds of the current and the previous frame live in a CUDA bank that the scene-flow stage reads;
