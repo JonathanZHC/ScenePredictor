@@ -183,11 +183,14 @@ class MultiViewTrackerAdapter:
             camera = frame.cameras[camera_name]
             K = camera.K
             rgb = np.ascontiguousarray(camera.rgb, dtype=np.uint8)
-            depth = np.ascontiguousarray(camera.depth, dtype=np.float32)
+            depth_gpu = getattr(camera, "depth_gpu", None)
+            # (a depth that is already on the device stays there: the host image is then only a lazy view)
+            depth = camera.depth if depth_gpu is not None else np.ascontiguousarray(camera.depth, dtype=np.float32)
             view_inputs.append(
                 {
                     "rgb": rgb,
                     "depth_m": depth,
+                    "depth_gpu": depth_gpu,
                     "fx": float(K[0, 0]),
                     "fy": float(K[1, 1]),
                     "cx": float(K[0, 2]),

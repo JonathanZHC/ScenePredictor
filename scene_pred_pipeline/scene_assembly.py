@@ -252,8 +252,8 @@ class SceneCloudAssembler:
         views = []
         for result in output.view_results.values():
             frame = result.frame
-            depth_cpu = np.asarray(frame.depth_m, dtype=np.float32)
-            if depth_cpu.ndim != 2 or depth_cpu.size == 0:
+            depth_cpu = self._depth_view(frame.depth_m, getattr(frame, "depth_gpu", None))
+            if depth_cpu is None:
                 continue
             world_from_camera = getattr(frame, "world_from_camera", None)
             if world_from_camera is None:
@@ -263,19 +263,22 @@ class SceneCloudAssembler:
             views.append((depth_cpu, (float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)), np.asarray(world_from_camera, dtype=np.float32), excluded))
         return self._rest_points_from_views(views)
 
+    @staticmethod
+    def _depth_view(depth_host, depth_gpu):
+        """The depth image of a view for the rest scene: the CUDA tensor when the producer supplied one (no host
+        copy, no upload), else the host array. None for an empty / malformed image."""
+        if depth_gpu is not None:
+            return depth_gpu if depth_gpu.ndim == 2 and depth_gpu.numel() > 0 else None
+        depth = np.asarray(depth_host, dtype=np.float32)
+        return depth if depth.ndim == 2 and depth.size > 0 else None
+
     def rest_points_from_frame(self, frame: MultiCameraFrame) -> torch.Tensor:
         """Rest scene directly from the synchronized RGB-D bundle (no tracker: nothing excluded)."""
         views = []
         for cam in frame.cameras.values():
-            depth_gpu = getattr(cam, "depth_gpu", None)
-            if depth_gpu is not None:                 # already on the device: no host copy, no upload
-                depth_cpu = depth_gpu
-                if depth_cpu.ndim != 2 or depth_cpu.numel() == 0:
-                    continue
-            else:
-                depth_cpu = np.asarray(cam.depth, dtype=np.float32)
-                if depth_cpu.ndim != 2 or depth_cpu.size == 0:
-                    continue
+            depth_cpu = self._depth_view(cam.depth, getattr(cam, "depth_gpu", None))
+            if depth_cpu is None:
+                continue
             K = np.asarray(cam.K, dtype=np.float64).reshape(3, 3)
             views.append((depth_cpu, (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])), np.asarray(cam.T_world_camera, dtype=np.float32), None))
         return self._rest_points_from_views(views)

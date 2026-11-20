@@ -17,9 +17,59 @@ class CameraFrameCpu:
     T_world_camera: np.ndarray
     optical_frame_id: str
     # Optional: the depth image as a CUDA tensor [H, W] float32 (meters), set by a producer that already
-    # has it on the device (an upstream depth filter). Consumers that can take a tensor use it instead of
-    # `depth` and skip the upload; `depth` may then be None.
+    # has it on the device (an upstream depth filter). Consumers that can take a tensor use it and skip
+    # the upload; `depth` is then a LazyHostDepth on the same tensor, downloaded only if somebody reads it.
     depth_gpu: "object | None" = None
+
+
+class LazyHostDepth:
+    """Host view of a depth image that lives on the GPU: looks like the numpy array, downloads on first use.
+
+    Shape, dtype, ndim and size are known without a download. Reading the pixels (np.asarray, indexing, any
+    other array attribute) downloads the whole image once; later reads reuse it. Thread-safe. Arithmetic on
+    the object itself is not defined: convert with np.asarray first.
+    """
+
+    lazy_host = True
+
+    def __init__(self, tensor) -> None:
+        import threading
+
+        self._tensor = tensor
+        self._array = None
+        self._lock = threading.Lock()
+        self.shape = tuple(int(n) for n in tensor.shape)
+        self.ndim = len(self.shape)
+        self.size = int(np.prod(self.shape)) if self.shape else 1
+        self.dtype = np.dtype(np.float32)
+
+    @property
+    def materialized(self) -> bool:
+        return self._array is not None
+
+    def host(self) -> np.ndarray:
+        if self._array is None:
+            with self._lock:
+                if self._array is None:
+                    self._array = np.ascontiguousarray(self._tensor.detach().float().cpu().numpy(), dtype=np.float32)
+        return self._array
+
+    def __array__(self, dtype=None, copy=None):
+        array = self.host()
+        if dtype is not None and np.dtype(dtype) != array.dtype:
+            return array.astype(dtype)
+        return array.copy() if copy else array
+
+    def __getitem__(self, key):
+        return self.host()[key]
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getattr__(self, name):                 # anything else an ndarray offers
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.host(), name)
 
 
 @dataclass
