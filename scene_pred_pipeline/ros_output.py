@@ -498,6 +498,15 @@ class RosVisualizer:
         )
 
 
+    def _visualization_mask(self, points: torch.Tensor):
+        """Rows inside output.visualization_min/max; None = no box."""
+        lo, hi = self.config.output.visualization_min, self.config.output.visualization_max
+        if lo is None or hi is None or points is None or points.shape[0] == 0:
+            return None
+        lo_t = torch.as_tensor(lo, dtype=points.dtype, device=points.device)
+        hi_t = torch.as_tensor(hi, dtype=points.dtype, device=points.device)
+        return ((points >= lo_t) & (points <= hi_t)).all(dim=1)
+
     @staticmethod
     def _subscribed(publisher) -> bool:
         return publisher is not None and int(publisher.get_subscription_count()) > 0
@@ -842,10 +851,14 @@ class RosVisualizer:
             and self._scene_cloud_due()
             and self._subscribed(self.scene_cloud_pub)
         ):
+            keep = self._visualization_mask(output.scene_points)
             self.scene_cloud_pub.publish(
                 _velocity_cloud(
-                    self.node, output.scene_points, output.scene_velocity,
-                    output.scene_track_ids, output.stamp_ns, frame,
+                    self.node,
+                    output.scene_points if keep is None else output.scene_points[keep],
+                    output.scene_velocity if keep is None else output.scene_velocity[keep],
+                    output.scene_track_ids if keep is None else output.scene_track_ids[keep],
+                    output.stamp_ns, frame,
                 )
             )
 
@@ -860,6 +873,9 @@ class RosVisualizer:
         if self._subscribed(self.rest_scene_pub):
             if output.scene_points is not None:
                 rest_points = output.scene_points[output.scene_num_dynamic:]
+                keep = self._visualization_mask(rest_points)
+                if keep is not None:
+                    rest_points = rest_points[keep]
             else:
                 rest_points = torch.empty((0, 3), dtype=torch.float32)
             self.rest_scene_pub.publish(

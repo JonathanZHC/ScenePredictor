@@ -16,6 +16,10 @@ class CameraFrameCpu:
     K: np.ndarray
     T_world_camera: np.ndarray
     optical_frame_id: str
+    # Optional: the depth image as a CUDA tensor [H, W] float32 (meters), set by a producer that already
+    # has it on the device (an upstream depth filter). Consumers that can take a tensor use it instead of
+    # `depth` and skip the upload; `depth` may then be None.
+    depth_gpu: "object | None" = None
 
 
 @dataclass

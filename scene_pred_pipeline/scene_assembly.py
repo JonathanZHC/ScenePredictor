@@ -172,6 +172,8 @@ class SceneCloudAssembler:
         The returned device tensor is reused by the next upload to the same slot; every reader runs on the
         current stream before that upload is enqueued, so stream order protects it. Callers that keep the
         result beyond the cycle must clone it."""
+        if isinstance(array, torch.Tensor):       # the producer already holds it on a device
+            return array.to(self.device)
         array = np.ascontiguousarray(array)
         if self.device.type != "cuda":
             return torch.as_tensor(array, device=self.device)
@@ -265,16 +267,22 @@ class SceneCloudAssembler:
         """Rest scene directly from the synchronized RGB-D bundle (no tracker: nothing excluded)."""
         views = []
         for cam in frame.cameras.values():
-            depth_cpu = np.asarray(cam.depth, dtype=np.float32)
-            if depth_cpu.ndim != 2 or depth_cpu.size == 0:
-                continue
+            depth_gpu = getattr(cam, "depth_gpu", None)
+            if depth_gpu is not None:                 # already on the device: no host copy, no upload
+                depth_cpu = depth_gpu
+                if depth_cpu.ndim != 2 or depth_cpu.numel() == 0:
+                    continue
+            else:
+                depth_cpu = np.asarray(cam.depth, dtype=np.float32)
+                if depth_cpu.ndim != 2 or depth_cpu.size == 0:
+                    continue
             K = np.asarray(cam.K, dtype=np.float64).reshape(3, 3)
             views.append((depth_cpu, (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])), np.asarray(cam.T_world_camera, dtype=np.float32), None))
         return self._rest_points_from_views(views)
 
     def _rest_points_fused(self, views) -> torch.Tensor:
         """All views through the fused Triton kernel (rest_scene_kernel.py) into one buffer, then the voxel dedup."""
-        sizes = [int(depth_cpu.size) for depth_cpu, *_ in views]
+        sizes = [int(depth_cpu.shape[0]) * int(depth_cpu.shape[1]) for depth_cpu, *_ in views]
         total = sum(sizes)
         buffers = self._fused_buffers
         if buffers is None or buffers[0].shape[0] != total:

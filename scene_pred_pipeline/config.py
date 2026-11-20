@@ -393,6 +393,11 @@ class OutputConfig:
     publish_removed_outlier_points: bool = False
     # Maximum update rate for visualization-only ROS topics. 0 = unthrottled.
     visualization_publish_hz: float = 10.0
+    # Optional axis-aligned box (world frame, meters) for the visualization-only point
+    # clouds (rest scene and merged scene-cloud copy). None = everything. It only limits
+    # what RViz receives: the clouds handed to consumers in-process stay complete.
+    visualization_min: tuple[float, float, float] | None = None
+    visualization_max: tuple[float, float, float] | None = None
     velocity_marker_stride: int = 32
     # Marker endpoint = point + velocity * flow_dt_s * factor.
     velocity_marker_scale_factor: float = 2.0
@@ -1057,6 +1062,14 @@ def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> Pi
             "output.velocity_marker_scale_factor instead; marker length is now "
             "velocity * actual_flow_dt * factor."
         )
+    for key in ("visualization_min", "visualization_max"):
+        if output_values.get(key) is not None:
+            value = tuple(float(v) for v in output_values[key])
+            if len(value) != 3 or not all(math.isfinite(v) for v in value):
+                raise ValueError(f"output.{key} must be [x, y, z] in meters or null")
+            output_values = {**output_values, key: value}
+    if (output_values.get("visualization_min") is None) != (output_values.get("visualization_max") is None):
+        raise ValueError("output.visualization_min and visualization_max must be set together")
     output = _construct(OutputConfig, output_values)
     visualization_publish_hz = float(output.visualization_publish_hz)
     if not math.isfinite(visualization_publish_hz) or visualization_publish_hz < 0.0:
