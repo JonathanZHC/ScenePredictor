@@ -33,8 +33,8 @@ class LazyHostDepth:
     """Host view of a depth image that lives on the GPU: looks like the numpy array, downloads on first use.
 
     Shape, dtype, ndim and size are known without a download. Reading the pixels (np.asarray, indexing, any
-    other array attribute) downloads the whole image once; later reads reuse it. Thread-safe. Arithmetic on
-    the object itself is not defined: convert with np.asarray first.
+    other array attribute) downloads the whole image once; later reads reuse it. Thread-safe. Comparisons
+    and arithmetic act on the downloaded array.
     """
 
     lazy_host = True
@@ -77,6 +77,23 @@ class LazyHostDepth:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self.host(), name)
+
+
+def _delegate_operators() -> None:
+    # Python looks operators up on the type, not through __getattr__: `depth > 0`, `depth * s` ... act on the host array.
+    def forward(name):
+        def operator(self, *args):
+            return getattr(self.host(), name)(*(a.host() if isinstance(a, LazyHostDepth) else a for a in args))
+        operator.__name__ = name
+        return operator
+
+    for op in ("lt", "le", "gt", "ge", "eq", "ne", "add", "radd", "sub", "rsub", "mul", "rmul", "truediv", "rtruediv",
+               "neg", "abs", "and", "rand", "or", "ror", "invert"):
+        setattr(LazyHostDepth, f"__{op}__", forward(f"__{op}__"))
+    LazyHostDepth.__hash__ = object.__hash__      # __eq__ is elementwise now; the object stays hashable by identity
+
+
+_delegate_operators()
 
 
 @dataclass

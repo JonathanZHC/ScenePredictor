@@ -89,3 +89,13 @@ def test_memory_sees_past_the_zone():
     assert pts.shape[0] > 0 and bool((pts[:, 2] < 2.0).all())          # the object only: nothing beyond the zone
     cycle(background); cycle(background)                               # two cycles of rays through it ...
     assert asm.static_memory.size == 0 and cycle(background).shape[0] == 0   # ... and it is gone, from the next cloud on
+
+
+def test_lazy_host_depth_behaves_like_the_array_in_expressions():
+    from scene_pred_pipeline.data_types import LazyHostDepth
+
+    depth = LazyHostDepth(torch.tensor([[0.0, 1.5], [float("nan"), 0.4]]))
+    valid = np.array([[True, True], [True, False]]) & np.isfinite(depth) & (depth > 0.0)     # as the tracker writes it
+    assert valid.tolist() == [[False, True], [False, False]]
+    assert ((depth >= 0.3) & (depth <= 1.0)).tolist() == [[False, False], [False, True]]
+    assert np.allclose(2.0 * depth[0], [0.0, 3.0]) and float((depth * 2.0)[0, 1]) == 3.0
