@@ -251,7 +251,7 @@ def test_young_points_beside_the_robot_are_not_held():
     blob = wall.copy(); blob[8:24, 8:24] = 0.5                         # something at 0.5 m in front of the wall
     hidden = wall.copy(); hidden[8:24, 8:24] = 0.0                     # ... and then robot pixels there
     for cycles_seen, report_near, held in ((1, True, False), (2, True, False), (3, True, True), (6, True, True), (1, False, True)):
-        asm = _assembler(min_observations_to_hold=3)
+        asm = _assembler(min_observations_to_hold=3, robot_born_needs_anchor=False)     # the age rule alone
         mem = asm.static_memory
 
         def cycle(depth, mask=None):                                   # the consumer reports the rows beside the robot
@@ -264,6 +264,35 @@ def test_young_points_beside_the_robot_are_not_held():
         for _ in range(4):
             near = cycle(hidden, mask=robot)
         assert near == (n_blob if held else 0), (cycles_seen, report_near, near, n_blob)
+
+
+def test_robot_born_points_need_an_anchor():
+    """Born at the robot's silhouette and connected to nothing else: never held, however often it was observed. Born there
+    but part of a surface that reaches beyond the silhouette: held like any other point."""
+    robot = np.zeros((H, W), dtype=bool); robot[8:24, 4:10] = True               # the arm, a vertical bar in the image
+    all_robot = np.ones((H, W), dtype=bool); nothing = np.zeros((H, W), dtype=np.float32)
+    # a speck right beside the arm, in front of a far background that never enters the cloud (beyond the depth range)
+    asm = _assembler(silhouette_px=4)
+    speck = np.full((H, W), 9.0, dtype=np.float32); speck[8:24, 4:10] = 0.0; speck[12:16, 10:13] = 0.6
+    for _ in range(8):
+        n_speck = _cycle(asm, speck, mask=robot).shape[0]
+    assert n_speck > 0 and asm.static_memory.size == n_speck                     # observed: in the cloud and in the memory
+    assert _cycle(asm, nothing, mask=all_robot).shape[0] == 0                    # hidden by the arm: not held
+    assert asm.static_memory.size == 0
+    # the same with the rule off: held
+    off = _assembler(silhouette_px=4, robot_born_needs_anchor=False)
+    for _ in range(8):
+        _cycle(off, speck, mask=robot)
+    assert _cycle(off, nothing, mask=all_robot).shape[0] == n_speck
+    # a wall that the arm uncovers: its voxels beside the arm are robot-born, the rest of the wall anchors them
+    asm = _assembler(silhouette_px=4)
+    wall = np.full((H, W), 0.5, dtype=np.float32); wall[8:24, 4:10] = 0.0     # 0.5 m: neighbouring pixels fall into neighbouring voxels
+    for _ in range(5):                                                           # the anchor spreads a few voxels per cycle
+        n_wall = _cycle(asm, wall, mask=robot).shape[0]
+    mem = asm.static_memory
+    born = (mem.tags & 1) != 0
+    assert bool(born.any()) and not bool(born.all()) and bool(((mem.tags[born] & 2) != 0).all())     # some born, all of them anchored
+    assert _cycle(asm, nothing, mask=all_robot).shape[0] == n_wall               # hidden by the arm: all held
 
 
 def test_forgotten_rows_leave_the_memory():

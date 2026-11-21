@@ -39,6 +39,17 @@ limit: on the real arm 30 such points stood 1 cm beside the hand for as long as 
 pushed away from them. A surface the robot approaches was observed long before the robot came close, and anything
 that stays visible beside the robot is old enough after a fraction of a second. Away from the robot there is no such rule.
 
+Robot-born points need an anchor: what the self-filter leaves of the robot is mostly not ON the robot but at the edge of
+its silhouette in the image - mixed pixels between the arm and the background, lying anywhere along the ray behind the
+arm (measured on the real installation: 63 % of the leftover points are within 4 pixels of a robot pixel in the camera
+that measured them, against 0.5 % of the points of the scene; only a quarter are within 8 cm of a collision body). The
+arm then hides them (and 82 % are within 16 pixels, against 6 %); the "behind a robot pixel" keeps a point without a time limit, and the leftovers of a moving arm
+pile up into clusters. A point is therefore tagged ROBOT_BORN when it is inserted within `silhouette_px` of a robot pixel
+(in a camera that measured it) or where the consumer reports the voxel close to the robot. Such a point is held only
+once it is ANCHORED: connected, through neighbouring voxels, to a point that is not robot-born - the edge of a table the
+arm uncovers is, a speck in free space is not. Without an anchor it lives while it is observed and is dropped the first
+cycle it is not, whatever its age and however large its cluster has grown (`robot_born_needs_anchor`).
+
 Two halves of a cycle: held(current keys) gives the remembered points to add to this cycle's rest points - those whose
 voxel is not observed now - with one binary search; that is all the latency-critical path pays. update() (merge, visibility
 of every remembered point, deletions) runs after the consumer's command is out (SceneCloudAssembler.finish_memory), so a
@@ -61,6 +72,8 @@ import torch.nn.functional as F
 from . import rest_scene_kernel, static_memory_kernel
 
 KEY_BIAS = 1 << 20
+ROBOT_BORN = 1      # tags: first observed close to the robot (consumer's near_keys) or at the robot's silhouette in the image
+ANCHORED = 2        #       ... and connected to something that was not
 KEY_MASK = (1 << 21) - 1
 
 
@@ -91,12 +104,16 @@ class StaticMemory:
         self.unknown_count = torch.empty((0,), dtype=torch.int16, device=device) # consecutive cycles without any evidence
         self.obs_count = torch.empty((0,), dtype=torch.int16, device=device)     # cycles in which the voxel was observed (saturating)
         self.near_flag = torch.empty((0,), dtype=torch.bool, device=device)      # reported close to the robot while young
+        self.tags = torch.empty((0,), dtype=torch.uint8, device=device)          # ROBOT_BORN | ANCHORED (see module text)
+        offs = [(dx << 42) + (dy << 21) + dz for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1) if (dx, dy, dz) != (0, 0, 0)]
+        self._neighbours = torch.tensor(offs, dtype=torch.int64, device=device)
         self.cycle = 0
         # Device counters (read with summary(); no per-cycle host sync): inserted, refreshed, kept occluded/unknown,
         # deleted (empty), capped (dropped for size), dropped as stale (seen but never refreshed), forgotten (forget()),
         # dropped as unknown (no evidence for too long)
         # ... and dropped young (hidden before min_observations_to_hold observations)
-        self._counters = torch.zeros(9, dtype=torch.int64, device=device)
+        # ... and dropped as robot-born without an anchor
+        self._counters = torch.zeros(10, dtype=torch.int64, device=device)
         self._cam_cache: dict[int, tuple[bytes, torch.Tensor, list[float]]] = {}
         self.use_kernel = static_memory_kernel.available(device) and not bool(getattr(config, "reference_path", False))
 
@@ -123,11 +140,15 @@ class StaticMemory:
         if self.points.shape[0] == 0:
             return self.points, self.keys
         mask = ~self._isin_sorted(self.keys, current_keys.to(self.device)) & (self.stale_count == 0)
+        if self.tags.shape[0] == mask.shape[0] and bool(getattr(self.cfg, "robot_born_needs_anchor", True)):
+            # robot-born without an anchor: never held (the update drops it)
+            mask &= (self.tags & (ROBOT_BORN | ANCHORED)) != ROBOT_BORN
         idx = mask.nonzero(as_tuple=True)[0]
         return self.points.index_select(0, idx), self.keys.index_select(0, idx)
 
     def reset(self) -> None:
         self.near_flag = self.near_flag[:0]
+        self.tags = self.tags[:0]
         self.points = self.points[:0]
         self.keys = self.keys[:0]
         self.last_seen = self.last_seen[:0]
@@ -197,6 +218,8 @@ class StaticMemory:
             self.obs_count = torch.ones(n_cur, dtype=torch.int16, device=self.device)
             self.near_flag = (self._isin_sorted(cur_keys, near_keys) if near_keys is not None
                               else torch.zeros(n_cur, dtype=torch.bool, device=self.device))
+            self.tags = self._born_tags(current, cur_keys, near_keys, views, upload, masks)
+            self._anchor()
             self._counters[0] += n_cur
             return
 
@@ -234,6 +257,13 @@ class StaticMemory:
             self._counters[5] += (keep & stale).sum()
             keep &= ~stale
         hold_after = int(getattr(self.cfg, "min_observations_to_hold", 0))
+        if self.tags.shape[0] != m:
+            self.tags = torch.zeros(m, dtype=torch.uint8, device=self.device)
+        if bool(getattr(self.cfg, "robot_born_needs_anchor", True)):
+            # robot-born and not connected to anything else: lives only while it is observed
+            loose = ((self.tags & (ROBOT_BORN | ANCHORED)) == ROBOT_BORN) & ~refreshed
+            self._counters[9] += (keep & loose).sum()
+            keep &= ~loose
         young = None
         if hold_after > 1:
             young = (self.obs_count < hold_after) & ~refreshed & self.near_flag
@@ -256,7 +286,7 @@ class StaticMemory:
         s_keys = self.keys[surv]
         s_points, s_seen = self.points[surv], self.last_seen[surv]
         s_empty, s_stale, s_unknown = self.empty_count[surv], self.stale_count[surv], self.unknown_count[surv]
-        s_obs, s_near = self.obs_count[surv], self.near_flag[surv]
+        s_obs, s_near, s_tags = self.obs_count[surv], self.near_flag[surv], self.tags[surv]
 
         # 4. Insert the new voxels by a merge of two sorted key lists (no sort of the union).
         new = (~found).nonzero(as_tuple=True)[0]                            # second host sync (number of new voxels)
@@ -266,7 +296,7 @@ class StaticMemory:
         if k == 0:
             self.points, self.keys, self.last_seen = s_points, s_keys, s_seen
             self.empty_count, self.stale_count, self.unknown_count = s_empty, s_stale, s_unknown
-            self.obs_count, self.near_flag = s_obs, s_near
+            self.obs_count, self.near_flag, self.tags = s_obs, s_near, s_tags
         else:
             n_keys = cur_keys[new]
             ins = torch.searchsorted(s_keys, n_keys)                        # [k], non-decreasing
@@ -296,6 +326,11 @@ class StaticMemory:
             if near_keys is not None:
                 near[dst_k] = self._isin_sorted(n_keys, near_keys)
             self.near_flag = near
+            tags = torch.zeros(total, dtype=torch.uint8, device=self.device)
+            tags[dst_m] = s_tags
+            tags[dst_k] = self._born_tags(current[new], n_keys, near_keys, views, upload, masks)
+            self.tags = tags
+        self._anchor()
 
         cap = int(self.cfg.max_points)
         if cap > 0 and self.points.shape[0] > cap:              # drop the longest unseen points (keeps the key order)
@@ -305,14 +340,66 @@ class StaticMemory:
             self.last_seen, self.empty_count = self.last_seen[keep_idx], self.empty_count[keep_idx]
             self.stale_count, self.unknown_count = self.stale_count[keep_idx], self.unknown_count[keep_idx]
             self.obs_count, self.near_flag = self.obs_count[keep_idx], self.near_flag[keep_idx]
+            self.tags = self.tags[keep_idx]
 
     def summary(self) -> str:
         c = [int(v) for v in self._counters.tolist()]
         return (f"static memory: {self.size} points after {self.cycle} cycles; inserted {c[0]}, refreshed {c[1]}, "
                 f"kept while occluded/unknown {c[2]}, deleted as empty {c[3]}, dropped as stale {c[5]}, forgotten {c[6]}, "
-                f"dropped as unknown {c[7]}, dropped young {c[8]}, dropped for size {c[4]}")
+                f"dropped as unknown {c[7]}, dropped young {c[8]}, dropped robot-born without anchor {c[9]}, dropped for size {c[4]}")
 
     # ------------------------------------------------------------------ internals
+    def _born_tags(self, points, keys, near_keys, views, upload, masks) -> torch.Tensor:
+        """Tag of newly inserted points: ROBOT_BORN when the consumer reports the voxel close to the robot (near_keys) or
+        when the camera that measured the point has a robot pixel within silhouette_px of it."""
+        born = self._isin_sorted(keys, near_keys) if near_keys is not None else torch.zeros(keys.shape[0], dtype=torch.bool, device=self.device)
+        radius = int(getattr(self.cfg, "silhouette_px", 0))
+        if radius > 0 and masks is not None and points.shape[0] > 0:
+            for view, (depth, intr, world_from_camera, _excluded) in enumerate(views):
+                mask = masks[view] if view < len(masks) else None
+                if mask is None:
+                    continue
+                mask = mask.to(self.device) if torch.is_tensor(mask) else torch.as_tensor(np.asarray(mask), device=self.device)
+                if torch.is_tensor(depth):
+                    depth = depth.to(self.device)
+                elif upload is not None:
+                    depth = upload(("static_memory_depth", view), np.asarray(depth, dtype=np.float32))
+                else:
+                    depth = torch.as_tensor(np.asarray(depth, dtype=np.float32), device=self.device)
+                if depth.ndim != 2 or tuple(mask.shape) != tuple(depth.shape):
+                    continue
+                height, width = int(depth.shape[0]), int(depth.shape[1])
+                cam_from_world, (fx, fy, cx, cy) = self._camera(view, world_from_camera, intr)
+                p = points @ cam_from_world[:, :3].T + cam_from_world[:, 3]
+                z = p[:, 2].clamp(min=1e-3)
+                u = torch.round(fx * p[:, 0] / z + cx).to(torch.int64)
+                v = torch.round(fy * p[:, 1] / z + cy).to(torch.int64)
+                inside = (p[:, 2] > 1e-3) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
+                flat = v.clamp_(0, height - 1) * width + u.clamp_(0, width - 1)
+                measured = inside & ((depth.reshape(-1).index_select(0, flat) - z).abs() <= self._margin(z))
+                wide = F.max_pool2d((mask != 0).to(torch.float32)[None, None], 2 * radius + 1, stride=1, padding=radius)[0, 0]
+                born |= measured & (wide.reshape(-1).index_select(0, flat) > 0)
+        return born.to(torch.uint8) * ROBOT_BORN
+
+    def _anchor(self, rounds: int = 3) -> None:
+        """Robot-born points next to (26 neighbours on the lattice) a point that is not robot-born, or that is anchored
+        itself, become anchored. A few rounds per cycle; the flag stays, so chains settle over the following cycles."""
+        m = int(self.keys.shape[0])
+        if m == 0 or self.tags.shape[0] != m:
+            return
+        idx = ((self.tags & (ROBOT_BORN | ANCHORED)) == ROBOT_BORN).nonzero(as_tuple=True)[0]
+        for _ in range(rounds):
+            if idx.numel() == 0:
+                return
+            cand = self.keys[idx][:, None] + self._neighbours[None]
+            pos = torch.searchsorted(self.keys, cand.reshape(-1)).clamp_(max=m - 1).reshape(cand.shape)
+            solid = (self.keys[pos] == cand) & ((self.tags[pos] & (ROBOT_BORN | ANCHORED)) != ROBOT_BORN)
+            hit = solid.any(dim=1)
+            self.tags[idx[hit]] |= ANCHORED
+            if not bool(hit.any()):
+                return
+            idx = idx[~hit]
+
     def _voxel_keys(self, points: torch.Tensor) -> torch.Tensor:
         if points.shape[0] == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)

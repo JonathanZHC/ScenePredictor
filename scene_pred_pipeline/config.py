@@ -449,6 +449,13 @@ class StaticMemoryConfig:
     # obstacle next to it for as long as it stands there. 0 or 1 = every point is held from its first observation.
     min_observations_to_hold: int = 5
     young_near_robot_sdf_m: float = 0.08
+    # A point first observed within silhouette_px pixels of a robot pixel (in a camera that measured it), or where the
+    # consumer reports the voxel within young_near_robot_sdf_m of the robot, is "robot-born". With
+    # robot_born_needs_anchor it is held only when it is connected, through neighbouring voxels, to a point that is
+    # not robot-born; otherwise it is dropped the first cycle it is not observed (leftovers of the self-filter at the
+    # arm's silhouette pile up otherwise). silhouette_px 0 = only the consumer's report counts.
+    robot_born_needs_anchor: bool = True
+    silhouette_px: int = 16
     # A point whose ray hits a surface at its depth (seen) but whose voxel yields no rest point for this many
     # consecutive cycles is a depth-noise voxel beside the surface: dropped (0 = keep forever).
     seen_unrefreshed_frames_to_delete: int = 10
@@ -1077,6 +1084,8 @@ def _static_memory_config(value: Any) -> StaticMemoryConfig:
         raise ValueError("static_memory.neighbourhood must be an odd positive integer")
     if int(cfg.empty_frames_to_delete) < 1:
         raise ValueError("static_memory.empty_frames_to_delete must be >= 1")
+    if int(cfg.silhouette_px) < 0 or int(cfg.silhouette_px) > 64:
+        raise ValueError("static_memory.silhouette_px must be in 0 .. 64")
     if int(cfg.min_observations_to_hold) < 0:
         raise ValueError("static_memory.min_observations_to_hold must be >= 0")
     if int(cfg.seen_unrefreshed_frames_to_delete) < 0:
