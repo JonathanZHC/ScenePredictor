@@ -17,6 +17,7 @@ from .scene_assembly import SceneCloudAssembler
 from .tracker_adapter import MultiViewTrackerAdapter
 from .flow_guard import FlowGuard
 from .velocity_recovery import VelocityRecovery, anchor_velocity_region
+from .zone import ZoneFilter
 
 
 class ScenePredictionPipeline:
@@ -48,6 +49,7 @@ class ScenePredictionPipeline:
         self.flow_guard = None
         # True: the caller marks the GPU idle itself after the cycle (see process()).
         self.defer_gpu_idle = False
+        self.defer_memory_update = False     # True: the caller runs scene_assembler.finish_memory() after its own work
         tracker_config = None
         if not self.static_only:
             # Load/patch the upstream tracker configuration once. DifFlow needs the
@@ -85,6 +87,8 @@ class ScenePredictionPipeline:
                 )
         # Full-scene cloud (tracked points + velocity, rest points + zero velocity)
         # for in-process consumers such as the safety filter.
+        # Zone: depth outside the box is blanked at the start of every cycle (zone.py); None = all points.
+        self.zone = ZoneFilter(config.zone, self.device) if config.zone is not None else None
         self.scene_assembler = (
             SceneCloudAssembler(config, tracker_config=tracker_config)
             if config.scene_cloud.enabled
@@ -183,6 +187,9 @@ class ScenePredictionPipeline:
             return
         started = time.perf_counter()
         self.scene_assembler.assemble(output, frame)
+        if not getattr(self, "defer_memory_update", False):
+            # no consumer that finishes the cycle itself (PerceptiveSafetyFilter does, after its command is out)
+            self.scene_assembler.finish_memory()
         self.profiler.record_async("scene_assembly", 1000.0 * (time.perf_counter() - started))
 
     def mark_gpu_busy(self) -> None:
@@ -220,6 +227,10 @@ class ScenePredictionPipeline:
     def _process_cycle(self, frame: MultiCameraFrame) -> SceneVelocityOutput:
         self.profiler.start_cycle()
         self.last_flow_gap_s = None
+        zone = getattr(self, "zone", None)
+        if zone is not None:
+            with self.profiler.stage("zone", cuda=False):
+                zone.apply(frame)
 
         if self.static_only:
             # Whole scene = static background with zero velocity (built in _assemble_scene).

@@ -32,6 +32,7 @@ def _frame(depth: np.ndarray, T=None, name="camera_0", stamp=0, mask=None):
 
 
 def _assembler(**memory):
+    memory.setdefault("min_observations_to_hold", 1)       # held from the first observation unless a test says otherwise
     config = PipelineConfig(scene_cloud=SceneCloudConfig(voxel_size_m=VOXEL, depth_min_m=0.1, depth_max_m=5.0),
                             static_memory=StaticMemoryConfig(enabled=True, **memory))
     return SceneCloudAssembler(config, tracker_config=None)
@@ -48,10 +49,13 @@ def _output():
     )
 
 
-def _cycle(asm, depth, T=None, mask=None):
+def _cycle(asm, depth, T=None, mask=None, forget=None, near=None):
+    """One cycle: the cloud, then the deferred half of the memory (forget / near: functions cloud -> rest rows)."""
     out = _output()
     asm.assemble(out, _frame(depth, T, mask=mask))
-    return out.scene_points
+    pts = out.scene_points
+    asm.finish_memory(forget(pts) if forget else None, near(pts) if near else None)
+    return pts
 
 
 def test_config_default_off_and_validation():
@@ -124,7 +128,8 @@ def test_points_without_any_evidence_expire():
     n_seen = _cycle(asm, holed).shape[0]              # cycle 1: unknown_count 1
     assert n_seen == n_wall
     assert _cycle(asm, holed).shape[0] == n_wall      # 2
-    n3 = _cycle(asm, holed).shape[0]                  # 3 -> dropped
+    assert _cycle(asm, holed).shape[0] == n_wall      # 3: dropped by this cycle's update, which runs after the cloud is out
+    n3 = _cycle(asm, holed).shape[0]                  # ... so the cloud shows it one cycle later
     assert n3 < n_wall
     assert n3 == _cycle(asm, holed).shape[0]          # stable afterwards
     assert _cycle(asm, wall).shape[0] == n_wall       # the surface comes back when it is seen again
@@ -145,9 +150,9 @@ def test_empty_rays_delete_after_confirmation():
     n_far = _cycle(n_far_alone, far).shape[0]
     first = _cycle(asm, far).shape[0]                 # judged empty once: still remembered
     assert first == n_near + n_far
-    second = _cycle(asm, far).shape[0]                # confirmed: the old wall is gone
-    assert second == n_far
-    assert asm.static_memory.size == n_far
+    second = _cycle(asm, far).shape[0]                # confirmed by the update of this cycle, after its cloud went out
+    assert second == n_near + n_far and asm.static_memory.size == n_far
+    assert _cycle(asm, far).shape[0] == n_far         # the old wall is gone from the cloud
 
 
 def test_partial_removal_only_where_rays_pass():
@@ -180,7 +185,7 @@ def test_second_camera_evidence_counts():
         "camera_0": _frame(occluded_a).cameras["camera_0"],
         "camera_1": _frame(far_b, T_b, name="camera_1").cameras["camera_1"],
     })
-    asm.assemble(out, frame)
+    asm.assemble(out, frame); asm.finish_memory()
     mem = asm.static_memory
     near = mem.points[(mem.points[:, 2] - 1.0).abs() < 0.05]
     # the part of the old wall inside camera B's view (x in roughly [0, 1] m at z = 1) was carved by B
@@ -224,18 +229,53 @@ def test_fused_kernel_matches_reference_path():
         assert torch.equal(fused.static_memory.keys, ref.static_memory.keys)
 
 
-def test_forget_drops_rows_and_blocks_their_revival():
+def test_points_behind_the_edge_of_the_robot_are_not_judged_empty():
+    """A remembered surface whose pixel is a robot pixel stays, also at the robot's silhouette where the neighbouring
+    pixels see far beyond it (those rays pass beside the point, not through it)."""
+    for reference in (False, True):
+        asm = _assembler(reference_path=reference)
+        scene = np.full((H, W), 1.0, dtype=np.float32)
+        scene[8:24, 8:24] = 0.5                       # a small plate in front of the wall
+        n = _cycle(asm, scene).shape[0]
+        hidden = scene.copy(); hidden[8:24, 8:24] = 0.0
+        robot = np.zeros((H, W), dtype=bool); robot[8:24, 8:24] = True     # the robot now covers exactly the plate
+        for _ in range(6):
+            assert _cycle(asm, hidden, mask=robot).shape[0] == n
+
+
+def test_young_points_beside_the_robot_are_not_held():
+    """What shows up for a frame or two beside the robot (a robot pixel the self-filter missed) and is then hidden by the
+    robot is dropped; the same thing observed for a few cycles, or anywhere the consumer did not report as near, is held."""
+    robot = np.zeros((H, W), dtype=bool); robot[8:24, 8:24] = True
+    wall = np.full((H, W), 1.0, dtype=np.float32)
+    blob = wall.copy(); blob[8:24, 8:24] = 0.5                         # something at 0.5 m in front of the wall
+    hidden = wall.copy(); hidden[8:24, 8:24] = 0.0                     # ... and then robot pixels there
+    for cycles_seen, report_near, held in ((1, True, False), (2, True, False), (3, True, True), (6, True, True), (1, False, True)):
+        asm = _assembler(min_observations_to_hold=3)
+        mem = asm.static_memory
+
+        def cycle(depth, mask=None):                                   # the consumer reports the rows beside the robot
+            pts = _cycle(asm, depth, mask=mask, near=(lambda p: (p[:, 2] < 0.75).nonzero(as_tuple=True)[0]) if report_near else None)
+            return int((pts[:, 2] < 0.75).sum())
+
+        for _ in range(cycles_seen):
+            n_blob = cycle(blob)
+        assert n_blob > 0
+        for _ in range(4):
+            near = cycle(hidden, mask=robot)
+        assert near == (n_blob if held else 0), (cycles_seen, report_near, near, n_blob)
+
+
+def test_forgotten_rows_leave_the_memory():
     asm = _assembler()
     wall = np.full((H, W), 1.0, dtype=np.float32)
-    pts = _cycle(asm, wall)
-    mem = asm.static_memory
-    n = pts.shape[0]
-    rows = torch.arange(0, n, 2, device=DEV)                 # forget every second remembered point
-    mem.forget(rows)
-    after = _cycle(asm, wall)                                  # same view: the forgotten voxels are observed again ...
-    assert after.shape[0] == n - rows.shape[0]                 # ... but not revived this cycle
-    again = _cycle(asm, wall)
-    assert again.shape[0] == n                                 # a later observation inserts them again
+    n = _cycle(asm, wall).shape[0]
+    # the consumer finds every second rest point of this cycle inside the robot: not taken from this observation either
+    assert _cycle(asm, wall, forget=lambda p: torch.arange(0, p.shape[0], 2, device=DEV)).shape[0] == n
+    assert asm.static_memory.size == n - (n + 1) // 2
+    hidden = np.zeros((H, W), dtype=np.float32); robot = np.ones((H, W), dtype=bool)
+    assert _cycle(asm, hidden, mask=robot).shape[0] == n - (n + 1) // 2      # what is held behind the robot: the rest only
+    assert _cycle(asm, wall).shape[0] == n                                    # observed again: all there
 
 
 def test_summary_counts():

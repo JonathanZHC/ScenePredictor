@@ -3,7 +3,7 @@
 Per remembered point: camera transform p = R w + t, projection (u, v) = (fx x / z + cx, fy y / z + cy), the depth of
 the pixel and the smallest valid depth of its (2h+1)^2 neighbourhood, margin(z) = max(min_margin, k (a + b z^2)), and
     seen   = inside & d_centre > 0 & |d_centre - z| <= margin
-    empty  = inside & all valid neighbours beyond z + margin (at least one valid neighbour)
+    empty  = inside & all valid neighbours beyond z + margin (at least one valid neighbour) & not a robot pixel
     occluded = inside & (robot pixel: occluder mask) or (d_centre valid & d_centre < z - margin)
     known  = seen | occluded | empty   (the rest is "unknown": no depth at the pixel, outside the image, behind the camera)
 OR-ed into the int8 flag arrays over the views. Replaces ~15 torch kernels per view; the memory update was
@@ -66,6 +66,7 @@ if triton is not None:
         if HAS_MASK:
             robot = tl.load(mask_ptr + vc * width + uc, mask=inside, other=0)
             occluded = occluded | (in_img & (robot != 0))
+            empty = empty & (robot == 0)
         s_old = tl.load(seen_ptr + offs, mask=inside, other=0)
         e_old = tl.load(empty_ptr + offs, mask=inside, other=0)
         k_old = tl.load(known_ptr + offs, mask=inside, other=0)

@@ -10,8 +10,8 @@ ray proves that its place is empty:
         seen      |d - z| <= margin(z)                 -> refreshed by the current rest point of its voxel
         occluded  d < z - margin (something in front), or the pixel is in the camera's occluder mask (the robot,
                   removed by the self-filter)            -> kept as it is, for as long as it lasts
-        empty     all valid neighbours have d > z + margin (the ray passed through the point) -> delete
-                  after `empty_frames_to_delete` consecutive cycles
+        empty     all valid neighbours have d > z + margin (the ray passed through the point) and the pixel itself
+                  is not a robot pixel -> delete after `empty_frames_to_delete` consecutive cycles
         unknown   no evidence from any camera (holes, out of range, outside the image) -> kept for
                   `unknown_frames_to_delete` consecutive cycles, then dropped
 
@@ -30,6 +30,25 @@ tracked pipeline; with tracked classes the rest scene already excludes their mas
 margin(z) = max(min_margin_m, margin_sigmas * (depth_sigma_a_m + depth_sigma_b_per_m * z^2)), a depth-noise model
 of the stereo camera; min_margin_m defaults to the voxel size (a voxel centre is up to half a voxel off the surface,
 and surfaces seen at grazing angles spread over neighbouring pixels).
+
+Young points beside the robot: a point the consumer reports as close to the robot (update(near_keys=...), from the
+safety filter's SDF pass) whose voxel was observed in fewer than `min_observations_to_hold` cycles is not held - it is dropped
+the first cycle it is not observed (also when a ray still ends near it: beside the robot that is the robot's surface). Robot pixels the self-filter missed for a frame (or a whole frame that passed
+unfiltered) lie on the robot, the robot hides them the next cycle, and "behind a robot pixel" keeps a point without a time
+limit: on the real arm 30 such points stood 1 cm beside the hand for as long as it did not move, and the safety filter
+pushed away from them. A surface the robot approaches was observed long before the robot came close, and anything
+that stays visible beside the robot is old enough after a fraction of a second. Away from the robot there is no such rule.
+
+Two halves of a cycle: held(current keys) gives the remembered points to add to this cycle's rest points - those whose
+voxel is not observed now - with one binary search; that is all the latency-critical path pays. update() (merge, visibility
+of every remembered point, deletions) runs after the consumer's command is out (SceneCloudAssembler.finish_memory), so a
+deletion shows in the cloud one cycle later. Seen-but-not-observed points (depth-noise voxels beside a surface that is in
+the current cloud) stay inside the memory and are not handed out.
+
+Size: the memory holds what the pipeline's zone (zone.py) lets through. With a whole room in view and no zone it runs
+into max_points within a second, and the cap drops the longest-unseen points - the hidden ones the memory exists for.
+The visibility test reads the depth images BEFORE the zone blanked them: a ray through a remembered point usually ends
+on a surface outside the zone.
 """
 from __future__ import annotations
 
@@ -70,12 +89,14 @@ class StaticMemory:
         self.empty_count = torch.empty((0,), dtype=torch.int16, device=device)   # consecutive cycles judged empty
         self.stale_count = torch.empty((0,), dtype=torch.int16, device=device)   # consecutive cycles seen but not refreshed
         self.unknown_count = torch.empty((0,), dtype=torch.int16, device=device) # consecutive cycles without any evidence
-        self._dead: torch.Tensor | None = None                                    # rows to drop at the next update (forget())
+        self.obs_count = torch.empty((0,), dtype=torch.int16, device=device)     # cycles in which the voxel was observed (saturating)
+        self.near_flag = torch.empty((0,), dtype=torch.bool, device=device)      # reported close to the robot while young
         self.cycle = 0
         # Device counters (read with summary(); no per-cycle host sync): inserted, refreshed, kept occluded/unknown,
         # deleted (empty), capped (dropped for size), dropped as stale (seen but never refreshed), forgotten (forget()),
         # dropped as unknown (no evidence for too long)
-        self._counters = torch.zeros(8, dtype=torch.int64, device=device)
+        # ... and dropped young (hidden before min_observations_to_hold observations)
+        self._counters = torch.zeros(9, dtype=torch.int64, device=device)
         self._cam_cache: dict[int, tuple[bytes, torch.Tensor, list[float]]] = {}
         self.use_kernel = static_memory_kernel.available(device) and not bool(getattr(config, "reference_path", False))
 
@@ -84,29 +105,40 @@ class StaticMemory:
     def size(self) -> int:
         return int(self.points.shape[0])
 
-    def forget(self, rows: torch.Tensor) -> None:
-        """Drop these rows of the memory (indices into the cloud returned by the last update) at the next update.
+    @staticmethod
+    def _isin_sorted(keys: torch.Tensor, sorted_keys: torch.Tensor) -> torch.Tensor:
+        """keys[i] in sorted_keys (ascending), by binary search."""
+        if sorted_keys.shape[0] == 0 or keys.shape[0] == 0:
+            return torch.zeros(keys.shape[0], dtype=torch.bool, device=keys.device)
+        pos = torch.searchsorted(sorted_keys, keys).clamp_(max=sorted_keys.shape[0] - 1)
+        return sorted_keys[pos] == keys
 
-        Used by the consumer for points it can prove are not obstacles, e.g. remembered points inside the robot's own
-        bodies: robot pixels the self-filter missed enter the memory as rest points, and since the robot then stands in
-        front of them they would never be seen as empty."""
-        if rows.numel() == 0:
-            return
-        if self._dead is None or self._dead.shape[0] != self.points.shape[0]:
-            self._dead = torch.zeros(self.points.shape[0], dtype=torch.bool, device=self.device)
-        self._dead[rows.to(self.device)] = True
+    def held(self, current_keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(points, voxel keys) of the remembered points to ADD to the rest points observed this cycle: those whose
+        voxel is not among `current_keys` (sorted) - the hidden ones. This is all the latency-critical path does with
+        the memory (one binary search over the memory); update() runs after the consumer's command is out.
+
+        Left out: points seen but not observed at the last update (stale_count > 0) - depth-noise voxels beside a
+        surface that IS in the current cloud; they are kept inside the memory for the stale rule only."""
+        if self.points.shape[0] == 0:
+            return self.points, self.keys
+        mask = ~self._isin_sorted(self.keys, current_keys.to(self.device)) & (self.stale_count == 0)
+        idx = mask.nonzero(as_tuple=True)[0]
+        return self.points.index_select(0, idx), self.keys.index_select(0, idx)
 
     def reset(self) -> None:
-        self._dead = None
+        self.near_flag = self.near_flag[:0]
         self.points = self.points[:0]
         self.keys = self.keys[:0]
         self.last_seen = self.last_seen[:0]
         self.empty_count = self.empty_count[:0]
         self.stale_count = self.stale_count[:0]
         self.unknown_count = self.unknown_count[:0]
+        self.obs_count = self.obs_count[:0]
 
     def update(self, current: torch.Tensor, views: Sequence[tuple], upload: Callable[[tuple, Any], torch.Tensor] | None = None,
-               current_keys: torch.Tensor | None = None, masks: Sequence[Any] | None = None) -> torch.Tensor:
+               current_keys: torch.Tensor | None = None, masks: Sequence[Any] | None = None,
+               forget_keys: torch.Tensor | None = None, near_keys: torch.Tensor | None = None) -> torch.Tensor:
         """Merge the rest points of this cycle into the memory and return the memory (the new rest scene).
 
         current: [N, 3] float32 world points, one per voxel (output of the rest-scene dedup).
@@ -125,14 +157,34 @@ class StaticMemory:
             inside = ((current >= lo) & (current <= hi)).all(dim=1)
             current = current[inside]
             current_keys = current_keys[inside] if current_keys is not None else None
+        self._update(current, current_keys, views, upload, masks, forget_keys, near_keys)
+        return self.points
+
+    def sorted_keys(self, points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(points, voxel keys) sorted by key, points outside the key range dropped."""
+        keys = self._voxel_keys(points)
+        keys, order = torch.sort(keys)
+        points = points[order]
+        n_valid = int((keys != rest_scene_kernel.INVALID_KEY).sum())           # invalid keys sort last
+        return points[:n_valid], keys[:n_valid]
+
+    def _update(self, current, current_keys, views, upload, masks, forget_keys=None, near_keys=None) -> None:
         if current_keys is None:
-            cur_keys = self._voxel_keys(current)
-            cur_keys, order = torch.sort(cur_keys)
-            current = current[order]
-            n_valid = int((cur_keys != rest_scene_kernel.INVALID_KEY).sum())   # invalid keys sort last
-            current, cur_keys = current[:n_valid], cur_keys[:n_valid]
+            current, cur_keys = self.sorted_keys(current)
         else:
             cur_keys = current_keys.to(self.device)
+        # Consumer feedback of this cycle, by voxel key: forget_keys = not obstacles (inside the robot): dropped and not
+        # taken from this cycle's observation either; near_keys = close to the robot (see the young rule below).
+        if forget_keys is not None and forget_keys.numel() > 0:
+            forget_keys = torch.sort(forget_keys.to(self.device)).values
+            observed = ~self._isin_sorted(cur_keys, forget_keys)
+            current, cur_keys = current[observed], cur_keys[observed]
+        else:
+            forget_keys = None
+        if near_keys is not None and near_keys.numel() > 0:
+            near_keys = torch.sort(near_keys.to(self.device)).values
+        else:
+            near_keys = None
         n_cur = int(current.shape[0])
         m = int(self.points.shape[0])
 
@@ -142,8 +194,11 @@ class StaticMemory:
             self.empty_count = torch.zeros(n_cur, dtype=torch.int16, device=self.device)
             self.stale_count = torch.zeros(n_cur, dtype=torch.int16, device=self.device)
             self.unknown_count = torch.zeros(n_cur, dtype=torch.int16, device=self.device)
+            self.obs_count = torch.ones(n_cur, dtype=torch.int16, device=self.device)
+            self.near_flag = (self._isin_sorted(cur_keys, near_keys) if near_keys is not None
+                              else torch.zeros(n_cur, dtype=torch.bool, device=self.device))
             self._counters[0] += n_cur
-            return self.points
+            return
 
         # 1. Which memory voxels are observed again this cycle (both key lists sorted and unique).
         pos = torch.searchsorted(self.keys, cur_keys)                      # [N]
@@ -163,19 +218,28 @@ class StaticMemory:
             unknown = self.unknown_count >= unknown_limit
             self._counters[7] += (keep & unknown).sum()
             keep &= ~unknown
-        if self._dead is not None and self._dead.shape[0] == m:
-            self._counters[6] += (keep & self._dead).sum()
-            keep &= ~self._dead
-            dead_found = self._dead[pos_c[found]]
-        else:
-            dead_found = torch.zeros(pos_c[found].shape[0], dtype=torch.bool, device=self.device)
-        self._dead = None
+        dead = None
+        if forget_keys is not None:
+            dead = self._isin_sorted(self.keys, forget_keys)
+            self._counters[6] += (keep & dead).sum()
+            keep &= ~dead
+        if self.near_flag.shape[0] != m:
+            self.near_flag = torch.zeros(m, dtype=torch.bool, device=self.device)
+        if near_keys is not None:
+            self.near_flag = self.near_flag | self._isin_sorted(self.keys, near_keys)
         stale_limit = int(self.cfg.seen_unrefreshed_frames_to_delete)
         if stale_limit > 0:
             self.stale_count = torch.where(seen_now & ~refreshed, self.stale_count + 1, torch.zeros_like(self.stale_count))
             stale = self.stale_count >= stale_limit
             self._counters[5] += (keep & stale).sum()
             keep &= ~stale
+        hold_after = int(getattr(self.cfg, "min_observations_to_hold", 0))
+        young = None
+        if hold_after > 1:
+            young = (self.obs_count < hold_after) & ~refreshed & self.near_flag
+            self._counters[8] += (keep & young).sum()
+            keep &= ~young
+            self.near_flag = self.near_flag & (self.obs_count < hold_after)     # old enough: the flag has done its work
         self._counters[2] += (keep & ~seen_now & ~refreshed).sum()
 
         # 3. Refresh in place (position of the current observation, counters reset), then compact the survivors.
@@ -185,12 +249,14 @@ class StaticMemory:
         self.empty_count[idx_found] = 0
         self.stale_count[idx_found] = 0
         self.unknown_count[idx_found] = 0
-        keep[idx_found] = keep[idx_found] | ~dead_found                     # observed voxels are kept unless forgotten
+        self.obs_count[idx_found] = (self.obs_count[idx_found] + 1).clamp_(max=30000)
+        keep[idx_found] = True                                              # observed voxels are kept (forgotten ones are not among them)
         self._counters[1] += found.sum()
         surv = keep.nonzero(as_tuple=True)[0]                               # one host sync (size of the survivors)
         s_keys = self.keys[surv]
         s_points, s_seen = self.points[surv], self.last_seen[surv]
         s_empty, s_stale, s_unknown = self.empty_count[surv], self.stale_count[surv], self.unknown_count[surv]
+        s_obs, s_near = self.obs_count[surv], self.near_flag[surv]
 
         # 4. Insert the new voxels by a merge of two sorted key lists (no sort of the union).
         new = (~found).nonzero(as_tuple=True)[0]                            # second host sync (number of new voxels)
@@ -200,6 +266,7 @@ class StaticMemory:
         if k == 0:
             self.points, self.keys, self.last_seen = s_points, s_keys, s_seen
             self.empty_count, self.stale_count, self.unknown_count = s_empty, s_stale, s_unknown
+            self.obs_count, self.near_flag = s_obs, s_near
         else:
             n_keys = cur_keys[new]
             ins = torch.searchsorted(s_keys, n_keys)                        # [k], non-decreasing
@@ -221,6 +288,14 @@ class StaticMemory:
             empty[dst_m], stale[dst_m], unknown_c[dst_m] = s_empty, s_stale, s_unknown
             self.points, self.keys, self.last_seen, self.empty_count, self.stale_count = points, keys, seen, empty, stale
             self.unknown_count = unknown_c
+            obs = torch.ones(total, dtype=torch.int16, device=self.device)
+            obs[dst_m] = s_obs
+            self.obs_count = obs
+            near = torch.zeros(total, dtype=torch.bool, device=self.device)
+            near[dst_m] = s_near
+            if near_keys is not None:
+                near[dst_k] = self._isin_sorted(n_keys, near_keys)
+            self.near_flag = near
 
         cap = int(self.cfg.max_points)
         if cap > 0 and self.points.shape[0] > cap:              # drop the longest unseen points (keeps the key order)
@@ -229,13 +304,13 @@ class StaticMemory:
             self.points, self.keys = self.points[keep_idx], self.keys[keep_idx]
             self.last_seen, self.empty_count = self.last_seen[keep_idx], self.empty_count[keep_idx]
             self.stale_count, self.unknown_count = self.stale_count[keep_idx], self.unknown_count[keep_idx]
-        return self.points
+            self.obs_count, self.near_flag = self.obs_count[keep_idx], self.near_flag[keep_idx]
 
     def summary(self) -> str:
         c = [int(v) for v in self._counters.tolist()]
         return (f"static memory: {self.size} points after {self.cycle} cycles; inserted {c[0]}, refreshed {c[1]}, "
                 f"kept while occluded/unknown {c[2]}, deleted as empty {c[3]}, dropped as stale {c[5]}, forgotten {c[6]}, "
-                f"dropped as unknown {c[7]}, dropped for size {c[4]}")
+                f"dropped as unknown {c[7]}, dropped young {c[8]}, dropped for size {c[4]}")
 
     # ------------------------------------------------------------------ internals
     def _voxel_keys(self, points: torch.Tensor) -> torch.Tensor:
@@ -323,7 +398,9 @@ class StaticMemory:
             empty = in_img & (d_n > zs + margin) & torch.isfinite(d_n)
             occluded = in_img & c_valid & (d_c < zs - margin)
             if mask is not None:
-                occluded |= in_img & mask.reshape(-1).index_select(0, flat)
+                robot = in_img & mask.reshape(-1).index_select(0, flat)
+                occluded |= robot
+                empty &= ~robot                          # behind a robot pixel: the rays beside it say nothing about the point
             seen_any |= seen
             empty_any |= empty
             known_any |= seen | empty | occluded

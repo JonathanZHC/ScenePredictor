@@ -60,6 +60,8 @@ class SceneCloudAssembler:
         # Visibility-aware memory of the rest scene: rest points hidden from the cameras stay in the cloud until a
         # camera ray proves their place empty (static_memory.py).
         self.static_memory: StaticMemory | None = None
+        self._memory_pending = None          # (rest points, keys, views, masks) of the cycle whose memory update is still due
+        self._cloud_rest_keys = None         # voxel key per rest row of the cloud of this cycle
         if self.scene_cfg.include_rest_points and getattr(config, "static_memory", None) is not None and config.static_memory.enabled:
             if self._origin is None:
                 raise ValueError("static_memory needs the rest-scene lattice (scene_cloud.include_rest_points)")
@@ -111,7 +113,7 @@ class SceneCloudAssembler:
         self.last_rest_input = 0
         if self.scene_cfg.include_rest_points:
             if output.view_results:
-                rest = self.rest_scene_points(output)
+                rest = self.rest_scene_points(output, frame)
             elif frame is not None:
                 rest = self.rest_points_from_frame(frame)
             else:
@@ -133,6 +135,8 @@ class SceneCloudAssembler:
                 dyn_region = dyn_region.index_select(0, keep[:num_dynamic].nonzero(as_tuple=True)[0])
             num_dynamic = int(keep[:num_dynamic].sum().item())
             index = keep.nonzero(as_tuple=True)[0]
+            if self._cloud_rest_keys is not None and self._cloud_rest_keys.shape[0] == rest.shape[0]:
+                self._cloud_rest_keys = self._cloud_rest_keys[keep[int(dyn_points.shape[0]):]]
             points = points.index_select(0, index)
             velocity = velocity.index_select(0, index)
             track_ids = track_ids.index_select(0, index)
@@ -266,11 +270,13 @@ class SceneCloudAssembler:
             excluded.logical_or_(mask_gpu if mask_gpu.dtype == torch.bool else mask_gpu != 0)
         return excluded
 
-    def rest_scene_points(self, output: SceneVelocityOutput) -> torch.Tensor:
-        """Rest scene from tracker view results: dense depth minus tracked/excluded masks."""
-        views, masks = [], []
-        for result in output.view_results.values():
+    def rest_scene_points(self, output: SceneVelocityOutput, bundle: MultiCameraFrame | None = None) -> torch.Tensor:
+        """Rest scene from tracker view results: dense depth minus tracked/excluded masks. `bundle` is the camera
+        bundle of the cycle: it carries what the tracker's frames do not (robot pixels, depth before the zone)."""
+        views, masks, unzoned = [], [], []
+        for name, result in output.view_results.items():
             frame = result.frame
+            cam = bundle.cameras.get(name) if bundle is not None else None
             depth_cpu = self._depth_view(frame.depth_m, getattr(frame, "depth_gpu", None))
             if depth_cpu is None:
                 continue
@@ -280,8 +286,9 @@ class SceneCloudAssembler:
             intr = frame.intrinsics
             excluded = self._exclusion_mask_gpu(result, tuple(depth_cpu.shape), len(views))
             views.append((depth_cpu, (float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)), np.asarray(world_from_camera, dtype=np.float32), excluded))
-            masks.append(getattr(frame, "occluder_mask", None))
-        return self._remembered(self._rest_points_from_views(views), views, masks)
+            masks.append(getattr(cam, "occluder_mask", None))
+            unzoned.append(getattr(cam, "depth_unzoned_gpu", None))
+        return self._remembered(self._rest_points_from_views(views), views, masks, unzoned)
 
     @staticmethod
     def _depth_view(depth_host, depth_gpu):
@@ -294,7 +301,7 @@ class SceneCloudAssembler:
 
     def rest_points_from_frame(self, frame: MultiCameraFrame) -> torch.Tensor:
         """Rest scene directly from the synchronized RGB-D bundle (no tracker: nothing excluded)."""
-        views, masks = [], []
+        views, masks, unzoned = [], [], []
         for cam in frame.cameras.values():
             depth_cpu = self._depth_view(cam.depth, getattr(cam, "depth_gpu", None))
             if depth_cpu is None:
@@ -302,23 +309,61 @@ class SceneCloudAssembler:
             K = np.asarray(cam.K, dtype=np.float64).reshape(3, 3)
             views.append((depth_cpu, (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])), np.asarray(cam.T_world_camera, dtype=np.float32), None))
             masks.append(getattr(cam, "occluder_mask", None))
-        return self._remembered(self._rest_points_from_views(views), views, masks)
+            unzoned.append(getattr(cam, "depth_unzoned_gpu", None))
+        return self._remembered(self._rest_points_from_views(views), views, masks, unzoned)
 
-    def _remembered(self, rest: torch.Tensor, views, masks=None) -> torch.Tensor:
-        """The rest scene through the static memory (identity when the memory is off)."""
+    def _remembered(self, rest: torch.Tensor, views, masks=None, unzoned=None) -> torch.Tensor:
+        """The rest scene through the static memory (identity when the memory is off). `unzoned`: per view, the depth
+        image before the pipeline's zone blanked it (None without a zone) - what the visibility test looks at."""
         if self.static_memory is None:
             return rest
+        ok = [v[2].shape in {(4, 4), (3, 4)} for v in views]
         if masks is not None:
-            masks = [mk for v, mk in zip(views, masks) if v[2].shape in {(4, 4), (3, 4)}]
-        views = [v for v in views if v[2].shape in {(4, 4), (3, 4)}]
+            masks = [mk for good, mk in zip(ok, masks) if good]
+        if unzoned is not None:
+            unzoned = [d for good, d in zip(ok, unzoned) if good]
+        views = [v for good, v in zip(ok, views) if good]
         # Host depth images were just uploaded by _rest_points_from_views (slot ("depth", view)); the device copy is
         # valid until the next cycle's upload, so the memory reads it instead of copying the image a second time.
         views = [(self._uploaded(("depth", i), v[0]), *v[1:]) for i, v in enumerate(views)]
+        if unzoned is not None:
+            views = [v if d is None or tuple(d.shape) != tuple(v[0].shape) else (d, *v[1:]) for v, d in zip(views, unzoned)]
         keys = getattr(self, "_last_rest_keys", None)
-        if keys is None or keys.shape[0] != rest.shape[0]:
-            keys = None
         self._last_rest_keys = None
-        return self.static_memory.update(rest, views, upload=self._upload, current_keys=keys, masks=masks)
+        memory = self.static_memory
+        if self._memory_pending is not None:                 # the consumer did not finish the last cycle: do it now
+            self.finish_memory()
+        if keys is None or keys.shape[0] != rest.shape[0]:
+            rest, keys = memory.sorted_keys(rest.to(self.device, torch.float32))
+        # Latency-critical part: the rest points of this cycle plus the remembered points whose voxel is not observed
+        # now (one binary search). Merging this cycle into the memory and the visibility test of every remembered point
+        # wait in _memory_pending until finish_memory(), which the consumer calls once its command is out.
+        held, held_keys = memory.held(keys)
+        self._memory_pending = (rest, keys, views, masks)
+        self._cloud_rest_keys = torch.cat((keys, held_keys), dim=0) if held_keys.shape[0] else keys
+        return torch.cat((rest, held), dim=0) if held.shape[0] else rest
+
+    def finish_memory(self, forget_rows: torch.Tensor | None = None, near_rows: torch.Tensor | None = None) -> None:
+        """Second half of the static memory's cycle, off the latency-critical path: merge the observation of this cycle
+        and judge the visibility of every remembered point (static_memory.update). Call it after the consumer's command
+        is out; without a caller the next cycle does it first.
+
+        forget_rows / near_rows: rows of the REST part of the cloud of this cycle (output.scene_points behind the
+        dynamic rows) that the consumer found inside the robot / close to it (static_memory: forget, young rule)."""
+        pending, self._memory_pending = self._memory_pending, None
+        if pending is None or self.static_memory is None:
+            return
+        rest, keys, views, masks = pending
+        cloud_keys = self._cloud_rest_keys
+
+        def to_keys(rows):
+            if rows is None or rows.numel() == 0 or cloud_keys is None:
+                return None
+            rows = rows.to(self.device)
+            return cloud_keys.index_select(0, rows[rows < cloud_keys.shape[0]])
+
+        self.static_memory.update(rest, views, upload=self._upload, current_keys=keys, masks=masks,
+                                  forget_keys=to_keys(forget_rows), near_keys=to_keys(near_rows))
 
     def _rest_points_fused(self, views) -> torch.Tensor:
         """All views through the fused Triton kernel (rest_scene_kernel.py) into one buffer, then the voxel dedup."""

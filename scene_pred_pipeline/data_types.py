@@ -24,6 +24,9 @@ class CameraFrameCpu:
     # upstream self-filter). The static memory keeps remembered points behind these pixels without a timeout; pixels
     # without depth for any other reason (holes, out of range) are "unknown" and expire.
     occluder_mask: "object | None" = None
+    # Set by the pipeline's zone (zone.py): the depth image as it arrived, before the points outside the zone were
+    # blanked in depth / depth_gpu. Read by the static memory's visibility test, which must see past the zone.
+    depth_unzoned_gpu: "object | None" = None
 
 
 class LazyHostDepth:

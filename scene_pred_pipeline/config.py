@@ -442,6 +442,13 @@ class StaticMemoryConfig:
     # Odd pixel neighbourhood used for the "empty" test (all valid neighbours beyond the point).
     neighbourhood: int = 3
     empty_frames_to_delete: int = 2
+    # Beside the robot (closer than young_near_robot_sdf_m to a collision body, reported by the consumer that knows
+    # the robot) a point is held only after its voxel was observed in this many cycles; a younger one is dropped the
+    # first cycle its voxel yields no rest point. What appears there for a frame or two - robot pixels the self-filter
+    # missed, a frame that passed unfiltered - is hidden by the robot itself the next cycle and would stay as an
+    # obstacle next to it for as long as it stands there. 0 or 1 = every point is held from its first observation.
+    min_observations_to_hold: int = 5
+    young_near_robot_sdf_m: float = 0.08
     # A point whose ray hits a surface at its depth (seen) but whose voxel yields no rest point for this many
     # consecutive cycles is a depth-noise voxel beside the surface: dropped (0 = keep forever).
     seen_unrefreshed_frames_to_delete: int = 10
@@ -449,7 +456,10 @@ class StaticMemoryConfig:
     # image) is kept this many consecutive cycles, then dropped: transient objects in front of a background without
     # depth return must not be remembered for ever. Robot pixels (occluder mask) keep points without limit. 0 = never.
     unknown_frames_to_delete: int = 30
-    # Size cap; the points unseen for the longest time are dropped first (0 = unbounded).
+    # Size cap; the points unseen for the longest time are dropped first (0 = unbounded). Those are the HIDDEN points,
+    # the ones the memory exists for: a memory that reaches the cap forgets what the robot occludes within a few
+    # cycles. A whole room at 5 mm holds millions of voxels (far-field depth noise fills new ones every cycle), so
+    # keep the memory well below the cap with the pipeline's `zone`.
     max_points: int = 1_000_000
     # Remembered points closer than this to the robot's collision bodies (or inside them) are forgotten by the
     # consumer that knows the robot (PerceptiveSafetyFilter node, after the filter's SDF pass): robot pixels missed by
@@ -457,6 +467,19 @@ class StaticMemoryConfig:
     robot_carve_sdf_m: float = 0.005
     # Plain-torch visibility test instead of the fused Triton kernel (tests / machines without Triton).
     reference_path: bool = False
+
+
+@dataclass(frozen=True)
+class ZoneConfig:
+    """Box outside which the pipeline computes nothing (scene_pred_pipeline/zone.py): the depth of every camera is
+    blanked where its point lies outside, before the tracker, the flow, the rest scene and the static memory.
+
+    min / max are xyz in the zone frame; pose = [t_xyz, axis-angle] of that frame in the world (identity = a world
+    box). An application that knows the robot puts the robot base there. No zone (the default) = all points."""
+
+    min: tuple[float, float, float]
+    max: tuple[float, float, float]
+    pose: tuple[float, float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True)
@@ -468,6 +491,7 @@ class PipelineConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     scene_cloud: SceneCloudConfig = field(default_factory=SceneCloudConfig)
     static_memory: StaticMemoryConfig = field(default_factory=StaticMemoryConfig)
+    zone: ZoneConfig | None = None
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     # Loaded from flow.config_path; it is intentionally not duplicated inside
     # the ScenePredictor default.yaml.
@@ -1053,15 +1077,41 @@ def _static_memory_config(value: Any) -> StaticMemoryConfig:
         raise ValueError("static_memory.neighbourhood must be an odd positive integer")
     if int(cfg.empty_frames_to_delete) < 1:
         raise ValueError("static_memory.empty_frames_to_delete must be >= 1")
+    if int(cfg.min_observations_to_hold) < 0:
+        raise ValueError("static_memory.min_observations_to_hold must be >= 0")
     if int(cfg.seen_unrefreshed_frames_to_delete) < 0:
         raise ValueError("static_memory.seen_unrefreshed_frames_to_delete must be >= 0")
     if int(cfg.unknown_frames_to_delete) < 0:
         raise ValueError("static_memory.unknown_frames_to_delete must be >= 0")
+    if not (math.isfinite(float(cfg.young_near_robot_sdf_m)) and float(cfg.young_near_robot_sdf_m) >= 0.0):
+        raise ValueError("static_memory.young_near_robot_sdf_m must be finite and >= 0")
     if not (math.isfinite(float(cfg.robot_carve_sdf_m)) and float(cfg.robot_carve_sdf_m) >= 0.0):
         raise ValueError("static_memory.robot_carve_sdf_m must be finite and >= 0")
     if int(cfg.max_points) < 0:
         raise ValueError("static_memory.max_points must be >= 0")
     return cfg
+
+
+def _zone_config(value: Any) -> ZoneConfig | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"none", "all", "off"}:
+        return None
+    values = _mapping(value, name="zone")
+    unknown = set(values) - {"min", "max", "pose"}
+    if unknown or "min" not in values or "max" not in values:
+        raise ValueError("zone takes `min: [x, y, z]`, `max: [x, y, z]` and optionally `pose: [t_xyz, axis-angle]` "
+                         "(or `zone: none` for all points)" + (f"; unknown: {sorted(unknown)}" if unknown else ""))
+    try:
+        lo, hi = (tuple(float(v) for v in values[key]) for key in ("min", "max"))
+        pose = tuple(float(v) for v in values.get("pose", (0.0,) * 6))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("zone.min / zone.max / zone.pose must be lists of numbers") from exc
+    if len(lo) != 3 or len(hi) != 3 or not all(math.isfinite(v) for v in lo + hi) or not all(a < b for a, b in zip(lo, hi)):
+        raise ValueError("zone.min / zone.max must be finite xyz with min < max")
+    if len(pose) != 6 or not all(math.isfinite(v) for v in pose):
+        raise ValueError("zone.pose needs 6 finite values [t_xyz, axis-angle]")
+    return ZoneConfig(min=lo, max=hi, pose=pose)
 
 
 def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> PipelineConfig:
@@ -1177,6 +1227,7 @@ def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> Pi
         output=output,
         scene_cloud=scene_cloud,
         static_memory=_static_memory_config(raw.get("static_memory")),
+        zone=_zone_config(raw.get("zone")),
         runtime=_construct(RuntimeConfig, raw.get("runtime")),
         difflow=difflow,
     )
