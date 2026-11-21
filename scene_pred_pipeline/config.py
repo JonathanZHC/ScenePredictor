@@ -423,6 +423,43 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class StaticMemoryConfig:
+    """Visibility-aware memory of the rest scene (scene_pred_pipeline/static_memory.py).
+
+    Rest points seen once are kept, in the world frame, while the robot or another object hides them from
+    the cameras; they are removed only when a camera ray passes through their position for
+    `empty_frames_to_delete` consecutive cycles. Static points only (zero velocity).
+    """
+
+    enabled: bool = False
+    # Depth-noise model of the camera: sigma(z) = depth_sigma_a_m + depth_sigma_b_per_m * z^2; a point counts as
+    # seen within margin_sigmas * sigma of the observed depth and as behind a surface / in empty space outside it.
+    depth_sigma_a_m: float = 0.002
+    depth_sigma_b_per_m: float = 0.004
+    margin_sigmas: float = 3.0
+    # Lower bound of the margin; 0 = the rest-scene voxel size.
+    min_margin_m: float = 0.0
+    # Odd pixel neighbourhood used for the "empty" test (all valid neighbours beyond the point).
+    neighbourhood: int = 3
+    empty_frames_to_delete: int = 2
+    # A point whose ray hits a surface at its depth (seen) but whose voxel yields no rest point for this many
+    # consecutive cycles is a depth-noise voxel beside the surface: dropped (0 = keep forever).
+    seen_unrefreshed_frames_to_delete: int = 10
+    # A point no camera has evidence about (no depth at its pixel and not a robot pixel, out of range, outside every
+    # image) is kept this many consecutive cycles, then dropped: transient objects in front of a background without
+    # depth return must not be remembered for ever. Robot pixels (occluder mask) keep points without limit. 0 = never.
+    unknown_frames_to_delete: int = 30
+    # Size cap; the points unseen for the longest time are dropped first (0 = unbounded).
+    max_points: int = 1_000_000
+    # Remembered points closer than this to the robot's collision bodies (or inside them) are forgotten by the
+    # consumer that knows the robot (PerceptiveSafetyFilter node, after the filter's SDF pass): robot pixels missed by
+    # the self-filter must not become permanent obstacles. 0 disables.
+    robot_carve_sdf_m: float = 0.005
+    # Plain-torch visibility test instead of the fused Triton kernel (tests / machines without Triton).
+    reference_path: bool = False
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     ros: RosConfig = field(default_factory=RosConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
@@ -430,6 +467,7 @@ class PipelineConfig:
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     scene_cloud: SceneCloudConfig = field(default_factory=SceneCloudConfig)
+    static_memory: StaticMemoryConfig = field(default_factory=StaticMemoryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     # Loaded from flow.config_path; it is intentionally not duplicated inside
     # the ScenePredictor default.yaml.
@@ -1005,6 +1043,27 @@ def _scene_cloud_config(value: Any) -> SceneCloudConfig:
     return cfg
 
 
+def _static_memory_config(value: Any) -> StaticMemoryConfig:
+    cfg = _construct(StaticMemoryConfig, _mapping(value, name="static_memory"))
+    for name in ("depth_sigma_a_m", "depth_sigma_b_per_m", "margin_sigmas", "min_margin_m"):
+        v = float(getattr(cfg, name))
+        if not (math.isfinite(v) and v >= 0.0):
+            raise ValueError(f"static_memory.{name} must be finite and >= 0")
+    if int(cfg.neighbourhood) < 1 or int(cfg.neighbourhood) % 2 == 0:
+        raise ValueError("static_memory.neighbourhood must be an odd positive integer")
+    if int(cfg.empty_frames_to_delete) < 1:
+        raise ValueError("static_memory.empty_frames_to_delete must be >= 1")
+    if int(cfg.seen_unrefreshed_frames_to_delete) < 0:
+        raise ValueError("static_memory.seen_unrefreshed_frames_to_delete must be >= 0")
+    if int(cfg.unknown_frames_to_delete) < 0:
+        raise ValueError("static_memory.unknown_frames_to_delete must be >= 0")
+    if not (math.isfinite(float(cfg.robot_carve_sdf_m)) and float(cfg.robot_carve_sdf_m) >= 0.0):
+        raise ValueError("static_memory.robot_carve_sdf_m must be finite and >= 0")
+    if int(cfg.max_points) < 0:
+        raise ValueError("static_memory.max_points must be >= 0")
+    return cfg
+
+
 def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> PipelineConfig:
     """Build a PipelineConfig from an already-parsed mapping.
 
@@ -1117,6 +1176,7 @@ def load_config_from_mapping(raw: dict[str, Any], *, base_dir: str | Path) -> Pi
         recovery=_construct(RecoveryConfig, raw.get("recovery")),
         output=output,
         scene_cloud=scene_cloud,
+        static_memory=_static_memory_config(raw.get("static_memory")),
         runtime=_construct(RuntimeConfig, raw.get("runtime")),
         difflow=difflow,
     )

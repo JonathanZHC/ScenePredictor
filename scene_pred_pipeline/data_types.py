@@ -20,6 +20,10 @@ class CameraFrameCpu:
     # has it on the device (an upstream depth filter). Consumers that can take a tensor use it and skip
     # the upload; `depth` is then a LazyHostDepth on the same tensor, downloaded only if somebody reads it.
     depth_gpu: "object | None" = None
+    # Optional bool [H, W] (host array or CUDA tensor): pixels whose depth was removed because the ROBOT is there (the
+    # upstream self-filter). The static memory keeps remembered points behind these pixels without a timeout; pixels
+    # without depth for any other reason (holes, out of range) are "unknown" and expire.
+    occluder_mask: "object | None" = None
 
 
 class LazyHostDepth:

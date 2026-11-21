@@ -25,6 +25,7 @@ import torch
 from . import rest_scene_kernel
 from .config import PipelineConfig
 from .data_types import MultiCameraFrame, SceneVelocityOutput
+from .static_memory import StaticMemory
 
 
 class SceneCloudAssembler:
@@ -55,6 +56,16 @@ class SceneCloudAssembler:
             self._workspace = (
                 torch.as_tensor(self.scene_cfg.workspace_min, dtype=torch.float32, device=self.device),
                 torch.as_tensor(self.scene_cfg.workspace_max, dtype=torch.float32, device=self.device),
+            )
+        # Visibility-aware memory of the rest scene: rest points hidden from the cameras stay in the cloud until a
+        # camera ray proves their place empty (static_memory.py).
+        self.static_memory: StaticMemory | None = None
+        if self.scene_cfg.include_rest_points and getattr(config, "static_memory", None) is not None and config.static_memory.enabled:
+            if self._origin is None:
+                raise ValueError("static_memory needs the rest-scene lattice (scene_cloud.include_rest_points)")
+            self.static_memory = StaticMemory(
+                config.static_memory, device=self.device, origin=self._origin, voxel_size_m=self.voxel_size_m,
+                depth_range=(self._min_depth_m, self._max_depth_m), workspace=self._workspace,
             )
 
     # ------------------------------------------------------------------ public
@@ -166,6 +177,14 @@ class SceneCloudAssembler:
         self._min_depth_m = min_depth_m
         self._max_depth_m = max_depth_m
 
+    def _uploaded(self, slot: tuple[Any, ...], array) -> Any:
+        """The device tensor the last _upload to `slot` filled with `array` (same shape and dtype), else `array` itself."""
+        if isinstance(array, torch.Tensor) or self.device.type != "cuda":
+            return array
+        array = np.asarray(array)
+        entry = self._uploads.get((slot, array.shape, array.dtype.str))
+        return array if entry is None else entry[1]
+
     def _upload(self, slot: tuple[Any, ...], array: np.ndarray) -> torch.Tensor:
         """Device copy of a host array through a reused pinned buffer, without a stream sync.
 
@@ -249,7 +268,7 @@ class SceneCloudAssembler:
 
     def rest_scene_points(self, output: SceneVelocityOutput) -> torch.Tensor:
         """Rest scene from tracker view results: dense depth minus tracked/excluded masks."""
-        views = []
+        views, masks = [], []
         for result in output.view_results.values():
             frame = result.frame
             depth_cpu = self._depth_view(frame.depth_m, getattr(frame, "depth_gpu", None))
@@ -261,7 +280,8 @@ class SceneCloudAssembler:
             intr = frame.intrinsics
             excluded = self._exclusion_mask_gpu(result, tuple(depth_cpu.shape), len(views))
             views.append((depth_cpu, (float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)), np.asarray(world_from_camera, dtype=np.float32), excluded))
-        return self._rest_points_from_views(views)
+            masks.append(getattr(frame, "occluder_mask", None))
+        return self._remembered(self._rest_points_from_views(views), views, masks)
 
     @staticmethod
     def _depth_view(depth_host, depth_gpu):
@@ -274,14 +294,31 @@ class SceneCloudAssembler:
 
     def rest_points_from_frame(self, frame: MultiCameraFrame) -> torch.Tensor:
         """Rest scene directly from the synchronized RGB-D bundle (no tracker: nothing excluded)."""
-        views = []
+        views, masks = [], []
         for cam in frame.cameras.values():
             depth_cpu = self._depth_view(cam.depth, getattr(cam, "depth_gpu", None))
             if depth_cpu is None:
                 continue
             K = np.asarray(cam.K, dtype=np.float64).reshape(3, 3)
             views.append((depth_cpu, (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])), np.asarray(cam.T_world_camera, dtype=np.float32), None))
-        return self._rest_points_from_views(views)
+            masks.append(getattr(cam, "occluder_mask", None))
+        return self._remembered(self._rest_points_from_views(views), views, masks)
+
+    def _remembered(self, rest: torch.Tensor, views, masks=None) -> torch.Tensor:
+        """The rest scene through the static memory (identity when the memory is off)."""
+        if self.static_memory is None:
+            return rest
+        if masks is not None:
+            masks = [mk for v, mk in zip(views, masks) if v[2].shape in {(4, 4), (3, 4)}]
+        views = [v for v in views if v[2].shape in {(4, 4), (3, 4)}]
+        # Host depth images were just uploaded by _rest_points_from_views (slot ("depth", view)); the device copy is
+        # valid until the next cycle's upload, so the memory reads it instead of copying the image a second time.
+        views = [(self._uploaded(("depth", i), v[0]), *v[1:]) for i, v in enumerate(views)]
+        keys = getattr(self, "_last_rest_keys", None)
+        if keys is None or keys.shape[0] != rest.shape[0]:
+            keys = None
+        self._last_rest_keys = None
+        return self.static_memory.update(rest, views, upload=self._upload, current_keys=keys, masks=masks)
 
     def _rest_points_fused(self, views) -> torch.Tensor:
         """All views through the fused Triton kernel (rest_scene_kernel.py) into one buffer, then the voxel dedup."""
@@ -316,6 +353,7 @@ class SceneCloudAssembler:
         keep = valid.clone()
         keep[1:] &= sorted_keys[1:] != sorted_keys[:-1]
         rest = points[order[keep]]
+        self._last_rest_keys = sorted_keys[keep]       # sorted, unique: the static memory merges on them
         self.last_rest_input = int(valid.sum())
         return rest
 
