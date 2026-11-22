@@ -69,7 +69,9 @@ behind where one camera is blocked and the other has no depth - and stood for te
       dropped, whatever hides it;
     * nothing lowers the confidence of a hidden point: behind the robot or another object there is no evidence, and the
       count stays. Only a ray through the point's place removes it, as before (`empty_frames_to_delete`);
-    * the rules for the robot's leftovers (young points, robot-born points and their anchors) are not applied: on a
+    * an unconfirmed point the consumer reports close to the robot (near_keys) is not held at all: beside the arm, what
+      was there for a few cycles is the arm;
+    * the other rules for the robot's leftovers (robot-born points and their anchors) are not applied: on a
       three-minute recording of the real installation (replayed through every variant) they changed nothing once ten
       observations were required - floating held cells 121 with them off against 113 with them on, 549 without evidence
       mode; static patches kept through an occlusion 50 % / 53 % / 57 % - and they cost half of the update.
@@ -229,10 +231,10 @@ class StaticMemory:
             current, cur_keys = current[observed], cur_keys[observed]
         else:
             forget_keys = None
-        if near_keys is not None and near_keys.numel() > 0 and not self.evidence:
+        if near_keys is not None and near_keys.numel() > 0:
             near_keys = torch.sort(near_keys.to(self.device)).values
         else:
-            near_keys = None                                  # evidence mode: the young / robot-born rules are not applied
+            near_keys = None
         n_cur = int(current.shape[0])
         m = int(self.points.shape[0])
 
@@ -302,9 +304,15 @@ class StaticMemory:
             self.near_flag = self.near_flag & (self.obs_count < hold_after)     # old enough: the flag has done its work
         if self.evidence:
             # unconfirmed and not observed for longer than the hold: dropped, whatever hides it
-            late = (self.obs_count < self._confirm_after) & ~refreshed & ((self.cycle - self.last_seen) > self._candidate_hold)
+            # ... and at once when the consumer reported it close to the robot: what is beside the arm for a few cycles
+            # is the arm (pixels the self-filter missed, a frame that passed unfiltered), and held for the hold time it
+            # stands in the filter's way (replayed recording: 92 held points beside the robot per cycle without this,
+            # 44 with the young rule of the memory as it was)
+            candidate = (self.obs_count < self._confirm_after) & ~refreshed
+            late = candidate & (((self.cycle - self.last_seen) > self._candidate_hold) | self.near_flag)
             self._counters[10] += (keep & late).sum()
             keep &= ~late
+            self.near_flag = self.near_flag & (self.obs_count < self._confirm_after)     # confirmed: the flag has done its work
         self._counters[2] += (keep & ~seen_now & ~refreshed).sum()
 
         # 3. Refresh in place (position of the current observation, counters reset), then compact the survivors.

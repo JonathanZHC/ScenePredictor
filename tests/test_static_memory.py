@@ -449,3 +449,24 @@ def test_depth_beyond_the_range_is_evidence():
     for _ in range(3):
         cloud = _cycle(asm, np.full((H, W), 8.0, dtype=np.float32))
     assert cloud.shape[0] == 0 and asm.static_memory.size == 0
+
+
+def test_candidates_beside_the_robot_are_not_held():
+    """Evidence mode: an unconfirmed point reported close to the robot goes the first cycle it is not observed."""
+    near_object = lambda pts: ((pts[:, 2] - OBJECT_Z).abs() < 0.06).nonzero(as_tuple=True)[0]
+    for near, expected_hold in ((None, True), (near_object, False)):
+        asm = _evidence(candidate_hold_frames=5)
+        for _ in range(3):
+            _cycle(asm, _scene(), near=near)
+        for _ in range(2):
+            _cycle(asm, _scene(obj=True), near=near)
+        _cycle(asm, _scene(plate=True), near=near)                   # hidden: this cycle's update judges it
+        cloud = _cycle(asm, _scene(plate=True), near=near)
+        assert (int(((cloud[:, 2] - OBJECT_Z).abs() < 0.06).sum()) > 0) is expected_hold
+    asm = _evidence(confirm_observations=4, candidate_hold_frames=2)  # confirmed: held although beside the robot
+    for _ in range(6):
+        _cycle(asm, _scene(obj=True), near=near_object)
+    n = _near_depth(asm, OBJECT_Z)
+    for _ in range(8):
+        _cycle(asm, _scene(plate=True), near=near_object)
+    assert n > 0 and _near_depth(asm, OBJECT_Z) == n
