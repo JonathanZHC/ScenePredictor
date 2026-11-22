@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Collection, Mapping
 
@@ -469,22 +469,13 @@ class StaticMemoryConfig:
     # keep the memory well below the cap with the pipeline's `zone`.
     max_points: int = 1_000_000
     # Evidence mode (static_memory.py, "Evidence mode"): a point is held while hidden only once it is CONFIRMED, i.e. its
-    # voxel was observed in enough cycles - `confirm_observations` when it appeared where the cameras had seen empty
-    # space (a new arrival: about 0.3 s at rest; what moves faster than a voxel per that time never gets there),
-    # `confirm_observations_unknown` when it appeared anywhere else (start-up, a surface something uncovers). An
-    # unconfirmed point that is not observed is handed out for `candidate_hold_frames` more cycles, then dropped.
-    # Confidence never falls while a point is hidden: only a ray through its place deletes it (empty_frames_to_delete).
+    # voxel was observed in `confirm_observations` cycles (about 0.3 s at rest; what moves faster than a voxel per that
+    # time never gets there). An unconfirmed point that is not observed is handed out for `candidate_hold_frames` more
+    # cycles, then dropped. Confidence never falls while a point is hidden: only a ray through its place deletes it
+    # (empty_frames_to_delete). The young / robot-born / anchor rules above are not applied in this mode.
     evidence: bool = False
     confirm_observations: int = 10
-    confirm_observations_unknown: int = 3
     candidate_hold_frames: int = 9
-    # Free-space grid of the evidence mode: voxel size, the consecutive cycles a camera ray must pass through a voxel
-    # (and no camera see a surface in it) before it counts as known free, and its world box (default: the pipeline's
-    # zone, else scene_cloud.workspace_*; without any box nothing counts as known free).
-    free_voxel_m: float = 0.03
-    free_frames_to_know: int = 15
-    free_min: tuple[float, float, float] | None = None
-    free_max: tuple[float, float, float] | None = None
     # Remembered points closer than this to the robot's collision bodies (or inside them) are forgotten by the
     # consumer that knows the robot (PerceptiveSafetyFilter node, after the filter's SDF pass): robot pixels missed by
     # the self-filter must not become permanent obstacles. 0 disables.
@@ -1115,20 +1106,10 @@ def _static_memory_config(value: Any) -> StaticMemoryConfig:
         raise ValueError("static_memory.robot_carve_sdf_m must be finite and >= 0")
     if int(cfg.max_points) < 0:
         raise ValueError("static_memory.max_points must be >= 0")
-    for name in ("confirm_observations", "confirm_observations_unknown", "free_frames_to_know"):
-        if int(getattr(cfg, name)) < 1:
-            raise ValueError(f"static_memory.{name} must be >= 1")
+    if int(cfg.confirm_observations) < 1:
+        raise ValueError("static_memory.confirm_observations must be >= 1")
     if int(cfg.candidate_hold_frames) < 0:
         raise ValueError("static_memory.candidate_hold_frames must be >= 0")
-    if not (math.isfinite(float(cfg.free_voxel_m)) and float(cfg.free_voxel_m) > 0.0):
-        raise ValueError("static_memory.free_voxel_m must be finite and > 0")
-    if (cfg.free_min is None) != (cfg.free_max is None):
-        raise ValueError("static_memory.free_min and free_max go together")
-    if cfg.free_min is not None:
-        lo, hi = tuple(float(v) for v in cfg.free_min), tuple(float(v) for v in cfg.free_max)
-        if len(lo) != 3 or len(hi) != 3 or not all(a < b for a, b in zip(lo, hi)):
-            raise ValueError("static_memory.free_min / free_max must be xyz with min < max")
-        cfg = replace(cfg, free_min=lo, free_max=hi)
     return cfg
 
 

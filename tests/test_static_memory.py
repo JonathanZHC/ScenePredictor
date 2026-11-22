@@ -318,11 +318,6 @@ def test_summary_counts():
 
 # ----------------------------------------------------------------------------------------------- evidence mode
 def _evidence(**memory):
-    """Evidence mode with a free-space grid in front of the camera (5 cm voxels, known free after 5 cycles)."""
-    memory.setdefault("free_min", (-1.5, -1.5, 0.2))
-    memory.setdefault("free_max", (1.5, 1.5, 2.6))
-    memory.setdefault("free_voxel_m", 0.05)
-    memory.setdefault("free_frames_to_know", 5)
     return _assembler(evidence=True, **memory)
 
 
@@ -347,39 +342,11 @@ def test_evidence_config_validation():
     base = {"tracker": {"tracked_prompts": []}, "scene_cloud": {"voxel_size_m": 0.005}}
     cfg = load_config_from_mapping({**base, "static_memory": {"enabled": True}}, base_dir=".")
     assert cfg.static_memory.evidence is False                       # off by default: the memory behaves as before
-    cfg = load_config_from_mapping({**base, "static_memory": {"enabled": True, "evidence": True, "free_min": [0, 0, 0], "free_max": [1, 1, 1]}}, base_dir=".")
-    assert cfg.static_memory.evidence and cfg.static_memory.free_max == (1.0, 1.0, 1.0)
-    for bad in ({"confirm_observations": 0}, {"candidate_hold_frames": -1}, {"free_voxel_m": 0.0}, {"free_min": [0, 0, 0]},
-                {"free_min": [0, 0, 0], "free_max": [1, 0, 1]}):
+    cfg = load_config_from_mapping({**base, "static_memory": {"enabled": True, "evidence": True, "confirm_observations": 6}}, base_dir=".")
+    assert cfg.static_memory.evidence and cfg.static_memory.confirm_observations == 6
+    for bad in ({"confirm_observations": 0}, {"candidate_hold_frames": -1}):
         with pytest.raises(ValueError):
             load_config_from_mapping({**base, "static_memory": bad}, base_dir=".")
-
-
-def test_free_space_grid_learns_what_the_rays_pass_through():
-    asm = _evidence()
-    memory = asm.static_memory
-    centres = memory._free_centres
-    on_axis = (centres[:, 0].abs() < 0.2) & (centres[:, 1].abs() < 0.2)       # well inside the 32 x 32 image
-    for _ in range(4):
-        _cycle(asm, _scene())
-    assert not bool(memory.free_known().any())                                 # not yet: free_frames_to_know = 5
-    for _ in range(2):
-        _cycle(asm, _scene())
-    known = memory.free_known()
-    assert bool(known[on_axis & (centres[:, 2] > 0.4) & (centres[:, 2] < 1.6)].all())     # in front of the wall: free
-    assert not bool(known[on_axis & (centres[:, 2] > 1.95)].any())                         # the wall and behind it: not
-    assert not bool(known[centres[:, 0].abs() > 1.3].any())                                # outside the image: no evidence
-    # a surface seen in a voxel resets it; a robot pixel says nothing (the count stays)
-    for _ in range(2):
-        _cycle(asm, _scene(obj=True))
-    at_object = on_axis & (centres[:, 0].abs() < 0.08) & (centres[:, 1].abs() < 0.08) & ((centres[:, 2] - OBJECT_Z).abs() < 0.03)
-    assert bool(at_object.any()) and not bool(memory.free_known()[at_object].any())
-    asm = _evidence()
-    robot = np.zeros((H, W), dtype=bool); robot[8:24, 8:24] = True
-    for _ in range(8):
-        _cycle(asm, _scene(), mask=robot)
-    behind_robot = (centres[:, 0].abs() < 0.05) & (centres[:, 1].abs() < 0.05) & (centres[:, 2] > 0.4) & (centres[:, 2] < 1.6)
-    assert not bool(asm.static_memory.free_known()[behind_robot].any())
 
 
 def test_what_passes_through_is_not_remembered():
@@ -455,30 +422,6 @@ def test_confirmed_object_stays_behind_robot_pixels():
     assert _near_depth(asm, OBJECT_Z) == 0
 
 
-def test_unknown_born_points_confirm_sooner():
-    """What is there from the first cycle (no knowledge of free space yet) needs confirm_observations_unknown only."""
-    asm = _evidence(confirm_observations=10, confirm_observations_unknown=3, candidate_hold_frames=2)
-    for _ in range(3):
-        _cycle(asm, _scene(obj=True))
-    n_object = _near_depth(asm, OBJECT_Z)
-    for _ in range(10):
-        _cycle(asm, _scene(plate=True))
-    assert n_object > 0 and _near_depth(asm, OBJECT_Z) == n_object
-    asm = _evidence(confirm_observations=10, confirm_observations_unknown=3, candidate_hold_frames=2)
-    _cycle(asm, _scene(obj=True))                                    # seen once only
-    for _ in range(10):
-        _cycle(asm, _scene(plate=True))
-    assert _near_depth(asm, OBJECT_Z) == 0
-
-
-def test_evidence_mode_without_a_box_has_no_grid():
-    asm = _assembler(evidence=True)
-    assert asm.static_memory._free is None and asm.static_memory.free_known() is None
-    for _ in range(4):
-        _cycle(asm, _scene())
-    assert _near_depth(asm, WALL_Z) > 0
-
-
 # ----------------------------------------------------------------------------------------------- too-far pixels
 def test_too_far_pixels_prove_the_place_empty():
     """A pixel the camera reports as too far has no depth, but the ray passed everything in range: remembered points
@@ -506,17 +449,3 @@ def test_depth_beyond_the_range_is_evidence():
     for _ in range(3):
         cloud = _cycle(asm, np.full((H, W), 8.0, dtype=np.float32))
     assert cloud.shape[0] == 0 and asm.static_memory.size == 0
-
-
-def test_too_far_pixels_teach_the_free_space_grid():
-    asm = _evidence()
-    centres = asm.static_memory._free_centres
-    on_axis = (centres[:, 0].abs() < 0.2) & (centres[:, 1].abs() < 0.2) & (centres[:, 2] > 0.4) & (centres[:, 2] < 2.4)
-    nothing = np.zeros((H, W), dtype=np.float32)
-    for _ in range(7):
-        _cycle(asm, nothing)
-    assert not bool(asm.static_memory.free_known()[on_axis].any())   # no depth, no mask: no evidence
-    far = np.ones((H, W), dtype=bool)
-    for _ in range(7):
-        _cycle(asm, nothing, far=far)
-    assert bool(asm.static_memory.free_known()[on_axis].all())

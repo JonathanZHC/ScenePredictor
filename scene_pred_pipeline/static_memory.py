@@ -58,31 +58,25 @@ of every remembered point, deletions) runs after the consumer's command is out (
 deletion shows in the cloud one cycle later. Seen-but-not-observed points (depth-noise voxels beside a surface that is in
 the current cloud) stay inside the memory and are not handed out.
 
-Evidence mode (`evidence: true`): how long a point has been observed decides whether it may be held at all. Without it
+Evidence mode (`evidence: true`): how often a point has been observed decides whether it may be held at all. Without it
 every point that was in the cloud for one cycle is held like a table: on the real installation 77 % of the points held
 for more than a second had been observed in fewer than 5 cycles - what the moving arm, a hand, an unmasked object leave
 behind where one camera is blocked and the other has no depth - and stood for tens of seconds. In evidence mode
 
-    * a point is CONFIRMED once its voxel was observed in `confirm_observations` cycles when it appeared where the cameras
-      had seen empty space (FREE_BORN: a new arrival; ten cycles = a third of a second at rest, and what moves faster
-      than a voxel per that time never gets there), in `confirm_observations_unknown` cycles when it appeared anywhere
-      else (start-up, a surface that something uncovers);
-    * only confirmed points are held without a time limit. An unconfirmed one is handed out for `candidate_hold_frames`
-      cycles after its last observation and then dropped, whatever hides it;
-    * a robot-born point's anchor must be confirmed itself (leftovers anchored each other and the table through chains
-      of other leftovers);
+    * a point is CONFIRMED once its voxel was observed in `confirm_observations` cycles (ten = a third of a second at
+      rest; what moves faster than a voxel per that time never gets there). Only confirmed points are held without a
+      time limit; an unconfirmed one is handed out for `candidate_hold_frames` cycles after its last observation and then
+      dropped, whatever hides it;
     * nothing lowers the confidence of a hidden point: behind the robot or another object there is no evidence, and the
-      count stays. Only a ray through the point's place removes it, as before (`empty_frames_to_delete`).
+      count stays. Only a ray through the point's place removes it, as before (`empty_frames_to_delete`);
+    * the rules for the robot's leftovers (young points, robot-born points and their anchors) are not applied: on a
+      three-minute recording of the real installation (replayed through every variant) they changed nothing once ten
+      observations were required - floating held cells 121 with them off against 113 with them on, 549 without evidence
+      mode; static patches kept through an occlusion 50 % / 53 % / 57 % - and they cost half of the update.
 
-Semi-static scenes follow from the same two rules: an object that is put down is in the cloud at once (it is observed)
-and is remembered a third of a second later; one that is taken away is released as soon as a camera sees through its
-place, however long it stood there; taken away while hidden, its place stays blocked until a camera sees it again.
-
-Known free space is a dense grid over the pipeline's zone (`free_voxel_m`): a voxel counts as free after a camera ray
-passed through all of it (beyond its centre by the depth margin plus the voxel's half diagonal) for
-`free_frames_to_know` consecutive cycles while no camera saw a surface in it; a surface seen in it resets it, no evidence
-(hidden, no depth, robot pixels) leaves it as it is. The cameras are static, so the pixel of every voxel centre is
-computed once and a cycle costs two gathers per camera.
+Semi-static scenes follow from the same rule: an object that is put down is in the cloud at once (it is observed) and is
+remembered a third of a second later; one that is taken away is released as soon as a camera sees through its place,
+however long it stood there; taken away while hidden, its place stays blocked until a camera sees it again.
 
 Size: the memory holds what the pipeline's zone (zone.py) lets through. With a whole room in view and no zone it runs
 into max_points within a second, and the cap drops the longest-unseen points - the hidden ones the memory exists for.
@@ -92,8 +86,6 @@ on a surface outside the zone.
 from __future__ import annotations
 
 from typing import Any, Callable, Sequence
-
-import math
 
 import numpy as np
 import torch
@@ -105,8 +97,6 @@ _NO_MAX = 1.0e30    # the visibility test has no far limit (depth beyond the ran
 KEY_BIAS = 1 << 20
 ROBOT_BORN = 1      # tags: first observed close to the robot (consumer's near_keys) or at the robot's silhouette in the image
 ANCHORED = 2        #       ... and connected to something that was not
-FREE_BORN = 4       # evidence mode: first observed where the cameras had seen empty space (a new arrival)
-CONFIRMED = 8       #                observed often enough to be held while hidden
 KEY_MASK = (1 << 21) - 1
 
 
@@ -120,7 +110,6 @@ class StaticMemory:
         voxel_size_m: float,
         depth_range: tuple[float, float],
         workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
-        free_bounds: tuple[Sequence[float], Sequence[float]] | None = None,
     ) -> None:
         self.cfg = config
         self.device = device
@@ -150,21 +139,8 @@ class StaticMemory:
         # ... and dropped as unconfirmed (evidence mode: not observed for candidate_hold_frames before being confirmed)
         self._counters = torch.zeros(11, dtype=torch.int64, device=device)
         self.evidence = bool(getattr(config, "evidence", False))
-        # Free-space grid (evidence mode): consecutive cycles each voxel was judged free, saturating.
-        self._free: torch.Tensor | None = None
-        self._free_view: dict[int, tuple] = {}      # per view: (cache key, pixel index, depth of the centre, in image, margin)
-        if self.evidence and free_bounds is not None:
-            size = float(config.free_voxel_m)
-            lo = torch.as_tensor([float(v) for v in free_bounds[0]], dtype=torch.float32, device=device)
-            hi = torch.as_tensor([float(v) for v in free_bounds[1]], dtype=torch.float32, device=device)
-            shape = [max(1, int(math.ceil(float(e) / size))) for e in (hi - lo).tolist()]
-            if shape[0] * shape[1] * shape[2] > 8_000_000:
-                raise ValueError(f"static_memory: free-space grid {shape} at free_voxel_m {size} has more than 8e6 voxels")
-            self._free_lo, self._free_inv, self._free_shape = lo, 1.0 / size, shape
-            self._free_radius = 0.5 * math.sqrt(3.0) * size          # a ray is through the whole voxel beyond this
-            self._free = torch.zeros(shape[0] * shape[1] * shape[2], dtype=torch.int16, device=device)
-            grid = torch.stack(torch.meshgrid(*[torch.arange(n, device=device, dtype=torch.float32) for n in shape], indexing="ij"), dim=-1)
-            self._free_centres = (grid.reshape(-1, 3) + 0.5) * size + lo
+        self._confirm_after = int(getattr(config, "confirm_observations", 10))
+        self._candidate_hold = int(getattr(config, "candidate_hold_frames", 9))
         self._cam_cache: dict[int, tuple[bytes, torch.Tensor, list[float]]] = {}
         self.use_kernel = static_memory_kernel.available(device) and not bool(getattr(config, "reference_path", False))
 
@@ -191,15 +167,13 @@ class StaticMemory:
         if self.points.shape[0] == 0:
             return self.points, self.keys
         mask = ~self._isin_sorted(self.keys, current_keys.to(self.device)) & (self.stale_count == 0)
-        if self.tags.shape[0] == mask.shape[0] and bool(getattr(self.cfg, "robot_born_needs_anchor", True)):
+        if not self.evidence and self.tags.shape[0] == mask.shape[0] and bool(getattr(self.cfg, "robot_born_needs_anchor", True)):
             # robot-born without an anchor: never held (the update drops it)
             mask &= (self.tags & (ROBOT_BORN | ANCHORED)) != ROBOT_BORN
         idx = mask.nonzero(as_tuple=True)[0]
         return self.points.index_select(0, idx), self.keys.index_select(0, idx)
 
     def reset(self) -> None:
-        if self._free is not None:
-            self._free.zero_()
         self.near_flag = self.near_flag[:0]
         self.tags = self.tags[:0]
         self.points = self.points[:0]
@@ -255,14 +229,12 @@ class StaticMemory:
             current, cur_keys = current[observed], cur_keys[observed]
         else:
             forget_keys = None
-        if near_keys is not None and near_keys.numel() > 0:
+        if near_keys is not None and near_keys.numel() > 0 and not self.evidence:
             near_keys = torch.sort(near_keys.to(self.device)).values
         else:
-            near_keys = None
+            near_keys = None                                  # evidence mode: the young / robot-born rules are not applied
         n_cur = int(current.shape[0])
         m = int(self.points.shape[0])
-        if self.evidence:
-            views, masks = self._device_views(views, upload, masks)       # one upload for every user below
 
         if m == 0:
             self.points, self.keys = current.clone(), cur_keys.clone()
@@ -273,14 +245,12 @@ class StaticMemory:
             self.obs_count = torch.ones(n_cur, dtype=torch.int16, device=self.device)
             self.near_flag = (self._isin_sorted(cur_keys, near_keys) if near_keys is not None
                               else torch.zeros(n_cur, dtype=torch.bool, device=self.device))
-            self.tags = self._born_tags(current, cur_keys, near_keys, views, upload, masks)
             if self.evidence:
-                self.tags |= self._free_born(current).to(torch.uint8) * FREE_BORN
-                self._confirm()
-            self._anchor()
+                self.tags = torch.zeros(n_cur, dtype=torch.uint8, device=self.device)
+            else:
+                self.tags = self._born_tags(current, cur_keys, near_keys, views, upload, masks)
+                self._anchor()
             self._counters[0] += n_cur
-            if self.evidence:
-                self._update_free(views, masks)
             return
 
         # 1. Which memory voxels are observed again this cycle (both key lists sorted and unique).
@@ -316,10 +286,10 @@ class StaticMemory:
             stale = self.stale_count >= stale_limit
             self._counters[5] += (keep & stale).sum()
             keep &= ~stale
-        hold_after = int(getattr(self.cfg, "min_observations_to_hold", 0))
+        hold_after = 0 if self.evidence else int(getattr(self.cfg, "min_observations_to_hold", 0))
         if self.tags.shape[0] != m:
             self.tags = torch.zeros(m, dtype=torch.uint8, device=self.device)
-        if bool(getattr(self.cfg, "robot_born_needs_anchor", True)):
+        if not self.evidence and bool(getattr(self.cfg, "robot_born_needs_anchor", True)):
             # robot-born and not connected to anything else: lives only while it is observed
             loose = ((self.tags & (ROBOT_BORN | ANCHORED)) == ROBOT_BORN) & ~refreshed
             self._counters[9] += (keep & loose).sum()
@@ -332,7 +302,7 @@ class StaticMemory:
             self.near_flag = self.near_flag & (self.obs_count < hold_after)     # old enough: the flag has done its work
         if self.evidence:
             # unconfirmed and not observed for longer than the hold: dropped, whatever hides it
-            late = ((self.tags & CONFIRMED) == 0) & ~refreshed & ((self.cycle - self.last_seen) > int(self.cfg.candidate_hold_frames))
+            late = (self.obs_count < self._confirm_after) & ~refreshed & ((self.cycle - self.last_seen) > self._candidate_hold)
             self._counters[10] += (keep & late).sum()
             keep &= ~late
         self._counters[2] += (keep & ~seen_now & ~refreshed).sum()
@@ -393,15 +363,11 @@ class StaticMemory:
             self.near_flag = near
             tags = torch.zeros(total, dtype=torch.uint8, device=self.device)
             tags[dst_m] = s_tags
-            born = self._born_tags(current[new], n_keys, near_keys, views, upload, masks)
-            if self.evidence:
-                born |= self._free_born(current[new]).to(torch.uint8) * FREE_BORN
-            tags[dst_k] = born
+            if not self.evidence:
+                tags[dst_k] = self._born_tags(current[new], n_keys, near_keys, views, upload, masks)
             self.tags = tags
-        if self.evidence:
-            self._confirm()
-            self._update_free(views, masks)          # after the tags: a new arrival is judged against the grid before it
-        self._anchor()
+        if not self.evidence:
+            self._anchor()
 
         cap = int(self.cfg.max_points)
         if cap > 0 and self.points.shape[0] > cap:              # drop the longest unseen points (keeps the key order)
@@ -466,114 +432,18 @@ class StaticMemory:
             cand = self.keys[idx][:, None] + self._neighbours[None]
             pos = torch.searchsorted(self.keys, cand.reshape(-1)).clamp_(max=m - 1).reshape(cand.shape)
             solid = (self.keys[pos] == cand) & ((self.tags[pos] & (ROBOT_BORN | ANCHORED)) != ROBOT_BORN)
-            if self.evidence:
-                solid &= (self.tags[pos] & CONFIRMED) != 0
             hit = solid.any(dim=1)
             self.tags[idx[hit]] |= ANCHORED
             if not bool(hit.any()):
                 return
             idx = idx[~hit]
 
-    # ------------------------------------------------------------------ evidence mode
     def _evidence_summary(self, dropped_unconfirmed: int) -> str:
         if not self.evidence:
             return ""
-        m = int(self.tags.shape[0])
-        confirmed = int(((self.tags & CONFIRMED) != 0).sum()) if m else 0
-        free_born = int(((self.tags & FREE_BORN) != 0).sum()) if m else 0
-        text = f"; evidence: confirmed {confirmed} of {m}, born in free space {free_born}, dropped unconfirmed {dropped_unconfirmed}"
-        if self._free is not None:
-            known = int((self._free >= int(self.cfg.free_frames_to_know)).sum())
-            text += f", known free {known} of {int(self._free.shape[0])} voxels ({float(self.cfg.free_voxel_m) * 100:.0f} cm)"
-        return text
-
-    def _device_views(self, views: Sequence[tuple], upload, masks) -> tuple[list[tuple], list[Any]]:
-        """The view tuples with depth and occluder mask on the device (one upload per image and update)."""
-        out_views, out_masks = [], []
-        for view, (depth, intr, world_from_camera, excluded) in enumerate(views):
-            if torch.is_tensor(depth):
-                depth = depth.to(self.device)
-            elif upload is not None:
-                depth = upload(("static_memory_depth", view), np.asarray(depth, dtype=np.float32))
-            else:
-                depth = torch.as_tensor(np.asarray(depth, dtype=np.float32), device=self.device)
-            mask = masks[view] if masks is not None and view < len(masks) else None
-            if mask is not None:
-                mask = mask.to(self.device) if torch.is_tensor(mask) else torch.as_tensor(np.asarray(mask), device=self.device)
-                mask = (mask != 0) if mask.dtype != torch.bool else mask
-            out_views.append((depth, intr, world_from_camera, excluded))
-            out_masks.append(mask)
-        return out_views, out_masks
-
-    def _confirm(self) -> None:
-        """Set CONFIRMED where the voxel was observed often enough (more often for what appeared in known free space)."""
-        if self.tags.shape[0] == 0:
-            return
-        need = torch.where((self.tags & FREE_BORN) != 0, int(self.cfg.confirm_observations), int(self.cfg.confirm_observations_unknown))
-        self.tags |= (self.obs_count >= need).to(torch.uint8) * CONFIRMED
-
-    def _free_index(self, points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(flat grid index, inside the grid) of world points."""
-        nx, ny, nz = self._free_shape
-        ijk = torch.floor((points - self._free_lo) * self._free_inv).to(torch.int64)
-        inside = (ijk >= 0).all(dim=1) & (ijk[:, 0] < nx) & (ijk[:, 1] < ny) & (ijk[:, 2] < nz)
-        flat = (ijk[:, 0].clamp(0, nx - 1) * ny + ijk[:, 1].clamp(0, ny - 1)) * nz + ijk[:, 2].clamp(0, nz - 1)
-        return flat, inside
-
-    def _free_born(self, points: torch.Tensor) -> torch.Tensor:
-        """Per point: its place was known free space before this cycle."""
-        if self._free is None or points.shape[0] == 0:
-            return torch.zeros(points.shape[0], dtype=torch.bool, device=self.device)
-        flat, inside = self._free_index(points)
-        return inside & (self._free.index_select(0, flat) >= int(self.cfg.free_frames_to_know))
-
-    def _update_free(self, views: Sequence[tuple], masks: Sequence[Any]) -> None:
-        """One cycle of the free-space grid: +1 where a camera ray passes through the whole voxel and no camera sees a
-        surface in it, 0 where one does, unchanged without evidence (hidden, no depth, robot pixel, outside every image)."""
-        if self._free is None:
-            return
-        g = int(self._free.shape[0])
-        seen_any = torch.zeros(g, dtype=torch.bool, device=self.device)
-        empty_any = torch.zeros(g, dtype=torch.bool, device=self.device)
-        k = 2 * self._half + 1
-        for view, (depth, intr, world_from_camera, _excluded) in enumerate(views):
-            if depth.ndim != 2 or depth.numel() == 0:
-                continue
-            height, width = int(depth.shape[0]), int(depth.shape[1])
-            cam_from_world, (fx, fy, cx, cy) = self._camera(view, world_from_camera, intr)
-            key = (self._cam_cache[view][0], height, width, fx, fy, cx, cy)
-            cached = self._free_view.get(view)
-            if cached is None or cached[0] != key:
-                p = torch.addmm(cam_from_world[:, 3], self._free_centres, cam_from_world[:, :3].T)
-                z = p[:, 2]
-                zs = z.clamp(min=max(self._min_depth, 1e-3))
-                u = torch.round(cx + fx * p[:, 0] / zs).to(torch.int64)
-                v = torch.round(cy + fy * p[:, 1] / zs).to(torch.int64)
-                in_img = (z > max(self._min_depth, 1e-3)) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
-                flat = v.clamp_(0, height - 1) * width + u.clamp_(0, width - 1)
-                cached = (key, flat, zs, in_img, self._margin(zs) + self._free_radius)
-                self._free_view[view] = cached
-            _, flat, zs, in_img, margin = cached
-            valid = depth >= self._min_depth                             # beyond the range: the ray passed (see _observe)
-            d_inf = torch.where(valid, depth, torch.full_like(depth, float("inf")))
-            d_min = -F.max_pool2d(-d_inf[None, None], k, stride=1, padding=self._half)[0, 0] if self._half > 0 else d_inf
-            d_c = depth.reshape(-1).index_select(0, flat)
-            d_n = d_min.reshape(-1).index_select(0, flat)
-            seen = in_img & valid.reshape(-1).index_select(0, flat) & ((d_c - zs).abs() <= margin)
-            empty = in_img & (d_n > zs + margin) & torch.isfinite(d_n)
-            mask = masks[view] if view < len(masks) else None
-            if mask is not None and tuple(mask.shape) == (height, width):
-                robot = mask.reshape(-1).index_select(0, flat)
-                seen &= ~robot                           # a robot pixel says nothing about the voxel, either way
-                empty &= ~robot
-            seen_any |= seen
-            empty_any |= empty
-        grown = (self._free + 1).clamp_(max=30000)
-        self._free = torch.where(seen_any, torch.zeros_like(self._free), torch.where(empty_any, grown, self._free))
-
-    def free_known(self) -> torch.Tensor | None:
-        """[G] bool: voxels of the free-space grid that count as known free (None without a grid)."""
-        return None if self._free is None else self._free >= int(self.cfg.free_frames_to_know)
+        m = int(self.obs_count.shape[0])
+        confirmed = int((self.obs_count >= self._confirm_after).sum()) if m else 0
+        return f"; evidence: confirmed {confirmed} of {m}, dropped unconfirmed {dropped_unconfirmed}"
 
     def _voxel_keys(self, points: torch.Tensor) -> torch.Tensor:
         if points.shape[0] == 0:
