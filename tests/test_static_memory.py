@@ -314,3 +314,166 @@ def test_summary_counts():
     _cycle(asm, np.full((H, W), 2.0, dtype=np.float32))
     text = asm.static_memory.summary()
     assert "deleted as empty" in text and "inserted" in text
+
+
+# ----------------------------------------------------------------------------------------------- evidence mode
+def _evidence(**memory):
+    """Evidence mode with a free-space grid in front of the camera (5 cm voxels, known free after 5 cycles)."""
+    memory.setdefault("free_min", (-1.5, -1.5, 0.2))
+    memory.setdefault("free_max", (1.5, 1.5, 2.6))
+    memory.setdefault("free_voxel_m", 0.05)
+    memory.setdefault("free_frames_to_know", 5)
+    return _assembler(evidence=True, **memory)
+
+
+WALL_Z, OBJECT_Z, PLATE_Z = 2.0, 1.0, 0.5
+
+
+def _scene(obj=False, plate=False):
+    depth = np.full((H, W), WALL_Z, dtype=np.float32)
+    if obj:
+        depth[12:20, 12:20] = OBJECT_Z                # an object in front of the wall
+    if plate:
+        depth[6:26, 6:26] = PLATE_Z                   # something that hides the object (and the wall behind it)
+    return depth
+
+
+def _near_depth(asm, z, tol=0.06):
+    points = asm.static_memory.points
+    return int(((points[:, 2] - z).abs() < tol).sum())
+
+
+def test_evidence_config_validation():
+    base = {"tracker": {"tracked_prompts": []}, "scene_cloud": {"voxel_size_m": 0.005}}
+    cfg = load_config_from_mapping({**base, "static_memory": {"enabled": True}}, base_dir=".")
+    assert cfg.static_memory.evidence is False                       # off by default: the memory behaves as before
+    cfg = load_config_from_mapping({**base, "static_memory": {"enabled": True, "evidence": True, "free_min": [0, 0, 0], "free_max": [1, 1, 1]}}, base_dir=".")
+    assert cfg.static_memory.evidence and cfg.static_memory.free_max == (1.0, 1.0, 1.0)
+    for bad in ({"confirm_observations": 0}, {"candidate_hold_frames": -1}, {"free_voxel_m": 0.0}, {"free_min": [0, 0, 0]},
+                {"free_min": [0, 0, 0], "free_max": [1, 0, 1]}):
+        with pytest.raises(ValueError):
+            load_config_from_mapping({**base, "static_memory": bad}, base_dir=".")
+
+
+def test_free_space_grid_learns_what_the_rays_pass_through():
+    asm = _evidence()
+    memory = asm.static_memory
+    centres = memory._free_centres
+    on_axis = (centres[:, 0].abs() < 0.2) & (centres[:, 1].abs() < 0.2)       # well inside the 32 x 32 image
+    for _ in range(4):
+        _cycle(asm, _scene())
+    assert not bool(memory.free_known().any())                                 # not yet: free_frames_to_know = 5
+    for _ in range(2):
+        _cycle(asm, _scene())
+    known = memory.free_known()
+    assert bool(known[on_axis & (centres[:, 2] > 0.4) & (centres[:, 2] < 1.6)].all())     # in front of the wall: free
+    assert not bool(known[on_axis & (centres[:, 2] > 1.95)].any())                         # the wall and behind it: not
+    assert not bool(known[centres[:, 0].abs() > 1.3].any())                                # outside the image: no evidence
+    # a surface seen in a voxel resets it; a robot pixel says nothing (the count stays)
+    for _ in range(2):
+        _cycle(asm, _scene(obj=True))
+    at_object = on_axis & (centres[:, 0].abs() < 0.08) & (centres[:, 1].abs() < 0.08) & ((centres[:, 2] - OBJECT_Z).abs() < 0.03)
+    assert bool(at_object.any()) and not bool(memory.free_known()[at_object].any())
+    asm = _evidence()
+    robot = np.zeros((H, W), dtype=bool); robot[8:24, 8:24] = True
+    for _ in range(8):
+        _cycle(asm, _scene(), mask=robot)
+    behind_robot = (centres[:, 0].abs() < 0.05) & (centres[:, 1].abs() < 0.05) & (centres[:, 2] > 0.4) & (centres[:, 2] < 1.6)
+    assert not bool(asm.static_memory.free_known()[behind_robot].any())
+
+
+def test_what_passes_through_is_not_remembered():
+    """An object that was in free space for two cycles and is then hidden: held without limit before, dropped now."""
+    legacy, evidence = _assembler(), _evidence(candidate_hold_frames=2)
+    for asm in (legacy, evidence):
+        for _ in range(8):
+            _cycle(asm, _scene())
+        for _ in range(2):
+            _cycle(asm, _scene(obj=True))
+        assert _near_depth(asm, OBJECT_Z) > 0
+        for _ in range(6):
+            _cycle(asm, _scene(plate=True))
+    assert _near_depth(legacy, OBJECT_Z) > 0                         # the old rule: seen once, kept for ever
+    assert _near_depth(evidence, OBJECT_Z) == 0
+    assert _near_depth(evidence, WALL_Z) > 0                         # the wall behind the plate is confirmed and stays
+    held = evidence.static_memory.held(torch.empty((0,), dtype=torch.int64, device=DEV))[0]
+    assert int(((held[:, 2] - WALL_Z).abs() < 0.06).sum()) > 0
+    assert "dropped unconfirmed" in evidence.static_memory.summary()
+
+
+def test_candidate_is_handed_out_for_the_hold_time():
+    asm = _evidence(candidate_hold_frames=3)
+    for _ in range(8):
+        _cycle(asm, _scene())
+    _cycle(asm, _scene(obj=True))
+    counts = []
+    for _ in range(6):
+        cloud = _cycle(asm, _scene(plate=True))
+        counts.append(int(((cloud[:, 2] - OBJECT_Z).abs() < 0.06).sum()))
+    assert counts[0] > 0 and counts[2] > 0                           # still in the cloud for the hold
+    assert counts[-1] == 0                                           # then gone
+
+
+def test_object_put_down_is_remembered_and_released():
+    """Semi-static: at rest for confirm_observations cycles -> held while hidden; taken away -> released by the rays."""
+    asm = _evidence(confirm_observations=10, candidate_hold_frames=2)
+    for _ in range(8):
+        _cycle(asm, _scene())
+    for _ in range(10):
+        _cycle(asm, _scene(obj=True))
+    n_object = _near_depth(asm, OBJECT_Z)
+    assert n_object > 0
+    for _ in range(40):                                              # hidden far longer than any hold or unknown timeout
+        _cycle(asm, _scene(plate=True))
+    assert _near_depth(asm, OBJECT_Z) == n_object                    # confidence does not fall while it is hidden
+    for _ in range(3):                                               # plate and object taken away: rays pass through both
+        _cycle(asm, _scene())
+    assert _near_depth(asm, OBJECT_Z) == 0 and _near_depth(asm, PLATE_Z) == 0
+    assert _cycle(asm, _scene()).shape[0] == asm.static_memory.size   # only the wall is left
+
+
+def test_confirmed_object_stays_behind_robot_pixels():
+    asm = _evidence(confirm_observations=10, candidate_hold_frames=2, unknown_frames_to_delete=5)
+    for _ in range(8):
+        _cycle(asm, _scene())
+    for _ in range(10):
+        _cycle(asm, _scene(obj=True))
+    n_object = _near_depth(asm, OBJECT_Z)
+    hidden = _scene(); hidden[6:26, 6:26] = 0.0                      # the robot in front: no depth, robot pixels
+    robot = np.zeros((H, W), dtype=bool); robot[6:26, 6:26] = True
+    for _ in range(30):
+        _cycle(asm, hidden, mask=robot)
+    assert _near_depth(asm, OBJECT_Z) == n_object
+    # ... an unconfirmed one does not
+    asm = _evidence(confirm_observations=10, candidate_hold_frames=2, unknown_frames_to_delete=5)
+    for _ in range(8):
+        _cycle(asm, _scene())
+    for _ in range(3):
+        _cycle(asm, _scene(obj=True))
+    for _ in range(6):
+        _cycle(asm, hidden, mask=robot)
+    assert _near_depth(asm, OBJECT_Z) == 0
+
+
+def test_unknown_born_points_confirm_sooner():
+    """What is there from the first cycle (no knowledge of free space yet) needs confirm_observations_unknown only."""
+    asm = _evidence(confirm_observations=10, confirm_observations_unknown=3, candidate_hold_frames=2)
+    for _ in range(3):
+        _cycle(asm, _scene(obj=True))
+    n_object = _near_depth(asm, OBJECT_Z)
+    for _ in range(10):
+        _cycle(asm, _scene(plate=True))
+    assert n_object > 0 and _near_depth(asm, OBJECT_Z) == n_object
+    asm = _evidence(confirm_observations=10, confirm_observations_unknown=3, candidate_hold_frames=2)
+    _cycle(asm, _scene(obj=True))                                    # seen once only
+    for _ in range(10):
+        _cycle(asm, _scene(plate=True))
+    assert _near_depth(asm, OBJECT_Z) == 0
+
+
+def test_evidence_mode_without_a_box_has_no_grid():
+    asm = _assembler(evidence=True)
+    assert asm.static_memory._free is None and asm.static_memory.free_known() is None
+    for _ in range(4):
+        _cycle(asm, _scene())
+    assert _near_depth(asm, WALL_Z) > 0

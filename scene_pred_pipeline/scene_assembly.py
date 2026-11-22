@@ -68,7 +68,28 @@ class SceneCloudAssembler:
             self.static_memory = StaticMemory(
                 config.static_memory, device=self.device, origin=self._origin, voxel_size_m=self.voxel_size_m,
                 depth_range=(self._min_depth_m, self._max_depth_m), workspace=self._workspace,
+                free_bounds=self._free_bounds(config),
             )
+
+    def _free_bounds(self, config) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+        """World box of the static memory's free-space grid (evidence mode): static_memory.free_min/max, else the
+        pipeline's zone (the axis-aligned box around it when the zone frame is rotated), else the workspace."""
+        memory = config.static_memory
+        if not bool(getattr(memory, "evidence", False)):
+            return None
+        if memory.free_min is not None:
+            return tuple(memory.free_min), tuple(memory.free_max)
+        zone = getattr(config, "zone", None)
+        if zone is not None:
+            from .zone import axis_angle_matrix
+            pose = np.asarray(zone.pose, dtype=np.float64)
+            lo, hi = np.asarray(zone.min, dtype=np.float64), np.asarray(zone.max, dtype=np.float64)
+            corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+            world = corners @ axis_angle_matrix(pose[3:]).T + pose[:3]
+            return tuple(world.min(axis=0).tolist()), tuple(world.max(axis=0).tolist())
+        if self.scene_cfg.workspace_min is not None and self.scene_cfg.workspace_max is not None:
+            return tuple(float(v) for v in self.scene_cfg.workspace_min), tuple(float(v) for v in self.scene_cfg.workspace_max)
+        return None
 
     # ------------------------------------------------------------------ public
     def assemble(self, output: SceneVelocityOutput, frame: MultiCameraFrame | None = None) -> None:
