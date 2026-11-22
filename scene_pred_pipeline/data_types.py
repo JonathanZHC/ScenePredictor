@@ -27,6 +27,10 @@ class CameraFrameCpu:
     # Set by the pipeline's zone (zone.py): the depth image as it arrived, before the points outside the zone were
     # blanked in depth / depth_gpu. Read by the static memory's visibility test, which must see past the zone.
     depth_unzoned_gpu: "object | None" = None
+    # Optional bool [H, W] (host array or CUDA tensor): pixels the camera reported as TOO FAR (beyond its range; +inf in
+    # the raw image). Not a missing measurement: the ray passed everything within the range. The static memory judges
+    # remembered points and free space behind these pixels as seen through (scene_assembly.FAR_DEPTH_M).
+    far_mask: "object | None" = None
 
 
 class LazyHostDepth:

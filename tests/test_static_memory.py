@@ -23,11 +23,11 @@ def _K():
     return np.array([[FX, 0.0, W / 2], [0.0, FY, H / 2], [0.0, 0.0, 1.0]], dtype=np.float32)
 
 
-def _frame(depth: np.ndarray, T=None, name="camera_0", stamp=0, mask=None):
+def _frame(depth: np.ndarray, T=None, name="camera_0", stamp=0, mask=None, far=None):
     cam = CameraFrameCpu(camera_name=name, stamp_ns=stamp, rgb=np.zeros((H, W, 3), dtype=np.uint8),
                          depth=depth.astype(np.float32), K=_K(),
                          T_world_camera=np.eye(4, dtype=np.float32) if T is None else T,
-                         optical_frame_id=f"{name}_color_optical_frame", occluder_mask=mask)
+                         optical_frame_id=f"{name}_color_optical_frame", occluder_mask=mask, far_mask=far)
     return MultiCameraFrame(stamp_ns=stamp, cameras={name: cam})
 
 
@@ -49,10 +49,10 @@ def _output():
     )
 
 
-def _cycle(asm, depth, T=None, mask=None, forget=None, near=None):
+def _cycle(asm, depth, T=None, mask=None, forget=None, near=None, far=None):
     """One cycle: the cloud, then the deferred half of the memory (forget / near: functions cloud -> rest rows)."""
     out = _output()
-    asm.assemble(out, _frame(depth, T, mask=mask))
+    asm.assemble(out, _frame(depth, T, mask=mask, far=far))
     pts = out.scene_points
     asm.finish_memory(forget(pts) if forget else None, near(pts) if near else None)
     return pts
@@ -477,3 +477,46 @@ def test_evidence_mode_without_a_box_has_no_grid():
     for _ in range(4):
         _cycle(asm, _scene())
     assert _near_depth(asm, WALL_Z) > 0
+
+
+# ----------------------------------------------------------------------------------------------- too-far pixels
+def test_too_far_pixels_prove_the_place_empty():
+    """A pixel the camera reports as too far has no depth, but the ray passed everything in range: remembered points
+    behind it are deleted like behind any ray that goes on, instead of waiting for the unknown timeout."""
+    wall = np.full((H, W), 1.0, dtype=np.float32)
+    gone = wall.copy(); gone[8:24, 8:24] = 0.0                       # the wall was taken away there; nothing within range behind it
+    far = np.zeros((H, W), dtype=bool); far[8:24, 8:24] = True
+    for as_tensor in (False, True):
+        asm = _assembler(unknown_frames_to_delete=0, empty_frames_to_delete=2)     # no timeout: only evidence removes
+        n_wall = _cycle(asm, wall).shape[0]
+        for _ in range(4):
+            n_far = _cycle(asm, gone, far=torch.as_tensor(far, device=DEV) if as_tensor else far).shape[0]
+        assert n_far < n_wall and asm.static_memory.size == n_far
+    asm = _assembler(unknown_frames_to_delete=0, empty_frames_to_delete=2)         # without the mask: no evidence, kept
+    n_wall = _cycle(asm, wall).shape[0]
+    for _ in range(4):
+        assert _cycle(asm, gone).shape[0] == n_wall
+
+
+def test_depth_beyond_the_range_is_evidence():
+    """depth_max_m limits the rest scene, not the visibility test: a surface farther than that still shows the ray passed."""
+    asm = _assembler(empty_frames_to_delete=2)                       # depth_max_m 5.0
+    n_near = _cycle(asm, np.full((H, W), 1.0, dtype=np.float32)).shape[0]
+    assert n_near > 0
+    for _ in range(3):
+        cloud = _cycle(asm, np.full((H, W), 8.0, dtype=np.float32))
+    assert cloud.shape[0] == 0 and asm.static_memory.size == 0
+
+
+def test_too_far_pixels_teach_the_free_space_grid():
+    asm = _evidence()
+    centres = asm.static_memory._free_centres
+    on_axis = (centres[:, 0].abs() < 0.2) & (centres[:, 1].abs() < 0.2) & (centres[:, 2] > 0.4) & (centres[:, 2] < 2.4)
+    nothing = np.zeros((H, W), dtype=np.float32)
+    for _ in range(7):
+        _cycle(asm, nothing)
+    assert not bool(asm.static_memory.free_known()[on_axis].any())   # no depth, no mask: no evidence
+    far = np.ones((H, W), dtype=bool)
+    for _ in range(7):
+        _cycle(asm, nothing, far=far)
+    assert bool(asm.static_memory.free_known()[on_axis].all())

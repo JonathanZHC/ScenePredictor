@@ -11,7 +11,9 @@ ray proves that its place is empty:
         occluded  d < z - margin (something in front), or the pixel is in the camera's occluder mask (the robot,
                   removed by the self-filter)            -> kept as it is, for as long as it lasts
         empty     all valid neighbours have d > z + margin (the ray passed through the point) and the pixel itself
-                  is not a robot pixel -> delete after `empty_frames_to_delete` consecutive cycles
+                  is not a robot pixel -> delete after `empty_frames_to_delete` consecutive cycles. A depth beyond the
+                  rest scene's range counts (a far wall; a pixel the camera reported as TOO FAR, which the assembler
+                  hands over as FAR_DEPTH_M): out of range is not out of evidence
         unknown   no evidence from any camera (holes, out of range, outside the image) -> kept for
                   `unknown_frames_to_delete` consecutive cycles, then dropped
 
@@ -99,6 +101,7 @@ import torch.nn.functional as F
 
 from . import rest_scene_kernel, static_memory_kernel
 
+_NO_MAX = 1.0e30    # the visibility test has no far limit (depth beyond the range = the ray passed)
 KEY_BIAS = 1 << 20
 ROBOT_BORN = 1      # tags: first observed close to the robot (consumer's near_keys) or at the robot's silhouette in the image
 ANCHORED = 2        #       ... and connected to something that was not
@@ -551,7 +554,7 @@ class StaticMemory:
                 cached = (key, flat, zs, in_img, self._margin(zs) + self._free_radius)
                 self._free_view[view] = cached
             _, flat, zs, in_img, margin = cached
-            valid = (depth >= self._min_depth) & (depth <= self._max_depth)
+            valid = depth >= self._min_depth                             # beyond the range: the ray passed (see _observe)
             d_inf = torch.where(valid, depth, torch.full_like(depth, float("inf")))
             d_min = -F.max_pool2d(-d_inf[None, None], k, stride=1, padding=self._half)[0, 0] if self._half > 0 else d_inf
             d_c = depth.reshape(-1).index_select(0, flat)
@@ -633,7 +636,7 @@ class StaticMemory:
             if self.use_kernel:
                 static_memory_kernel.observe_view(
                     self.points, depth.contiguous(), self._cam_cache[view][2], (fx, fy, cx, cy),
-                    (self._min_depth, self._max_depth), min_z,
+                    (self._min_depth, _NO_MAX), min_z,
                     (float(self.cfg.depth_sigma_a_m), float(self.cfg.depth_sigma_b_per_m), float(self.cfg.margin_sigmas), self._min_margin),
                     self._half, seen8, empty8, known8, mask.contiguous().to(torch.int8) if mask is not None else None,
                 )
@@ -646,7 +649,9 @@ class StaticMemory:
             v = torch.round(torch.addcmul(torch.full_like(z, cy), p[:, 1], inv_z, value=fy)).to(torch.int64)
             in_img = (z > min_z) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
             flat = (v.clamp_(0, height - 1) * width).add_(u.clamp_(0, width - 1))
-            valid = (depth >= self._min_depth) & (depth <= self._max_depth)      # finite by construction (0 = invalid)
+            # 0 = no measurement. A depth beyond the range of the rest scene (a far wall, or the assembler's FAR_DEPTH_M at
+            # a pixel the camera reported as too far) is a measurement all the same: the ray passed everything nearer.
+            valid = depth >= self._min_depth
             d_inf = torch.where(valid, depth, torch.full_like(depth, float("inf")))
             d_min = -F.max_pool2d(-d_inf[None, None], k, stride=1, padding=self._half)[0, 0] if self._half > 0 else d_inf
             d_c = depth.reshape(-1).index_select(0, flat)

@@ -28,6 +28,9 @@ from .data_types import MultiCameraFrame, SceneVelocityOutput
 from .static_memory import StaticMemory
 
 
+# What the static memory sees at a pixel the camera reported as too far: farther than anything it holds.
+FAR_DEPTH_M = 1.0e6
+
 class SceneCloudAssembler:
     """Builds the merged scene cloud from tracker results (masks excluded) or, without a
     tracker (static-only mode), directly from the synchronized RGB-D frame."""
@@ -294,7 +297,7 @@ class SceneCloudAssembler:
     def rest_scene_points(self, output: SceneVelocityOutput, bundle: MultiCameraFrame | None = None) -> torch.Tensor:
         """Rest scene from tracker view results: dense depth minus tracked/excluded masks. `bundle` is the camera
         bundle of the cycle: it carries what the tracker's frames do not (robot pixels, depth before the zone)."""
-        views, masks, unzoned = [], [], []
+        views, masks, unzoned, far = [], [], [], []
         for name, result in output.view_results.items():
             frame = result.frame
             cam = bundle.cameras.get(name) if bundle is not None else None
@@ -309,7 +312,8 @@ class SceneCloudAssembler:
             views.append((depth_cpu, (float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)), np.asarray(world_from_camera, dtype=np.float32), excluded))
             masks.append(getattr(cam, "occluder_mask", None))
             unzoned.append(getattr(cam, "depth_unzoned_gpu", None))
-        return self._remembered(self._rest_points_from_views(views), views, masks, unzoned)
+            far.append(getattr(cam, "far_mask", None))
+        return self._remembered(self._rest_points_from_views(views), views, masks, unzoned, far)
 
     @staticmethod
     def _depth_view(depth_host, depth_gpu):
@@ -322,7 +326,7 @@ class SceneCloudAssembler:
 
     def rest_points_from_frame(self, frame: MultiCameraFrame) -> torch.Tensor:
         """Rest scene directly from the synchronized RGB-D bundle (no tracker: nothing excluded)."""
-        views, masks, unzoned = [], [], []
+        views, masks, unzoned, far = [], [], [], []
         for cam in frame.cameras.values():
             depth_cpu = self._depth_view(cam.depth, getattr(cam, "depth_gpu", None))
             if depth_cpu is None:
@@ -331,11 +335,14 @@ class SceneCloudAssembler:
             views.append((depth_cpu, (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])), np.asarray(cam.T_world_camera, dtype=np.float32), None))
             masks.append(getattr(cam, "occluder_mask", None))
             unzoned.append(getattr(cam, "depth_unzoned_gpu", None))
-        return self._remembered(self._rest_points_from_views(views), views, masks, unzoned)
+            far.append(getattr(cam, "far_mask", None))
+        return self._remembered(self._rest_points_from_views(views), views, masks, unzoned, far)
 
-    def _remembered(self, rest: torch.Tensor, views, masks=None, unzoned=None) -> torch.Tensor:
+    def _remembered(self, rest: torch.Tensor, views, masks=None, unzoned=None, far=None) -> torch.Tensor:
         """The rest scene through the static memory (identity when the memory is off). `unzoned`: per view, the depth
-        image before the pipeline's zone blanked it (None without a zone) - what the visibility test looks at."""
+        image before the pipeline's zone blanked it (None without a zone) - what the visibility test looks at. `far`:
+        per view, the pixels the camera reported as too far (None: none): the memory sees FAR_DEPTH_M there, a ray that
+        passes everything in range, instead of a pixel without evidence."""
         if self.static_memory is None:
             return rest
         ok = [v[2].shape in {(4, 4), (3, 4)} for v in views]
@@ -343,12 +350,16 @@ class SceneCloudAssembler:
             masks = [mk for good, mk in zip(ok, masks) if good]
         if unzoned is not None:
             unzoned = [d for good, d in zip(ok, unzoned) if good]
+        if far is not None:
+            far = [f for good, f in zip(ok, far) if good]
         views = [v for good, v in zip(ok, views) if good]
         # Host depth images were just uploaded by _rest_points_from_views (slot ("depth", view)); the device copy is
         # valid until the next cycle's upload, so the memory reads it instead of copying the image a second time.
         views = [(self._uploaded(("depth", i), v[0]), *v[1:]) for i, v in enumerate(views)]
         if unzoned is not None:
             views = [v if d is None or tuple(d.shape) != tuple(v[0].shape) else (d, *v[1:]) for v, d in zip(views, unzoned)]
+        if far is not None:
+            views = [v if f is None else (self._with_far(v[0], f), *v[1:]) for v, f in zip(views, far)]
         keys = getattr(self, "_last_rest_keys", None)
         self._last_rest_keys = None
         memory = self.static_memory
@@ -363,6 +374,13 @@ class SceneCloudAssembler:
         self._memory_pending = (rest, keys, views, masks)
         self._cloud_rest_keys = torch.cat((keys, held_keys), dim=0) if held_keys.shape[0] else keys
         return torch.cat((rest, held), dim=0) if held.shape[0] else rest
+
+    def _with_far(self, depth: torch.Tensor, far) -> torch.Tensor:
+        """The depth image with FAR_DEPTH_M at the too-far pixels (a new tensor; the rest scene keeps its own)."""
+        far = far.to(self.device) if torch.is_tensor(far) else torch.as_tensor(np.asarray(far), device=self.device)
+        if tuple(far.shape) != tuple(depth.shape):
+            return depth
+        return torch.where(far if far.dtype == torch.bool else far != 0, torch.full_like(depth, FAR_DEPTH_M), depth)
 
     def finish_memory(self, forget_rows: torch.Tensor | None = None, near_rows: torch.Tensor | None = None) -> None:
         """Second half of the static memory's cycle, off the latency-critical path: merge the observation of this cycle
