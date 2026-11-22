@@ -199,6 +199,17 @@ def chi2_3_quantile(level: float) -> float:
     return 0.5 * (lo + hi)
 
 
+def normal_quantile(level: float) -> float:
+    """Quantile of the standard normal distribution (bisection on the closed-form CDF)."""
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"normal quantile needs a level in (0, 1), got {level!r}")
+    lo, hi = -40.0, 40.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if 0.5 * (1.0 + math.erf(mid / math.sqrt(2.0))) < level else (lo, mid)
+    return 0.5 * (lo + hi)
+
+
 @dataclass(frozen=True)
 class DifFlowCalibrationTable:
     """Conformal scales of one region kind.
@@ -256,6 +267,18 @@ class DifFlowUncertaintyCalibrationConfig:
     def gaussian_scale(self) -> float:
         """Uncalibrated scale at ``level``: sqrt of the chi-square (3 dof) quantile."""
         return math.sqrt(chi2_3_quantile(self.level))
+
+    def row_factor(self) -> float:
+        """Factor from the scale of the 3-D region at ``level`` to the scale of ONE direction at ``level``.
+
+        The region holds the whole error vector d with probability ``level``. A consumer that looks along one fixed
+        direction n - a CBF row: how much faster than predicted does the point approach along the contact normal -
+        needs n.d >= -z sqrt(n^T Sigma n) with that probability, the one-sided normal quantile z, not the support
+        s sqrt(n^T Sigma n) of the 3-D region: at 0.8 that is 0.842 against 2.154, and the 3-D scale along one
+        direction holds with 98.4 %. The factor z / sqrt(chi2_3 quantile) is exact for the uncalibrated Gaussian
+        scale; applied to a conformal scale it keeps the table's correction of the head's magnitude and assumes the
+        Gaussian relation between the two quantiles. 0 at ``level`` <= 0.5 (no margin along the direction)."""
+        return max(normal_quantile(self.level), 0.0) / math.sqrt(chi2_3_quantile(self.level))
 
     def global_scale(self) -> float:
         """Global scale of the configured region at ``level``."""

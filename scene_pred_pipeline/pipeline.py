@@ -31,6 +31,10 @@ class ScenePredictionPipeline:
     # Calibrated velocity regions of the flow points (SceneVelocityOutput.flow/scene_velocity_region),
     # computed only for a consumer such as the safety filter's velocity-uncertainty tightening.
     compute_velocity_region = False
+    # The consumer of those regions judges one direction per row (the contact normal of a CBF row), so the region
+    # handed out is scaled to hold along ONE direction with the calibration level (calibration.row_factor), not to
+    # hold the whole 3-D error vector. False: the 3-D region as drawn in RViz (2.56 x larger at level 0.8).
+    velocity_region_per_row = True
 
 
     def __init__(self, config: PipelineConfig) -> None:
@@ -334,6 +338,8 @@ class ScenePredictionPipeline:
                             flow_result, flow_result.anchor_flow_cov, query_points=flow_points, query_track_ids=flow_track_ids
                         )
                         dense_scale = self.flow_predictor.calibration_scale(flow_velocity * float(pair.dt_s))
+                        if self.velocity_region_per_row:
+                            dense_scale = dense_scale * self.config.difflow.uncertainty_head.calibration.row_factor()
                         flow_velocity_region = anchor_velocity_region(
                             dense_cov, dense_scale, float(pair.dt_s), self.config.difflow.uncertainty_head.calibration.region
                         )

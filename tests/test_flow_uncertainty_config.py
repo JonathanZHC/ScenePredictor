@@ -18,7 +18,9 @@ from scene_pred_pipeline import flow_prediction
 from scene_pred_pipeline.config import (
     DifFlowModelConfig,
     check_uncertainty_head_meta,
+    DifFlowUncertaintyCalibrationConfig,
     chi2_3_quantile,
+    normal_quantile,
     load_config,
     load_config_from_mapping,
 )
@@ -742,3 +744,19 @@ def test_runtime_compile_mode(tmp_path):
     raw["runtime"]["compile_mode"] = "reduce-overhead"
     with pytest.raises(ValueError, match="compile_mode must be none, default or max-autotune"):
         _load(tmp_path, raw)
+
+
+@pytest.mark.parametrize("level, z", [(0.5, 0.0), (0.8, 0.841621), (0.95, 1.644854), (0.99, 2.326348)])
+def test_normal_quantile(level, z):
+    assert normal_quantile(level) == pytest.approx(z, abs=1e-5)
+
+
+def test_row_factor_is_the_one_direction_scale_over_the_region_scale():
+    """A CBF row looks along one direction: at 0.8 the margin is 0.842 sigma, not the 2.154 sigma of the 3-D region."""
+    calibration = DifFlowUncertaintyCalibrationConfig(level=0.8)
+    assert calibration.gaussian_scale() * calibration.row_factor() == pytest.approx(0.841621, abs=1e-5)
+    assert calibration.row_factor() == pytest.approx(0.841621 / 2.154435, abs=1e-5)
+    # the 3-D scale along one direction holds with far more than the level
+    assert 0.5 * (1.0 + math.erf(calibration.gaussian_scale() / math.sqrt(2.0))) == pytest.approx(0.9844, abs=1e-3)
+    assert DifFlowUncertaintyCalibrationConfig(level=0.5).row_factor() == 0.0
+    assert DifFlowUncertaintyCalibrationConfig(level=0.3).row_factor() == 0.0
