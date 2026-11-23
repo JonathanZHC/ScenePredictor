@@ -79,11 +79,11 @@ def _uncertainty_raw(region="ellipsoid", mode="mondrian", level=0.95) -> dict:
     return {
         "enable": True,
         "checkpoint": "/weights/head.pt",
+        "level": level,
         "calibration": {
             "enable": True,
             "region": region,
             "mode": mode,
-            "level": level,
             "source": "unit test",
             "tables": _tables_raw(),
         },
@@ -135,7 +135,9 @@ def test_old_difflow_yaml_loads_with_feature_off(tmp_path):
     assert not config.difflow.uncertainty_head.enable
     # Deployment defaults of the calibration selection (used once a head is enabled).
     calibration = config.difflow.uncertainty_head.calibration
-    assert (calibration.region, calibration.mode, calibration.level) == ("ellipsoid", "mondrian", 0.95)
+    assert (calibration.region, calibration.mode) == ("ellipsoid", "mondrian")
+    head = config.difflow.uncertainty_head
+    assert (head.level, head.display_level, head.shown_level) == (0.95, None, 0.95)
     assert not calibration.enable
 
 
@@ -166,8 +168,8 @@ def test_canonical_and_uncertainty_head_load(tmp_path):
         assert dict(table.global_scales) == TABLES[region]["global"]
         assert {level: list(row) for level, row in table.mondrian_scales} == TABLES[region]["mondrian"]
     assert calibration.table() is calibration.ellipsoid
-    assert calibration.mondrian_bin_scales() == tuple(MONDRIAN[0.95])
-    assert calibration.global_scale() == pytest.approx(TABLES["ellipsoid"]["global"][0.95])
+    assert calibration.mondrian_bin_scales(0.95) == tuple(MONDRIAN[0.95])
+    assert calibration.global_scale(0.95) == pytest.approx(TABLES["ellipsoid"]["global"][0.95])
     assert config.output.publish_uncertainty_markers
     assert config.output.uncertainty_marker_max == 50
     assert config.output.uncertainty_marker_publish_hz == pytest.approx(2.5)
@@ -177,11 +179,12 @@ def test_canonical_and_uncertainty_head_load(tmp_path):
 @pytest.mark.parametrize("level", [0.5, 0.99])
 def test_region_selects_its_tables(tmp_path, region, level):
     raw = _zu_raw()
-    raw["uncertainty_head"]["calibration"].update(region=region, level=level)
+    raw["uncertainty_head"]["calibration"].update(region=region)
+    raw["uncertainty_head"]["level"] = level
     calibration = _load(tmp_path, raw).difflow.uncertainty_head.calibration
     assert calibration.table() is getattr(calibration, region)
-    assert calibration.global_scale() == pytest.approx(TABLES[region]["global"][level])
-    assert calibration.mondrian_bin_scales() == tuple(TABLES[region]["mondrian"][level])
+    assert calibration.global_scale(level) == pytest.approx(TABLES[region]["global"][level])
+    assert calibration.mondrian_bin_scales(level) == tuple(TABLES[region]["mondrian"][level])
 
 
 def test_canonical_with_auto_spatial_scale_is_rejected(tmp_path):
@@ -239,9 +242,11 @@ def test_unknown_keys_raise_value_error(tmp_path, edit, name):
 @pytest.mark.parametrize("mode", ["global", "mondrian"])
 def test_level_must_be_in_selected_table(tmp_path, region, mode):
     raw = _zu_raw()
-    raw["uncertainty_head"]["calibration"].update(region=region, mode=mode, level=0.9)
-    with pytest.raises(ValueError, match=f"not a level of the {region} {mode} table"):
-        _load(tmp_path, raw)
+    raw["uncertainty_head"]["calibration"].update(region=region, mode=mode)
+    for key in ("level", "display_level"):                              # both levels must be in the table
+        head = dict(raw["uncertainty_head"], **{key: 0.9})
+        with pytest.raises(ValueError, match=f"not a level of the calibrated {region} {mode} table"):
+            _load(tmp_path, dict(raw, uncertainty_head=head))
 
 
 def test_level_only_needs_the_selected_table(tmp_path):
@@ -251,12 +256,12 @@ def test_level_only_needs_the_selected_table(tmp_path):
     del tables["ellipsoid"]["mondrian"]
     raw["uncertainty_head"]["calibration"]["mode"] = "global"
     config = _load(tmp_path, raw)
-    assert config.difflow.uncertainty_head.calibration.global_scale() == pytest.approx(2.6101)
+    assert config.difflow.uncertainty_head.calibration.global_scale(0.95) == pytest.approx(2.6101)
     raw["uncertainty_head"]["calibration"]["mode"] = "mondrian"
     with pytest.raises(ValueError, match="not a level"):
         _load(tmp_path, raw)
     raw["uncertainty_head"]["calibration"].update(mode="global", region="ball")
-    with pytest.raises(ValueError, match="not a level of the ball global table"):
+    with pytest.raises(ValueError, match="not a level of the calibrated ball global table"):
         _load(tmp_path, raw)
 
 
@@ -265,8 +270,7 @@ def test_level_only_needs_the_selected_table(tmp_path):
     [
         (lambda c: c.update(mode="conformal"), "global or mondrian"),
         (lambda c: c.update(region="sphere"), "ellipsoid or ball"),
-        (lambda c: c.update(level=1.0), "coverage level"),
-        (lambda c: c.update(level=True), "number"),
+        (lambda c: c.update(level=0.8), "calibration.level has moved"),
         (lambda c: c["tables"]["ellipsoid"]["mondrian"]["scales"][0.95].pop(), "5 scales"),
         (lambda c: c["tables"]["ball"]["mondrian"]["scales"].update({0.9: 1.0}), "5 scales"),
         (lambda c: c["tables"]["ball"]["mondrian"].update(edges_mm=[2.0, 2.0, 20.0, 40.0]),
@@ -301,17 +305,18 @@ def test_uncalibrated_uses_gaussian_scale_and_ignores_tables(tmp_path, region):
     raw = _zu_raw()
     calibration_raw = raw["uncertainty_head"]["calibration"]
     # No table holds level 0.9 and the tables are gone: both are fine without calibration.
-    calibration_raw.update(enable=False, region=region, level=0.9)
+    calibration_raw.update(enable=False, region=region)
+    raw["uncertainty_head"]["level"] = 0.9
     del calibration_raw["tables"]
     calibration = _load(tmp_path, raw).difflow.uncertainty_head.calibration
     assert not calibration.enable
-    assert calibration.gaussian_scale() == pytest.approx(math.sqrt(chi2_3_quantile(0.9)))
-    scale = AnchorCalibrationScale(calibration, "cpu")
+    assert calibration.gaussian_scale(0.9) == pytest.approx(math.sqrt(chi2_3_quantile(0.9)))
+    scale = AnchorCalibrationScale(calibration, "cpu", 0.9)
     assert scale.mode == "uncalibrated"
     flow = torch.tensor([[0.0, 0.0, 0.0], [0.005, 0.0, 0.0], [0.08, 0.0, 0.0]])
-    assert torch.allclose(scale(flow), torch.full((3,), calibration.gaussian_scale()))
+    assert torch.allclose(scale(flow), torch.full((3,), calibration.gaussian_scale(0.9)))
     assert torch.allclose(scale.for_displacement_mm(torch.tensor([[1.0, 50.0]])),
-                          torch.full((1, 2), calibration.gaussian_scale()))
+                          torch.full((1, 2), calibration.gaussian_scale(0.9)))
 
 
 def test_calibration_enable_must_be_boolean(tmp_path):
@@ -323,7 +328,7 @@ def test_calibration_enable_must_be_boolean(tmp_path):
 
 def test_disabled_head_ignores_level(tmp_path):
     raw = _difflow_raw()
-    raw["uncertainty_head"] = {"enable": False, "calibration": {"level": 0.9}}
+    raw["uncertainty_head"] = {"enable": False, "level": 0.9}
     assert not _load(tmp_path, raw).difflow.uncertainty_head.enable
 
 
@@ -516,12 +521,13 @@ def test_predictor_loads_canonical_head(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- calibration scale
 def _calibration(tmp_path, mode, level=0.95, region="ellipsoid"):
     raw = _zu_raw()
-    raw["uncertainty_head"]["calibration"].update(region=region, mode=mode, level=level)
+    raw["uncertainty_head"]["calibration"].update(region=region, mode=mode)
+    raw["uncertainty_head"]["level"] = level
     return _load(tmp_path, raw).difflow.uncertainty_head.calibration
 
 
 def test_mondrian_bins_include_lower_edge(tmp_path):
-    scale = AnchorCalibrationScale(_calibration(tmp_path, "mondrian"), "cpu")
+    scale = AnchorCalibrationScale(_calibration(tmp_path, "mondrian"), "cpu", 0.95)
     displacement_mm = torch.tensor(
         [0.0, 1.999, 2.0, 9.999, 10.0, 19.999, 20.0, 39.999, 40.0, 500.0]
     )
@@ -531,7 +537,7 @@ def test_mondrian_bins_include_lower_edge(tmp_path):
 
 
 def test_mondrian_scale_from_world_flow(tmp_path):
-    scale = AnchorCalibrationScale(_calibration(tmp_path, "mondrian", level=0.5), "cpu")
+    scale = AnchorCalibrationScale(_calibration(tmp_path, "mondrian", level=0.5), "cpu", 0.5)
     # |flow| = 1 mm, 5 mm (3-4-0 triangle), 15 mm, 30 mm, 0.1 m
     flow = torch.tensor(
         [[0.001, 0.0, 0.0], [0.003, 0.004, 0.0], [0.0, 0.015, 0.0], [0.0, 0.0, -0.03], [0.1, 0.0, 0.0]]
@@ -540,7 +546,7 @@ def test_mondrian_scale_from_world_flow(tmp_path):
 
 
 def test_global_scale_is_constant(tmp_path):
-    scale = AnchorCalibrationScale(_calibration(tmp_path, "global", level=0.99), "cpu")
+    scale = AnchorCalibrationScale(_calibration(tmp_path, "global", level=0.99), "cpu", 0.99)
     values = scale(torch.randn(7, 3))
     expected = torch.tensor(TABLES["ellipsoid"]["global"][0.99])
     assert values.shape == (7,) and torch.all(values == expected)
@@ -548,7 +554,7 @@ def test_global_scale_is_constant(tmp_path):
 
 @pytest.mark.parametrize("mode", ["global", "mondrian"])
 def test_ball_region_uses_ball_tables(tmp_path, mode):
-    scale = AnchorCalibrationScale(_calibration(tmp_path, mode, region="ball"), "cpu")
+    scale = AnchorCalibrationScale(_calibration(tmp_path, mode, region="ball"), "cpu", 0.95)
     assert (scale.region, scale.mode) == ("ball", mode)
     # |flow| = 1, 5, 15, 30, 100 mm: one point per Mondrian bin.
     flow = torch.tensor(
@@ -617,10 +623,12 @@ def _predictor(config, *, head):
     predictor.runner_class = _FakeRunner
     predictor.upstream_voxel_size_m = 0.01
     predictor.uncertainty_head = head
+    head_config = config.difflow.uncertainty_head
     predictor.calibration_scale = (
-        AnchorCalibrationScale(config.difflow.uncertainty_head.calibration, "cpu")
-        if head is not None
-        else None
+        AnchorCalibrationScale(head_config.calibration, "cpu", head_config.shown_level) if head is not None else None
+    )
+    predictor.filter_scale = (
+        AnchorCalibrationScale(head_config.calibration, "cpu", head_config.level, per_row=True) if head is not None else None
     )
     predictor._cached_target_stamp_ns = None
     predictor._cached_track_signature = None
@@ -753,10 +761,26 @@ def test_normal_quantile(level, z):
 
 def test_row_factor_is_the_one_direction_scale_over_the_region_scale():
     """A CBF row looks along one direction: at 0.8 the margin is 0.842 sigma, not the 2.154 sigma of the 3-D region."""
-    calibration = DifFlowUncertaintyCalibrationConfig(level=0.8)
-    assert calibration.gaussian_scale() * calibration.row_factor() == pytest.approx(0.841621, abs=1e-5)
-    assert calibration.row_factor() == pytest.approx(0.841621 / 2.154435, abs=1e-5)
+    calibration = DifFlowUncertaintyCalibrationConfig()
+    assert calibration.gaussian_scale(0.8) * calibration.row_factor(0.8) == pytest.approx(0.841621, abs=1e-5)
+    assert calibration.row_factor(0.8) == pytest.approx(0.841621 / 2.154435, abs=1e-5)
     # the 3-D scale along one direction holds with far more than the level
-    assert 0.5 * (1.0 + math.erf(calibration.gaussian_scale() / math.sqrt(2.0))) == pytest.approx(0.9844, abs=1e-3)
-    assert DifFlowUncertaintyCalibrationConfig(level=0.5).row_factor() == 0.0
-    assert DifFlowUncertaintyCalibrationConfig(level=0.3).row_factor() == 0.0
+    assert 0.5 * (1.0 + math.erf(calibration.gaussian_scale(0.8) / math.sqrt(2.0))) == pytest.approx(0.9844, abs=1e-3)
+    assert calibration.row_factor(0.5) == 0.0 and calibration.row_factor(0.3) == 0.0
+    filter_scale = AnchorCalibrationScale(calibration, "cpu", 0.8, per_row=True)
+    shown = AnchorCalibrationScale(calibration, "cpu", 0.8)
+    flow = torch.zeros((2, 3))
+    assert torch.allclose(filter_scale(flow), torch.full((2,), 0.841621), atol=1e-5)
+    assert torch.allclose(shown(flow), torch.full((2,), 2.154435), atol=1e-5)
+
+
+def test_head_levels(tmp_path):
+    """level: the filter's (one direction); display_level: RViz's (3-D), level when absent; both checked."""
+    raw = _zu_raw()
+    raw["uncertainty_head"]["calibration"]["enable"] = False
+    raw["uncertainty_head"].update(level=0.9, display_level=0.8)
+    head = _load(tmp_path, raw).difflow.uncertainty_head
+    assert (head.level, head.display_level, head.shown_level) == (0.9, 0.8, 0.8)
+    for bad in ({"level": 1.0}, {"display_level": 0.0}, {"level": True}):
+        with pytest.raises(ValueError, match="coverage level|number"):
+            _load(tmp_path, dict(raw, uncertainty_head=dict(raw["uncertainty_head"], **bad)))

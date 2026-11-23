@@ -240,16 +240,19 @@ class DifFlowUncertaintyCalibrationConfig:
     for the backbone, head and preprocessing they were fitted with (``source``).
 
     ``enable: false`` ignores the tables (mode and source too): the region is the
-    head's own Gaussian at ``level``, s = sqrt(chi2_3 quantile at ``level``) for
-    every point (exact for the ellipsoid; for the ball exact only for isotropic
-    Sigma). The tables are kept in the file for when calibration is re-enabled.
+    head's own Gaussian, s = sqrt(chi2_3 quantile at the level) for every point
+    (exact for the ellipsoid; for the ball exact only for isotropic Sigma). The
+    tables are kept in the file for when calibration is re-enabled.
+
+    The calibration only says HOW the scale of a level is obtained. Which level is
+    used is the head's (DifFlowUncertaintyHeadConfig.level / display_level); every
+    scale method takes it as an argument.
     """
 
     # Conformal tables on (true) or the uncalibrated Gaussian scale (false).
     enable: bool = False
     region: str = "ellipsoid"
     mode: str = "mondrian"
-    level: float = 0.95
     # Free-text provenance of the tables (dataset, split, checkpoints, preprocessing).
     source: str = ""
     ellipsoid: DifFlowCalibrationTable = field(default_factory=DifFlowCalibrationTable)
@@ -264,11 +267,13 @@ class DifFlowUncertaintyCalibrationConfig:
             )
         return getattr(self, self.region)
 
-    def gaussian_scale(self) -> float:
-        """Uncalibrated scale at ``level``: sqrt of the chi-square (3 dof) quantile."""
-        return math.sqrt(chi2_3_quantile(self.level))
+    @staticmethod
+    def gaussian_scale(level: float) -> float:
+        """Uncalibrated scale of the 3-D region at ``level``: sqrt of the chi-square (3 dof) quantile."""
+        return math.sqrt(chi2_3_quantile(level))
 
-    def row_factor(self) -> float:
+    @staticmethod
+    def row_factor(level: float) -> float:
         """Factor from the scale of the 3-D region at ``level`` to the scale of ONE direction at ``level``.
 
         The region holds the whole error vector d with probability ``level``. A consumer that looks along one fixed
@@ -278,19 +283,15 @@ class DifFlowUncertaintyCalibrationConfig:
         direction holds with 98.4 %. The factor z / sqrt(chi2_3 quantile) is exact for the uncalibrated Gaussian
         scale; applied to a conformal scale it keeps the table's correction of the head's magnitude and assumes the
         Gaussian relation between the two quantiles. 0 at ``level`` <= 0.5 (no margin along the direction)."""
-        return max(normal_quantile(self.level), 0.0) / math.sqrt(chi2_3_quantile(self.level))
+        return max(normal_quantile(level), 0.0) / math.sqrt(chi2_3_quantile(level))
 
-    def global_scale(self) -> float:
+    def global_scale(self, level: float) -> float:
         """Global scale of the configured region at ``level``."""
-        return float(
-            _level_entry(self.table().global_scales, self.level, name=f"{self.region} global")
-        )
+        return float(_level_entry(self.table().global_scales, level, name=f"{self.region} global"))
 
-    def mondrian_bin_scales(self) -> tuple[float, ...]:
+    def mondrian_bin_scales(self, level: float) -> tuple[float, ...]:
         """Per-bin scales of the configured region at ``level`` (len(edges_mm) + 1 entries)."""
-        return tuple(
-            _level_entry(self.table().mondrian_scales, self.level, name=f"{self.region} mondrian")
-        )
+        return tuple(_level_entry(self.table().mondrian_scales, level, name=f"{self.region} mondrian"))
 
 
 @dataclass(frozen=True)
@@ -300,9 +301,21 @@ class DifFlowUncertaintyHeadConfig:
     enable: bool = False
     # Resolved like model.checkpoint: relative to flow.repo_path when not absolute.
     checkpoint: str = ""
+    # Confidence level of the velocity regions handed to the safety filter: the probability that the error of a point's
+    # velocity along ONE direction (a CBF row's contact normal) stays within the region (one-sided; 0.8 -> 0.842 sigma
+    # uncalibrated, <= 0.5 -> no margin).
+    level: float = 0.95
+    # Coverage level of the 3-D regions drawn in RViz (output.publish_uncertainty_markers): the probability that the
+    # whole error vector lies inside the ellipsoid (0.8 -> 2.154 sigma uncalibrated). None = level.
+    display_level: float | None = None
     calibration: DifFlowUncertaintyCalibrationConfig = field(
         default_factory=DifFlowUncertaintyCalibrationConfig
     )
+
+    @property
+    def shown_level(self) -> float:
+        """Level of the regions drawn in RViz (display_level, else level)."""
+        return float(self.level if self.display_level is None else self.display_level)
 
 
 @dataclass(frozen=True)
@@ -698,7 +711,7 @@ def _level_entry(table: tuple[tuple[float, Any], ...], level: float, *, name: st
         if math.isclose(key, level, rel_tol=0.0, abs_tol=1.0e-9):
             return value
     raise ValueError(
-        f"difflow.uncertainty_head.calibration.level {level} is not a level of the "
+        f"difflow.uncertainty_head level {level} is not a level of the calibrated "
         f"{name} table (levels: {[key for key, _ in table]})"
     )
 
@@ -782,11 +795,15 @@ def _uncertainty_calibration_config(value: Any) -> DifFlowUncertaintyCalibration
     }
     _no_extra_keys(tables, name=f"{base}.tables")
 
+    if "level" in values:
+        raise ValueError(
+            f"{base}.level has moved: difflow.uncertainty_head.level is the safety filter's confidence along a contact "
+            "normal (one-sided), difflow.uncertainty_head.display_level the coverage of the 3-D ellipsoids in RViz "
+            "(default: level). The calibration only says how the scale of a level is obtained."
+        )
     _known_keys(
         DifFlowUncertaintyCalibrationConfig, values, name=base, exclude=CALIBRATION_REGIONS
     )
-    if "level" in values:
-        values["level"] = _level(values["level"], name=f"{base}.level")
     if "source" in values:
         values["source"] = str(values["source"] or "").strip()
     if not isinstance(values.get("enable", False), bool):
@@ -804,18 +821,23 @@ def _uncertainty_head_config(value: Any) -> DifFlowUncertaintyHeadConfig:
     values = _mapping(value, name=name)
     calibration = _uncertainty_calibration_config(values.pop("calibration", None))
     _known_keys(DifFlowUncertaintyHeadConfig, values, name=name, exclude=("calibration",))
+    if "level" in values:
+        values["level"] = _level(values["level"], name=f"{name}.level")
+    if values.get("display_level") is not None:
+        values["display_level"] = _level(values["display_level"], name=f"{name}.display_level")
     head = DifFlowUncertaintyHeadConfig(calibration=calibration, **values)
     if not isinstance(head.enable, bool):
         raise ValueError(f"{name}.enable must be boolean")
     if head.enable:
         if not str(head.checkpoint).strip():
             raise ValueError(f"{name}.checkpoint is required when enabled")
-        # Calibrated: the level must exist in the table of the configured region and mode.
+        # Calibrated: both levels must exist in the table of the configured region and mode.
         if calibration.enable:
-            if calibration.mode == "global":
-                calibration.global_scale()
-            else:
-                calibration.mondrian_bin_scales()
+            for level in {head.level, head.shown_level}:
+                if calibration.mode == "global":
+                    calibration.global_scale(level)
+                else:
+                    calibration.mondrian_bin_scales(level)
     return head
 
 

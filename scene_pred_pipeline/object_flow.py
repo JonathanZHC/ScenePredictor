@@ -306,6 +306,10 @@ class _PoolBacked:
         return self.pool.first.calibration_scale
 
     @property
+    def filter_scale(self):
+        return self.pool.first.filter_scale
+
+    @property
     def outlier_filter_enabled(self) -> bool:
         return self.pool.first.outlier_filter_enabled
 

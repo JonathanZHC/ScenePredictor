@@ -28,7 +28,7 @@ _NEIGHBOR_OFFSETS = tuple(
 
 
 class AnchorCalibrationScale:
-    """Per-anchor conformal scale of the configured region at the configured level.
+    """Per-anchor scale of the configured region at ``level``.
 
     The scale s of calibration.region: ellipsoid d^T Sigma^-1 d <= s^2, ball
     |d| <= s det(Sigma)^(1/6). Mondrian: scale of the bin of |flow| in mm, bin i
@@ -36,28 +36,36 @@ class AnchorCalibrationScale:
     calibration). Global: one scale. calibration.enable false: one uncalibrated
     Gaussian scale sqrt(chi2_3 quantile at level), tables unused. Device lookup
     tables, no host synchronization.
+
+    ``per_row``: the scale of ONE direction at ``level`` instead of the 3-D region's (calibration.row_factor; the
+    regions the safety filter uses per CBF row), e.g. 0.842 instead of 2.154 at 0.8 uncalibrated.
     """
 
     def __init__(
         self,
         calibration: DifFlowUncertaintyCalibrationConfig,
         device: torch.device | str,
+        level: float,
+        *,
+        per_row: bool = False,
     ) -> None:
+        self.level, self.per_row = float(level), bool(per_row)
         self.region = str(calibration.region)
         self.mode = str(calibration.mode) if calibration.enable else "uncalibrated"
         self._edges_mm = None          # one scale for every anchor unless mondrian
         if self.mode == "uncalibrated":
-            scales = (calibration.gaussian_scale(),)
+            scales = (calibration.gaussian_scale(level),)
         elif self.mode == "global":
-            scales = (calibration.global_scale(),)
+            scales = (calibration.global_scale(level),)
         elif self.mode == "mondrian":
             self._edges_mm = torch.tensor(
                 calibration.table().mondrian_edges_mm, dtype=torch.float32, device=device
             )
-            scales = calibration.mondrian_bin_scales()
+            scales = calibration.mondrian_bin_scales(level)
         else:
             raise ValueError(f"Unknown calibration mode {self.mode!r}")
-        self._scales = torch.tensor(scales, dtype=torch.float32, device=device)
+        factor = calibration.row_factor(level) if self.per_row else 1.0
+        self._scales = torch.tensor([float(v) * factor for v in scales], dtype=torch.float32, device=device)
 
     def __call__(self, flow_world: torch.Tensor) -> torch.Tensor:
         """Scale [M] for the anchor displacements ``flow_world`` [M, 3] (m)."""
@@ -211,6 +219,7 @@ class DifFlowPredictor:
         self.uncertainty_head = None
         self.uncertainty_head_meta: dict[str, object] | None = None
         self.calibration_scale: AnchorCalibrationScale | None = None
+        self.filter_scale: AnchorCalibrationScale | None = None
         head_config = difflow.uncertainty_head
         if head_config.enable:
             load_head = getattr(runtime_module, "load_flow_covariance_head", None)
@@ -225,8 +234,13 @@ class DifFlowPredictor:
             check_uncertainty_head_meta(meta, difflow)
             self.uncertainty_head = head
             self.uncertainty_head_meta = dict(meta)
+            # The anchors' regions as drawn in RViz (3-D, display level) and the velocity regions of the safety filter
+            # (one direction per CBF row, level).
             self.calibration_scale = AnchorCalibrationScale(
-                head_config.calibration, self.device
+                head_config.calibration, self.device, head_config.shown_level
+            )
+            self.filter_scale = AnchorCalibrationScale(
+                head_config.calibration, self.device, head_config.level, per_row=True
             )
 
     def _ensure_runner(self) -> None:

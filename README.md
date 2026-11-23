@@ -339,9 +339,10 @@ Objects and forwards (`object_flow` in the DifFlow config, `scene_pred_pipeline/
 Optional flow uncertainty, off by default:
 
 - **Head.** `uncertainty_head` in the DifFlow config loads a per-anchor flow covariance head that runs inside the DifFlow decode CUDA graphs. Per anchor it gives `Sigma`, the covariance of the anchor's one-frame displacement.
-- **Calibration.** `uncertainty_head.calibration` holds conformal tables per region kind, under `tables.ellipsoid` and `tables.ball`, each with `global.scales` and `mondrian.edges_mm` + `mondrian.scales`. `region`, `mode` and `level` select the scale `s`:
-  - `region: ellipsoid` (default): the true displacement minus the predicted one, `d`, satisfies `d^T Sigma^-1 d <= s^2` with probability `level`.
-  - `region: ball`: `|d| <= s det(Sigma)^(1/6)` with probability `level`.
+- **Levels.** `uncertainty_head.level` (default 0.95) is the confidence of the velocity regions handed to the safety filter, along ONE direction (a CBF row's contact normal, one-sided): uncalibrated 0.8 gives 0.842 sigma, a level <= 0.5 no margin. `uncertainty_head.display_level` (default: `level`) is the coverage of the 3-D regions drawn in RViz: uncalibrated 0.8 gives 2.154 sigma.
+- **Calibration.** `uncertainty_head.calibration` only says how the scale `s` of a level is obtained: `enable: false` the head's own Gaussian, `enable: true` conformal tables per region kind, under `tables.ellipsoid` and `tables.ball`, each with `global.scales` and `mondrian.edges_mm` + `mondrian.scales` (both levels must then be levels of the table). `region` and `mode` select the table:
+  - `region: ellipsoid` (default): the true displacement minus the predicted one, `d`, satisfies `d^T Sigma^-1 d <= s^2` with probability `display_level`; the filter's regions use `s` times the factor from the 3-D to the one-direction quantile at `level`.
+  - `region: ball`: `|d| <= s det(Sigma)^(1/6)` with probability `display_level`.
   - `mode: mondrian` (default) uses one scale per bin of the predicted displacement; `mode: global` uses one scale.
 - **Where the tables are valid.** Only for the backbone, head and preprocessing they were fitted with. That includes `model.level1_points` (level-1 size, default 1024, upstream DifFlow3D 2048; every point bucket other than 1024 must be at least this large), `fps_points`, the point buckets and the dense shortcuts.
 - **Normalisation.** `preprocessing.canonical_normalization` replaces `auto_spatial_scale` for checkpoints fine-tuned on canonically normalised inputs. It is required when the head's checkpoint meta says `canonical: True`.

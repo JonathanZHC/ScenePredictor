@@ -26,6 +26,10 @@ class FakePredictor:
     def calibration_scale(flow):
         return torch.full((flow.shape[0],), 2.0)
 
+    @staticmethod
+    def filter_scale(flow):
+        return torch.full((flow.shape[0],), 1.0)
+
     def prepare(self):
         pass
 
