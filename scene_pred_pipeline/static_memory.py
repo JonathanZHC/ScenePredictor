@@ -117,7 +117,7 @@ class StaticMemory:
         self.device = device
         self._origin = origin.to(device=device, dtype=torch.float32)
         self._inv_voxel = 1.0 / float(voxel_size_m)
-        self._min_depth, self._max_depth = float(depth_range[0]), float(depth_range[1])
+        self._min_depth = float(depth_range[0])          # the far end of depth_range does not limit the visibility test
         self._workspace = workspace
         self._min_margin = float(config.min_margin_m) if config.min_margin_m > 0.0 else float(voxel_size_m)
         self._half = int(config.neighbourhood) // 2
